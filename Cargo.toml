@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/raft-core",
+    "crates/storage",
+    "crates/transport",
+    "crates/node",
+    "crates/client",
+    "crates/chaos",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
