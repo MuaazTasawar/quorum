@@ -11,9 +11,9 @@ use tracing::{info, warn};
 
 use crate::config::NodeConfig;
 
-/// A command submitted by a client (via the metrics/dashboard API in Phase 7,
-/// or the client SDK in Phase 8). `respond_to` is resolved once the command's
-/// log entry is actually committed and applied - not when it's merely appended.
+/// A write command submitted by a client. `respond_to` is resolved once the
+/// command's log entry is actually committed and applied - not when it's
+/// merely appended.
 pub struct ClientCommand {
     pub command: Command,
     pub respond_to: oneshot::Sender<ClientCommandResult>,
@@ -25,9 +25,29 @@ pub enum ClientCommandResult {
     NotLeader { leader_hint: Option<NodeId> },
 }
 
-/// Read-only view of cluster state, published after every event-loop
-/// iteration for the dashboard (Phase 7) to stream over WebSocket.
+/// A read request. Deliberately NOT a `Command` / NOT routed through the
+/// replicated log - a read doesn't change state, so there's nothing to
+/// replicate. Answered directly from the leader's locally-applied KvStore.
+///
+/// Known simplification: this serves from `last_applied` state without the
+/// read-index/lease-read protocol from the Raft paper (§8), so it's not
+/// *strictly* linearizable under the rare case of a stale leader that hasn't
+/// yet learned it lost an election. Fine for an MVP/portfolio scope; a
+/// production system would add read-index confirmation before answering.
+pub struct ClientQuery {
+    pub key: String,
+    pub respond_to: oneshot::Sender<QueryResult>,
+}
+
 #[derive(Debug, Clone)]
+pub enum QueryResult {
+    Value(Option<Vec<u8>>),
+    NotLeader { leader_hint: Option<NodeId> },
+}
+
+/// Read-only view of cluster state, published after every event-loop
+/// iteration for the dashboard to stream over WebSocket.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ClusterSnapshot {
     pub node_id: NodeId,
     pub role: String,
@@ -40,6 +60,7 @@ pub struct ClusterSnapshot {
 
 pub struct ClusterHandle {
     pub command_tx: mpsc::UnboundedSender<ClientCommand>,
+    pub query_tx: mpsc::UnboundedSender<ClientQuery>,
     pub snapshot_rx: watch::Receiver<ClusterSnapshot>,
 }
 
@@ -58,6 +79,7 @@ pub struct Cluster {
     peer_outboxes: HashMap<NodeId, mpsc::UnboundedSender<RpcMessage>>,
     inbox_rx: mpsc::UnboundedReceiver<(NodeId, RpcMessage)>,
     command_rx: mpsc::UnboundedReceiver<ClientCommand>,
+    query_rx: mpsc::UnboundedReceiver<ClientQuery>,
     pending_commands: HashMap<u64, oneshot::Sender<ClientCommandResult>>,
     snapshot_tx: watch::Sender<ClusterSnapshot>,
 }
@@ -74,6 +96,7 @@ impl Cluster {
         inbox_rx: mpsc::UnboundedReceiver<(NodeId, RpcMessage)>,
     ) -> (Self, ClusterHandle) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (query_tx, query_rx) = mpsc::unbounded_channel();
         let election_timeout = ElectionTimeoutConfig::default();
         let election_deadline = Instant::now() + election_timeout.random_timeout();
 
@@ -102,11 +125,12 @@ impl Cluster {
             peer_outboxes,
             inbox_rx,
             command_rx,
+            query_rx,
             pending_commands: HashMap::new(),
             snapshot_tx,
         };
 
-        (cluster, ClusterHandle { command_tx, snapshot_rx })
+        (cluster, ClusterHandle { command_tx, query_tx, snapshot_rx })
     }
 
     /// Heartbeat interval must sit well below the minimum election timeout -
@@ -128,6 +152,9 @@ impl Cluster {
                 }
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_client_command(cmd);
+                }
+                Some(query) = self.query_rx.recv() => {
+                    self.handle_client_query(query);
                 }
                 _ = heartbeat_ticker.tick(), if self.volatile.role == Role::Leader => {
                     self.broadcast_append_entries();
@@ -187,9 +214,6 @@ impl Cluster {
                 );
                 if resp.success {
                     self.known_leader = Some(leader_id);
-                    // Persist every newly-accepted entry before moving on - this
-                    // node must survive a crash without losing what it just told
-                    // the leader it successfully appended.
                     for entry in &req.entries {
                         if let Err(e) = self.wal.append(entry) {
                             warn!(error = %e, "WAL append failed");
@@ -261,7 +285,6 @@ impl Cluster {
             self.send_to(peer_id, RpcMessage::RequestVote(req.clone()));
         }
 
-        // Single-node cluster (no peers): we already hold a majority of one.
         if self.vote_tally.as_ref().map(|t| t.has_majority()).unwrap_or(false) {
             self.become_leader();
         }
@@ -324,10 +347,20 @@ impl Cluster {
         self.broadcast_append_entries();
     }
 
-    /// Applies every entry between last_applied and commit_index (inclusive)
-    /// to the KV state machine, in order, resolving any client waiting on one
-    /// of those indices. Run after every event-loop iteration so commits are
-    /// applied promptly rather than batched arbitrarily.
+    /// Answers a read directly from local applied state - no log append, no
+    /// replication round-trip. Only the (believed) leader answers; followers
+    /// redirect, same as writes.
+    fn handle_client_query(&mut self, query: ClientQuery) {
+        if self.volatile.role != Role::Leader {
+            let _ = query
+                .respond_to
+                .send(QueryResult::NotLeader { leader_hint: self.known_leader });
+            return;
+        }
+        let value = self.kv_store.get(&query.key).cloned();
+        let _ = query.respond_to.send(QueryResult::Value(value));
+    }
+
     fn apply_committed_entries(&mut self) {
         while self.volatile.last_applied < self.volatile.commit_index {
             let next_index = self.volatile.last_applied + 1;
@@ -420,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn leader_appends_client_command_to_log() {
         let mut cluster = build_cluster();
-        cluster.begin_election(); // single-node cluster -> becomes leader immediately
+        cluster.begin_election();
         assert_eq!(cluster.volatile.role, Role::Leader);
 
         let (respond_to, _receiver) = oneshot::channel();
@@ -429,5 +462,30 @@ mod tests {
             respond_to,
         });
         assert_eq!(cluster.log.last_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_rejected_when_not_leader() {
+        let mut cluster = build_cluster();
+        let (respond_to, receiver) = oneshot::channel();
+        cluster.handle_client_query(ClientQuery { key: "k".into(), respond_to });
+        let result = receiver.await.unwrap();
+        assert!(matches!(result, QueryResult::NotLeader { .. }));
+    }
+
+    #[tokio::test]
+    async fn leader_answers_query_from_applied_state() {
+        let mut cluster = build_cluster();
+        cluster.begin_election();
+
+        // Directly apply, bypassing the full commit pipeline - this test is
+        // only checking the query path reads from kv_store correctly, not
+        // re-testing commit/apply (already covered by raft-core's own tests).
+        cluster.kv_store.apply(&Command::Put { key: "k".into(), value: b"v".to_vec() });
+
+        let (respond_to, receiver) = oneshot::channel();
+        cluster.handle_client_query(ClientQuery { key: "k".into(), respond_to });
+        let result = receiver.await.unwrap();
+        assert!(matches!(result, QueryResult::Value(Some(v)) if v == b"v".to_vec()));
     }
 }
