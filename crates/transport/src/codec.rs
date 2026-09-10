@@ -41,7 +41,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 ) -> Result<Option<RpcMessage>, CodecError> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf).await {
-        Ok(()) => {}
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(CodecError::Io(e)),
     }
