@@ -1,6 +1,12 @@
 [package]
 name = "transport"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+raft-core = { path = "../raft-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
