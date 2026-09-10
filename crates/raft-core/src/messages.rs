@@ -49,6 +49,9 @@ pub struct AppendEntriesResponse {
 /// ever sees `RpcMessage` variants, never raw bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcMessage {
+    /// Sent as the first frame on any new connection so the accepting side
+    /// knows who just dialed in - raw TCP carries no identity on its own.
+    Hello(NodeId),
     RequestVote(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntriesRequest),

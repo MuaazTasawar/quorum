@@ -30,6 +30,14 @@ impl Log {
         Self { entries: Vec::new() }
     }
 
+    /// Reconstructs a Log from a fully-ordered list of entries, used at node
+    /// startup after WAL replay. The WAL's on-disk order already IS the log
+    /// order (entries are appended in order, truncated in order), so this is
+    /// just wrapping already-correct recovered data, not re-deriving anything.
+    pub fn from_entries(entries: Vec<LogEntry>) -> Self {
+        Self { entries }
+    }
+
     pub fn last_index(&self) -> u64 {
         self.entries.last().map(|e| e.index).unwrap_or(0)
     }

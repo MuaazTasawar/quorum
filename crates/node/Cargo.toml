@@ -1,8 +1,18 @@
 [package]
 name = "node"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-axum = { version = "0.8.9", features = ["ws"] }
-tokio-tungstenite = "0.30.0"
+raft-core = { path = "../raft-core" }
+storage = { path = "../storage" }
+transport = { path = "../transport" }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.30"
