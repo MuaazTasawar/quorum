@@ -345,6 +345,20 @@ impl Cluster {
         }
         self.pending_commands.insert(index, cmd.respond_to);
         self.broadcast_append_entries();
+
+        // A single-node cluster (or a leader whose own append already satisfies
+        // a majority) never receives an AppendEntriesResponse to trigger this -
+        // advance_commit_index must also be checked right after the leader's
+        // own log append, using log.last_index() as the leader's own match_index.
+        if let Some(new_commit) = advance_commit_index(
+            &self.leader_state,
+            &self.log,
+            self.persistent.current_term,
+            self.config.cluster_size(),
+            self.log.last_index(),
+        ) {
+            self.volatile.commit_index = new_commit;
+        }
     }
 
     /// Answers a read directly from local applied state - no log append, no
