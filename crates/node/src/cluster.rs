@@ -303,7 +303,37 @@ impl Cluster {
             self.leader_state.match_index.insert(peer_id, 0);
         }
 
+        // Raft paper section 8: immediately append a no-op entry in this
+        // leader's OWN current term. Entries the previous leader replicated
+        // to a majority but never got to mark committed (e.g. it crashed
+        // before sending the next heartbeat) sit safely in the log but
+        // can't be committed directly by this leader - advance_commit_index
+        // only ever commits current-term entries directly. Once this no-op
+        // commits, the log-matching property means everything before it
+        // (including those stranded entries) becomes committed too.
+        let noop = Command::NoOp.encode().expect("NoOp always encodes");
+        let noop_index = self.log.append(self.persistent.current_term, noop);
+        if let Some(entry) = self.log.get(noop_index) {
+            if let Err(e) = self.wal.append(entry) {
+                warn!(error = %e, "WAL append failed for leader no-op entry");
+            }
+        }
+
         self.broadcast_append_entries();
+
+        // Mirrors the same self-commit check handle_client_command uses -
+        // covers the single-node-cluster case (majority of one, satisfied
+        // immediately) where no AppendEntriesResponse will ever arrive to
+        // trigger this otherwise.
+        if let Some(new_commit) = advance_commit_index(
+            &self.leader_state,
+            &self.log,
+            self.persistent.current_term,
+            self.config.cluster_size(),
+            self.log.last_index(),
+        ) {
+            self.volatile.commit_index = new_commit;
+        }
     }
 
     fn broadcast_append_entries(&mut self) {
@@ -470,12 +500,17 @@ mod tests {
         cluster.begin_election();
         assert_eq!(cluster.volatile.role, Role::Leader);
 
+        // become_leader() appends a no-op at index 1 (Raft section 8) before
+        // any client command can land - so the client command below is
+        // expected at index 2, not 1.
+        assert_eq!(cluster.log.last_index(), 1);
+
         let (respond_to, _receiver) = oneshot::channel();
         cluster.handle_client_command(ClientCommand {
             command: Command::Put { key: "k".into(), value: b"v".to_vec() },
             respond_to,
         });
-        assert_eq!(cluster.log.last_index(), 1);
+        assert_eq!(cluster.log.last_index(), 2);
     }
 
     #[tokio::test]
@@ -503,3 +538,5 @@ mod tests {
         assert!(matches!(result, QueryResult::Value(Some(v)) if v == b"v".to_vec()));
     }
 }
+
+

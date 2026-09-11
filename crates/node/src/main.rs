@@ -1,12 +1,4 @@
-mod cluster;
-mod config;
-mod errors;
-mod metrics_api;
-mod network;
-
-use cluster::Cluster;
-use config::NodeConfig;
-use metrics_api::AppState;
+use node::{cluster::Cluster, config::NodeConfig, metrics_api, network};
 use raft_core::{Log, PersistentState};
 use storage::{KvStore, Wal};
 use std::collections::HashMap;
@@ -30,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     let wal = Wal::open(&wal_path)?;
     let log = Log::from_entries(recovered_entries);
 
-    // TODO Phase 9.x: persist current_term/voted_for across restarts.
+    // TODO: persist current_term/voted_for across restarts.
     let persistent = PersistentState::default();
     let kv_store = KvStore::new();
 
@@ -49,10 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let (cluster, handle) =
         Cluster::new(config, wal, log, kv_store, persistent, peer_outboxes, inbox_rx);
 
-    // Metrics/dashboard API runs as its own task, talking to the cluster
-    // loop only through the channels in ClusterHandle - it never touches
-    // Cluster's internals directly.
-    let app_state = AppState::from_handle(handle);
+    let app_state = metrics_api::AppState::from_handle(handle);
     let router = metrics_api::router(app_state);
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(&metrics_addr).await {
