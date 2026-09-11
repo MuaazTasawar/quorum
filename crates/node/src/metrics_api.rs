@@ -40,8 +40,13 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.snapshot_rx.borrow().clone())
 }
 
+/// `is_leader` is the field clients must check first - `value: None` alone is
+/// ambiguous (could mean "key doesn't exist" on a real leader, or "you hit a
+/// follower with no idea who the leader is"). `is_leader` disambiguates that
+/// before the client ever looks at `value`.
 #[derive(Serialize)]
 struct GetResponse {
+    is_leader: bool,
     value: Option<String>,
     leader_hint: Option<u32>,
 }
@@ -57,14 +62,13 @@ async fn get_key(
         .map_err(|_| AppError::ChannelClosed)?;
 
     match receiver.await.map_err(|_| AppError::ChannelClosed)? {
-        // Values are stored as raw bytes; base64 would be more correct for
-        // arbitrary binary data, but lossy UTF-8 keeps this endpoint simple
-        // for the demo/dashboard use case (text values).
         QueryResult::Value(v) => Ok(Json(GetResponse {
+            is_leader: true,
             value: v.map(|bytes| String::from_utf8_lossy(&bytes).to_string()),
             leader_hint: None,
         })),
         QueryResult::NotLeader { leader_hint } => Ok(Json(GetResponse {
+            is_leader: false,
             value: None,
             leader_hint,
         })),
@@ -78,6 +82,7 @@ struct PutBody {
 
 #[derive(Serialize)]
 struct WriteResponse {
+    is_leader: bool,
     applied: bool,
     leader_hint: Option<u32>,
 }
@@ -97,9 +102,11 @@ async fn put_key(
         .map_err(|_| AppError::ChannelClosed)?;
 
     match receiver.await.map_err(|_| AppError::ChannelClosed)? {
-        ClientCommandResult::Applied(_) => Ok(Json(WriteResponse { applied: true, leader_hint: None })),
+        ClientCommandResult::Applied(_) => {
+            Ok(Json(WriteResponse { is_leader: true, applied: true, leader_hint: None }))
+        }
         ClientCommandResult::NotLeader { leader_hint } => {
-            Ok(Json(WriteResponse { applied: false, leader_hint }))
+            Ok(Json(WriteResponse { is_leader: false, applied: false, leader_hint }))
         }
     }
 }
@@ -115,24 +122,20 @@ async fn delete_key(
         .map_err(|_| AppError::ChannelClosed)?;
 
     match receiver.await.map_err(|_| AppError::ChannelClosed)? {
-        ClientCommandResult::Applied(_) => Ok(Json(WriteResponse { applied: true, leader_hint: None })),
+        ClientCommandResult::Applied(_) => {
+            Ok(Json(WriteResponse { is_leader: true, applied: true, leader_hint: None }))
+        }
         ClientCommandResult::NotLeader { leader_hint } => {
-            Ok(Json(WriteResponse { applied: false, leader_hint }))
+            Ok(Json(WriteResponse { is_leader: false, applied: false, leader_hint }))
         }
     }
 }
 
-/// WebSocket endpoint the dashboard connects to for a live cluster-state
-/// stream. This is what makes the "kill the leader, watch election happen"
-/// demo possible - pushes a fresh ClusterSnapshot every time the cluster's
-/// watch channel changes, no polling.
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| stream_snapshots(socket, state.snapshot_rx))
 }
 
 async fn stream_snapshots(mut socket: WebSocket, mut snapshot_rx: watch::Receiver<ClusterSnapshot>) {
-    // Send the current state immediately on connect, don't make the client
-    // wait for the next change to see anything.
     let initial = snapshot_rx.borrow().clone();
     if send_snapshot(&mut socket, &initial).await.is_err() {
         return;
@@ -140,11 +143,11 @@ async fn stream_snapshots(mut socket: WebSocket, mut snapshot_rx: watch::Receive
 
     loop {
         if snapshot_rx.changed().await.is_err() {
-            return; // sender side dropped - node shutting down
+            return;
         }
         let snapshot = snapshot_rx.borrow().clone();
         if send_snapshot(&mut socket, &snapshot).await.is_err() {
-            return; // client disconnected
+            return;
         }
     }
 }
