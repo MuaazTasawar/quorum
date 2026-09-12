@@ -1,0 +1,86 @@
+# 5-node Quorum cluster. Every node is reachable by every other node over
+# the `quorum-net` bridge network using its service name as hostname (Docker's
+# built-in DNS resolves e.g. "node3" to that container's IP) - so
+# QUORUM_PEERS below just lists service names on the internal Raft port 7000.
+# Only each node's metrics API (8000 inside the container) is published to
+# the host, on 8001-8005, so curl/Invoke-RestMethod/the chaos CLI's `status`
+# command can reach it from Windows.
+name: quorum
+
+networks:
+  quorum-net:
+    name: quorum-net
+
+x-node-common: &node-common
+  build: .
+  networks:
+    - quorum-net
+  environment:
+    QUORUM_LISTEN_ADDR: "0.0.0.0:7000"
+    QUORUM_METRICS_ADDR: "0.0.0.0:8000"
+    QUORUM_STORAGE_DIR: "/data"
+  # No restart policy - if a node crashes (or you `docker compose kill` it
+  # for the chaos demo), it should STAY DOWN so you can watch the survivors
+  # elect a new leader, not silently come back up on its own.
+  restart: "no"
+
+services:
+  node1:
+    <<: *node-common
+    container_name: quorum-node1
+    environment:
+      QUORUM_NODE_ID: "1"
+      QUORUM_LISTEN_ADDR: "0.0.0.0:7000"
+      QUORUM_METRICS_ADDR: "0.0.0.0:8000"
+      QUORUM_STORAGE_DIR: "/data"
+      QUORUM_PEERS: "2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000"
+    ports:
+      - "18001:8000"
+
+  node2:
+    <<: *node-common
+    container_name: quorum-node2
+    environment:
+      QUORUM_NODE_ID: "2"
+      QUORUM_LISTEN_ADDR: "0.0.0.0:7000"
+      QUORUM_METRICS_ADDR: "0.0.0.0:8000"
+      QUORUM_STORAGE_DIR: "/data"
+      QUORUM_PEERS: "1=node1:7000,3=node3:7000,4=node4:7000,5=node5:7000"
+    ports:
+      - "18002:8000"
+
+  node3:
+    <<: *node-common
+    container_name: quorum-node3
+    environment:
+      QUORUM_NODE_ID: "3"
+      QUORUM_LISTEN_ADDR: "0.0.0.0:7000"
+      QUORUM_METRICS_ADDR: "0.0.0.0:8000"
+      QUORUM_STORAGE_DIR: "/data"
+      QUORUM_PEERS: "1=node1:7000,2=node2:7000,4=node4:7000,5=node5:7000"
+    ports:
+      - "18003:8000"
+
+  node4:
+    <<: *node-common
+    container_name: quorum-node4
+    environment:
+      QUORUM_NODE_ID: "4"
+      QUORUM_LISTEN_ADDR: "0.0.0.0:7000"
+      QUORUM_METRICS_ADDR: "0.0.0.0:8000"
+      QUORUM_STORAGE_DIR: "/data"
+      QUORUM_PEERS: "1=node1:7000,2=node2:7000,3=node3:7000,5=node5:7000"
+    ports:
+      - "18004:8000"
+
+  node5:
+    <<: *node-common
+    container_name: quorum-node5
+    environment:
+      QUORUM_NODE_ID: "5"
+      QUORUM_LISTEN_ADDR: "0.0.0.0:7000"
+      QUORUM_METRICS_ADDR: "0.0.0.0:8000"
+      QUORUM_STORAGE_DIR: "/data"
+      QUORUM_PEERS: "1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000"
+    ports:
+      - "18005:8000"
