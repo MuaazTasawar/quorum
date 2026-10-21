@@ -4,7 +4,7 @@ use raft_core::{
     LeaderState, Log, NodeId, PersistentState, Role, RpcMessage, Term, VoteTally, VolatileState,
 };
 use std::collections::HashMap;
-use storage::{Command, KvStore, Wal};
+use storage::{Command, KvStore, Persistence, Recovered};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -64,18 +64,18 @@ pub struct ClusterHandle {
     pub snapshot_rx: watch::Receiver<ClusterSnapshot>,
 }
 
-/// The WAL is the durability guarantee behind every acknowledgement this node
-/// sends. If a write to it fails we can no longer honour that guarantee, and the
-/// in-memory log has already moved ahead of the disk, so the only safe response
+/// Durable storage is the guarantee behind every acknowledgement and vote this
+/// node sends. If a write to it fails we can no longer honour that guarantee, and
+/// in-memory state has already moved ahead of the disk, so the only safe response
 /// is fail-stop: crash and let the node recover from what is really on disk.
 /// (Raft tolerates crashed nodes; it does not tolerate a node that acknowledges
-/// entries it has not durably stored.)
-fn wal_must<T>(result: Result<T, storage::WalError>, what: &str) -> T {
+/// entries, or grants votes, that it has not durably recorded.)
+fn persist_must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
     match result {
         Ok(value) => value,
         Err(e) => {
-            error!(error = %e, operation = what, "WAL operation failed - halting node");
-            panic!("fatal: WAL {what} failed: {e}");
+            error!(error = %e, operation = what, "durable write failed - halting node");
+            panic!("fatal: durable write ({what}) failed: {e}");
         }
     }
 }
@@ -87,7 +87,7 @@ pub struct Cluster {
     leader_state: LeaderState,
     vote_tally: Option<VoteTally>,
     log: Log,
-    wal: Wal,
+    persistence: Persistence,
     kv_store: KvStore,
     election_timeout: ElectionTimeoutConfig,
     election_deadline: Instant,
@@ -101,16 +101,19 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    #[allow(clippy::too_many_arguments)]
+    /// Builds a node from what was recovered off disk: the log, plus the
+    /// `current_term` / `voted_for` it had before it last stopped. Starting from
+    /// the recovered term and vote (rather than from zero) is what stops a
+    /// restarted node from voting twice in a term it already voted in.
     pub fn new(
         config: NodeConfig,
-        wal: Wal,
-        log: Log,
-        kv_store: KvStore,
-        persistent: PersistentState,
+        recovered: Recovered,
         peer_outboxes: HashMap<NodeId, mpsc::UnboundedSender<RpcMessage>>,
         inbox_rx: mpsc::UnboundedReceiver<(NodeId, RpcMessage)>,
     ) -> (Self, ClusterHandle) {
+        let Recovered { persistence, hard_state: persistent, entries } = recovered;
+        let log = Log::from_entries(entries);
+        let kv_store = KvStore::new();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (query_tx, query_rx) = mpsc::unbounded_channel();
         let election_timeout = ElectionTimeoutConfig::default();
@@ -133,7 +136,7 @@ impl Cluster {
             leader_state: LeaderState::default(),
             vote_tally: None,
             log,
-            wal,
+            persistence,
             kv_store,
             election_timeout,
             election_deadline,
@@ -192,6 +195,9 @@ impl Cluster {
             RpcMessage::RequestVote(req) => {
                 let resp =
                     handle_request_vote(&mut self.persistent, &mut self.volatile, &self.log, &req);
+                // The vote (and any term bump) must be on disk BEFORE the reply
+                // leaves this node, or a crash could make us forget it.
+                self.persist_hard_state();
                 self.reset_election_deadline_if_follower();
                 self.send_to(from, RpcMessage::RequestVoteResponse(resp));
             }
@@ -230,14 +236,17 @@ impl Cluster {
                     &req,
                 );
 
-                // Mirror exactly what happened to the in-memory log onto disk,
-                // and do it BEFORE acknowledging. A conflict truncates the WAL
-                // suffix too; entries we already had are never re-appended.
+                // Everything below must be durable BEFORE we acknowledge. First the
+                // term (an AppendEntries from a newer term bumps it)...
+                self.persist_hard_state();
+                // ...then mirror exactly what happened to the in-memory log onto
+                // disk. A conflict truncates the WAL suffix too; entries we
+                // already had are never re-appended.
                 if let Some(from_index) = effect.truncated_from {
-                    wal_must(self.wal.truncate_from(from_index), "truncate");
+                    persist_must(self.persistence.truncate_from(from_index), "log truncate");
                 }
                 for entry in &effect.appended {
-                    wal_must(self.wal.append(entry), "append");
+                    persist_must(self.persistence.append(entry), "log append");
                 }
 
                 // Any request from a current-or-newer term comes from the
@@ -292,8 +301,19 @@ impl Cluster {
     /// the WAL. Used for entries this node creates itself as leader.
     fn append_to_wal(&mut self, index: u64) {
         if let Some(entry) = self.log.get(index) {
-            wal_must(self.wal.append(entry), "append");
+            persist_must(self.persistence.append(entry), "log append");
         }
+    }
+
+    /// Writes `current_term` / `voted_for` to disk if they changed. Called after
+    /// every code path that can change them and before anything is sent that
+    /// depends on them. A no-op (no fsync) when nothing changed, so steady-state
+    /// heartbeats cost nothing.
+    fn persist_hard_state(&mut self) {
+        persist_must(
+            self.persistence.save_hard_state_if_changed(&self.persistent),
+            "hard state",
+        );
     }
 
     fn reset_election_deadline_if_follower(&mut self) {
@@ -305,6 +325,7 @@ impl Cluster {
     fn step_down(&mut self, new_term: Term) {
         self.persistent.current_term = new_term;
         self.persistent.voted_for = None;
+        self.persist_hard_state();
         self.volatile.role = Role::Follower;
         self.vote_tally = None;
         self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
@@ -312,6 +333,9 @@ impl Cluster {
 
     fn begin_election(&mut self) {
         let req = start_election(&mut self.persistent, &mut self.volatile, &self.log, self.config.id);
+        // The new term and our vote for ourselves must be durable before any
+        // RequestVote leaves this node.
+        self.persist_hard_state();
         self.known_leader = None;
         self.vote_tally = Some(VoteTally::new(self.config.id, self.config.cluster_size()));
         self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
@@ -457,51 +481,73 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raft_core::{AppendEntriesRequest, AppendEntriesResponse, LogEntry};
+    use raft_core::{
+        AppendEntriesRequest, AppendEntriesResponse, LogEntry, RequestVoteRequest,
+        RequestVoteResponse,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use storage::{Wal, WAL_FILE};
 
-    static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn unique_wal_path() -> PathBuf {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let n = WAL_COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("quorum-test-{nanos}-{n}.wal"))
+    /// A scratch storage directory, removed on drop. Declare it BEFORE the
+    /// cluster that uses it so the cluster (and its open files) is dropped first.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+            Self(std::env::temp_dir().join(format!("quorum-unit-{nanos}-{n}")))
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn wal_path(&self) -> PathBuf {
+            self.0.join(WAL_FILE)
+        }
     }
 
-    /// Builds node 1 with the given peers. The peers' outbound channels go
-    /// nowhere (their receivers are dropped), which is fine: these tests call
-    /// the handlers directly and only inspect state.
-    fn make_cluster(peer_ids: &[NodeId], wal_path: &Path) -> Cluster {
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    type Outputs = HashMap<NodeId, mpsc::UnboundedReceiver<RpcMessage>>;
+
+    /// Builds node 1 over `dir` with the given peers, recovering whatever is
+    /// already stored there (so calling it twice on one directory is a restart).
+    /// Returns the receivers for each peer's outbound channel so a test can read
+    /// exactly what this node replied.
+    fn make_cluster_in(dir: &Path, peer_ids: &[NodeId]) -> (Cluster, Outputs) {
         let peers = peer_ids.iter().map(|&id| (id, String::new())).collect();
         let config = NodeConfig {
             id: 1,
             listen_addr: "127.0.0.1:0".to_string(),
             metrics_addr: "127.0.0.1:0".to_string(),
             peers,
-            storage_dir: std::env::temp_dir(),
+            storage_dir: dir.to_path_buf(),
         };
         let mut outboxes = HashMap::new();
+        let mut outputs = HashMap::new();
         for &id in peer_ids {
-            let (tx, _rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::unbounded_channel();
             outboxes.insert(id, tx);
+            outputs.insert(id, rx);
         }
         let (_inbox_tx, inbox_rx) = mpsc::unbounded_channel();
-        let (cluster, _handle) = Cluster::new(
-            config,
-            Wal::open(wal_path).unwrap(),
-            Log::new(),
-            KvStore::new(),
-            PersistentState::default(),
-            outboxes,
-            inbox_rx,
-        );
-        cluster
+        let recovered = Persistence::open(dir).expect("storage should open");
+        let (cluster, _handle) = Cluster::new(config, recovered, outboxes, inbox_rx);
+        (cluster, outputs)
     }
 
-    fn build_cluster() -> Cluster {
-        make_cluster(&[], &unique_wal_path())
+    /// For tests that never look at what the node sends: the peers' receivers
+    /// are dropped, so sends are silently discarded.
+    fn build_cluster(dir: &TestDir, peer_ids: &[NodeId]) -> Cluster {
+        make_cluster_in(dir.path(), peer_ids).0
     }
 
     fn entry(term: Term, index: u64, command: &str) -> LogEntry {
@@ -525,6 +571,15 @@ mod tests {
         })
     }
 
+    fn vote_request(term: Term, candidate_id: NodeId) -> RpcMessage {
+        RpcMessage::RequestVote(RequestVoteRequest {
+            term,
+            candidate_id,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+    }
+
     fn put_command(key: &str, value: &str) -> ClientCommand {
         let (respond_to, _receiver) = oneshot::channel();
         ClientCommand {
@@ -533,9 +588,20 @@ mod tests {
         }
     }
 
+    /// The vote reply this node sent to `peer`, if any.
+    fn vote_reply(outputs: &mut Outputs, peer: NodeId) -> RequestVoteResponse {
+        match outputs.get_mut(&peer).unwrap().try_recv() {
+            Ok(RpcMessage::RequestVoteResponse(resp)) => resp,
+            other => panic!("expected a vote reply to node {peer}, got {other:?}"),
+        }
+    }
+
+    // ---- existing behaviour -------------------------------------------------
+
     #[test]
     fn single_node_cluster_becomes_leader_on_election() {
-        let mut cluster = build_cluster();
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
         assert_eq!(cluster.volatile.role, Role::Follower);
         cluster.begin_election();
         assert_eq!(cluster.volatile.role, Role::Leader);
@@ -543,7 +609,8 @@ mod tests {
 
     #[tokio::test]
     async fn client_command_rejected_when_not_leader() {
-        let mut cluster = build_cluster();
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
         let (respond_to, receiver) = oneshot::channel();
         cluster.handle_client_command(ClientCommand {
             command: Command::Put { key: "k".into(), value: b"v".to_vec() },
@@ -555,7 +622,8 @@ mod tests {
 
     #[tokio::test]
     async fn leader_appends_client_command_to_log() {
-        let mut cluster = build_cluster();
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
         cluster.begin_election();
         assert_eq!(cluster.volatile.role, Role::Leader);
 
@@ -574,7 +642,8 @@ mod tests {
 
     #[tokio::test]
     async fn query_rejected_when_not_leader() {
-        let mut cluster = build_cluster();
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
         let (respond_to, receiver) = oneshot::channel();
         cluster.handle_client_query(ClientQuery { key: "k".into(), respond_to });
         let result = receiver.await.unwrap();
@@ -583,7 +652,8 @@ mod tests {
 
     #[tokio::test]
     async fn leader_answers_query_from_applied_state() {
-        let mut cluster = build_cluster();
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
         cluster.begin_election();
 
         // Directly apply, bypassing the full commit pipeline - this test is
@@ -599,8 +669,8 @@ mod tests {
 
     #[test]
     fn follower_wal_mirrors_truncation_after_conflicting_append() {
-        let path = unique_wal_path();
-        let mut cluster = make_cluster(&[], &path);
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
 
         // Term-1 leader replicates entries 1 and 2.
         cluster.handle_rpc(
@@ -614,7 +684,7 @@ mod tests {
         assert_eq!(cluster.log.term_at(2), Some(2));
 
         // What a restart would recover must equal the in-memory log.
-        let on_disk = Wal::replay(&path).unwrap();
+        let on_disk = Wal::replay(dir.wal_path()).unwrap();
         assert_eq!(on_disk.len(), 2);
         assert_eq!(on_disk[0].command, b"a".to_vec());
         assert_eq!(on_disk[1].term, 2);
@@ -623,20 +693,21 @@ mod tests {
 
     #[test]
     fn duplicate_append_entries_does_not_duplicate_wal_records() {
-        let path = unique_wal_path();
-        let mut cluster = make_cluster(&[], &path);
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
 
         let request = append_request(1, 2, 0, 0, vec![entry(1, 1, "a")]);
         cluster.handle_rpc(2, request.clone());
         cluster.handle_rpc(2, request);
 
         assert_eq!(cluster.log.last_index(), 1);
-        assert_eq!(Wal::replay(&path).unwrap().len(), 1);
+        assert_eq!(Wal::replay(dir.wal_path()).unwrap().len(), 1);
     }
 
     #[test]
     fn follower_learns_leader_hint_even_when_its_log_does_not_match() {
-        let mut cluster = build_cluster();
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
         // prev_log_index 5 can't match our empty log, so this is rejected...
         cluster.handle_rpc(2, append_request(1, 2, 5, 1, vec![]));
         // ...but it still came from the legitimate leader of term 1.
@@ -645,7 +716,8 @@ mod tests {
 
     #[test]
     fn leader_commit_uses_follower_reported_match_index_not_its_own_log_tail() {
-        let mut cluster = make_cluster(&[2, 3], &unique_wal_path());
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
         cluster.persistent.current_term = 1;
         cluster.become_leader(); // no-op at index 1
         cluster.handle_client_command(put_command("a", "1")); // index 2
@@ -673,7 +745,8 @@ mod tests {
 
     #[test]
     fn leader_ignores_append_response_from_an_earlier_term() {
-        let mut cluster = make_cluster(&[2, 3], &unique_wal_path());
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
         cluster.persistent.current_term = 2;
         cluster.become_leader();
 
@@ -688,5 +761,96 @@ mod tests {
         );
 
         assert_eq!(cluster.leader_state.match_index.get(&2), Some(&0));
+    }
+
+    // ---- durable hard state -------------------------------------------------
+
+    #[test]
+    fn restarted_node_remembers_its_vote_and_refuses_a_second_one_in_that_term() {
+        let dir = TestDir::new();
+
+        // First life: grant node 2 a vote in term 5, then "crash".
+        {
+            let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+            cluster.handle_rpc(2, vote_request(5, 2));
+            assert!(vote_reply(&mut outputs, 2).vote_granted);
+        }
+
+        // Second life, same storage directory.
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        assert_eq!(cluster.persistent.current_term, 5, "term must survive the restart");
+        assert_eq!(cluster.persistent.voted_for, Some(2), "vote must survive the restart");
+
+        // Node 3 now asks for a vote in the same term. Without a persisted vote
+        // this restarted node would grant it: two votes in one term.
+        cluster.handle_rpc(3, vote_request(5, 3));
+        assert!(
+            !vote_reply(&mut outputs, 3).vote_granted,
+            "must not vote twice in term 5 just because the process restarted"
+        );
+    }
+
+    #[test]
+    fn a_term_learned_from_a_leader_survives_a_restart() {
+        let dir = TestDir::new();
+        {
+            let mut cluster = build_cluster(&dir, &[]);
+            cluster.handle_rpc(2, append_request(3, 2, 0, 0, vec![]));
+            assert_eq!(cluster.persistent.current_term, 3);
+        }
+        let cluster = build_cluster(&dir, &[]);
+        assert_eq!(cluster.persistent.current_term, 3);
+    }
+
+    #[test]
+    fn a_candidates_own_vote_is_durable_before_it_asks_anyone_else() {
+        let dir = TestDir::new();
+        {
+            let mut cluster = build_cluster(&dir, &[2, 3]);
+            cluster.begin_election();
+            assert_eq!(cluster.persistent.current_term, 1);
+            assert_eq!(cluster.persistent.voted_for, Some(1));
+        }
+        let cluster = build_cluster(&dir, &[2, 3]);
+        assert_eq!(cluster.persistent.current_term, 1);
+        assert_eq!(cluster.persistent.voted_for, Some(1), "must remember it voted for itself");
+    }
+
+    #[test]
+    fn stepping_down_to_a_higher_term_is_durable() {
+        let dir = TestDir::new();
+        {
+            let mut cluster = build_cluster(&dir, &[2, 3]);
+            cluster.persistent.current_term = 1;
+            cluster.become_leader();
+            cluster.handle_rpc(
+                2,
+                RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 4,
+                    success: false,
+                    conflict_index: None,
+                    match_index: 0,
+                }),
+            );
+            assert_eq!(cluster.volatile.role, Role::Follower);
+        }
+        let cluster = build_cluster(&dir, &[2, 3]);
+        assert_eq!(cluster.persistent.current_term, 4);
+        assert_eq!(cluster.persistent.voted_for, None);
+    }
+
+    #[test]
+    fn restart_recovers_the_replicated_log() {
+        let dir = TestDir::new();
+        {
+            let mut cluster = build_cluster(&dir, &[]);
+            cluster.handle_rpc(
+                2,
+                append_request(1, 2, 0, 0, vec![entry(1, 1, "a"), entry(1, 2, "b")]),
+            );
+        }
+        let cluster = build_cluster(&dir, &[]);
+        assert_eq!(cluster.log.last_index(), 2);
+        assert_eq!(cluster.log.term_at(2), Some(1));
     }
 }

@@ -1,7 +1,6 @@
 use node::{cluster::Cluster, config::NodeConfig, metrics_api, network};
-use raft_core::{Log, PersistentState};
-use storage::{KvStore, Wal};
 use std::collections::HashMap;
+use storage::Persistence;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -15,16 +14,16 @@ async fn main() -> anyhow::Result<()> {
     let config = NodeConfig::from_env()?;
     tracing::info!(node_id = config.id, "starting quorum node");
 
-    std::fs::create_dir_all(&config.storage_dir)?;
-    let wal_path = config.storage_dir.join("wal.log");
-
-    let recovered_entries = Wal::replay(&wal_path)?;
-    let wal = Wal::open(&wal_path)?;
-    let log = Log::from_entries(recovered_entries);
-
-    // TODO: persist current_term/voted_for across restarts.
-    let persistent = PersistentState::default();
-    let kv_store = KvStore::new();
+    // Recovers the log AND the hard state (current_term / voted_for) from disk.
+    // A node that restarts without its vote could vote twice in one term, so a
+    // corrupt hard-state file stops startup here instead of silently resetting.
+    let recovered = Persistence::open(&config.storage_dir)?;
+    tracing::info!(
+        term = recovered.hard_state.current_term,
+        voted_for = ?recovered.hard_state.voted_for,
+        recovered_entries = recovered.entries.len(),
+        "recovered state from disk"
+    );
 
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
 
@@ -38,8 +37,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(network::run_accept_loop(listener, inbox_tx));
 
     let metrics_addr = config.metrics_addr.clone();
-    let (cluster, handle) =
-        Cluster::new(config, wal, log, kv_store, persistent, peer_outboxes, inbox_rx);
+    let (cluster, handle) = Cluster::new(config, recovered, peer_outboxes, inbox_rx);
 
     let app_state = metrics_api::AppState::from_handle(handle);
     let router = metrics_api::router(app_state);
