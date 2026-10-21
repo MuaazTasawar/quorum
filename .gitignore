@@ -2,3 +2,18 @@
 crates/*/target
 .venv/
 *.pdb
+
+# Added in Phase 12: runtime data, secrets, editor files
+/data/
+*.wal
+*.wal.tmp
+*.snap
+*.snap.tmp
+*.state
+*.state.tmp
+.env
+/certs/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
