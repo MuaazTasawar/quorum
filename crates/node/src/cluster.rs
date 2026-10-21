@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use storage::{Command, KvStore, Wal};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::NodeConfig;
 
@@ -62,6 +62,22 @@ pub struct ClusterHandle {
     pub command_tx: mpsc::UnboundedSender<ClientCommand>,
     pub query_tx: mpsc::UnboundedSender<ClientQuery>,
     pub snapshot_rx: watch::Receiver<ClusterSnapshot>,
+}
+
+/// The WAL is the durability guarantee behind every acknowledgement this node
+/// sends. If a write to it fails we can no longer honour that guarantee, and the
+/// in-memory log has already moved ahead of the disk, so the only safe response
+/// is fail-stop: crash and let the node recover from what is really on disk.
+/// (Raft tolerates crashed nodes; it does not tolerate a node that acknowledges
+/// entries it has not durably stored.)
+fn wal_must<T>(result: Result<T, storage::WalError>, what: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(e) => {
+            error!(error = %e, operation = what, "WAL operation failed - halting node");
+            panic!("fatal: WAL {what} failed: {e}");
+        }
+    }
 }
 
 pub struct Cluster {
@@ -204,21 +220,31 @@ impl Cluster {
             }
 
             RpcMessage::AppendEntries(req) => {
-                let is_new_term = req.term > self.persistent.current_term;
+                let term_before = self.persistent.current_term;
+                let is_new_term = req.term > term_before;
                 let leader_id = req.leader_id;
-                let resp = handle_append_entries(
+                let (resp, effect) = handle_append_entries(
                     &mut self.persistent,
                     &mut self.volatile,
                     &mut self.log,
                     &req,
                 );
-                if resp.success {
+
+                // Mirror exactly what happened to the in-memory log onto disk,
+                // and do it BEFORE acknowledging. A conflict truncates the WAL
+                // suffix too; entries we already had are never re-appended.
+                if let Some(from_index) = effect.truncated_from {
+                    wal_must(self.wal.truncate_from(from_index), "truncate");
+                }
+                for entry in &effect.appended {
+                    wal_must(self.wal.append(entry), "append");
+                }
+
+                // Any request from a current-or-newer term comes from the
+                // legitimate leader, even if its log didn't match ours - so
+                // clients hitting this follower get a useful leader_hint.
+                if req.term >= term_before {
                     self.known_leader = Some(leader_id);
-                    for entry in &req.entries {
-                        if let Err(e) = self.wal.append(entry) {
-                            warn!(error = %e, "WAL append failed");
-                        }
-                    }
                 }
                 if is_new_term {
                     self.vote_tally = None;
@@ -232,30 +258,41 @@ impl Cluster {
                     self.step_down(resp.term);
                     return;
                 }
+                // A response stamped with an older term answers a request from
+                // a previous leadership of this node. The log may have changed
+                // since, so what it reports no longer says anything reliable.
+                if resp.term < self.persistent.current_term {
+                    return;
+                }
                 if self.volatile.role != Role::Leader {
                     return;
                 }
-                let next_index = *self.leader_state.next_index.get(&from).unwrap_or(&1);
-                let sent_prev_log_index = next_index.saturating_sub(1);
-                let sent_entries_count = self.log.last_index().saturating_sub(sent_prev_log_index);
-                handle_append_entries_response(
-                    &mut self.leader_state,
-                    from,
-                    sent_prev_log_index,
-                    sent_entries_count,
-                    &resp,
-                );
-
-                if let Some(new_commit) = advance_commit_index(
-                    &self.leader_state,
-                    &self.log,
-                    self.persistent.current_term,
-                    self.config.cluster_size(),
-                    self.log.last_index(),
-                ) {
-                    self.volatile.commit_index = new_commit;
-                }
+                handle_append_entries_response(&mut self.leader_state, from, &resp);
+                self.advance_leader_commit();
             }
+        }
+    }
+
+    /// Recomputes commit_index from the followers' reported match_index values
+    /// (plus the leader's own log tail) and advances it if a majority now holds
+    /// a current-term entry.
+    fn advance_leader_commit(&mut self) {
+        if let Some(new_commit) = advance_commit_index(
+            &self.leader_state,
+            &self.log,
+            self.persistent.current_term,
+            self.config.cluster_size(),
+            self.log.last_index(),
+        ) {
+            self.volatile.commit_index = new_commit;
+        }
+    }
+
+    /// Durably appends the entry at `index` (already in the in-memory log) to
+    /// the WAL. Used for entries this node creates itself as leader.
+    fn append_to_wal(&mut self, index: u64) {
+        if let Some(entry) = self.log.get(index) {
+            wal_must(self.wal.append(entry), "append");
         }
     }
 
@@ -313,27 +350,14 @@ impl Cluster {
         // (including those stranded entries) becomes committed too.
         let noop = Command::NoOp.encode().expect("NoOp always encodes");
         let noop_index = self.log.append(self.persistent.current_term, noop);
-        if let Some(entry) = self.log.get(noop_index) {
-            if let Err(e) = self.wal.append(entry) {
-                warn!(error = %e, "WAL append failed for leader no-op entry");
-            }
-        }
+        self.append_to_wal(noop_index);
 
         self.broadcast_append_entries();
 
-        // Mirrors the same self-commit check handle_client_command uses -
-        // covers the single-node-cluster case (majority of one, satisfied
+        // Covers the single-node-cluster case (majority of one, satisfied
         // immediately) where no AppendEntriesResponse will ever arrive to
         // trigger this otherwise.
-        if let Some(new_commit) = advance_commit_index(
-            &self.leader_state,
-            &self.log,
-            self.persistent.current_term,
-            self.config.cluster_size(),
-            self.log.last_index(),
-        ) {
-            self.volatile.commit_index = new_commit;
-        }
+        self.advance_leader_commit();
     }
 
     fn broadcast_append_entries(&mut self) {
@@ -368,27 +392,14 @@ impl Cluster {
         };
 
         let index = self.log.append(self.persistent.current_term, encoded);
-        if let Some(entry) = self.log.get(index) {
-            if let Err(e) = self.wal.append(entry) {
-                warn!(error = %e, "WAL append failed for leader-local entry");
-            }
-        }
+        self.append_to_wal(index);
         self.pending_commands.insert(index, cmd.respond_to);
         self.broadcast_append_entries();
 
         // A single-node cluster (or a leader whose own append already satisfies
         // a majority) never receives an AppendEntriesResponse to trigger this -
-        // advance_commit_index must also be checked right after the leader's
-        // own log append, using log.last_index() as the leader's own match_index.
-        if let Some(new_commit) = advance_commit_index(
-            &self.leader_state,
-            &self.log,
-            self.persistent.current_term,
-            self.config.cluster_size(),
-            self.log.last_index(),
-        ) {
-            self.volatile.commit_index = new_commit;
-        }
+        // the commit check must also run right after the leader's own append.
+        self.advance_leader_commit();
     }
 
     /// Answers a read directly from local applied state - no log append, no
@@ -446,32 +457,80 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raft_core::{AppendEntriesRequest, AppendEntriesResponse, LogEntry};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_wal() -> Wal {
+    static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_wal_path() -> PathBuf {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        Wal::open(std::env::temp_dir().join(format!("quorum-test-{nanos}.wal"))).unwrap()
+        let n = WAL_COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("quorum-test-{nanos}-{n}.wal"))
     }
 
-    fn build_cluster() -> Cluster {
+    /// Builds node 1 with the given peers. The peers' outbound channels go
+    /// nowhere (their receivers are dropped), which is fine: these tests call
+    /// the handlers directly and only inspect state.
+    fn make_cluster(peer_ids: &[NodeId], wal_path: &Path) -> Cluster {
+        let peers = peer_ids.iter().map(|&id| (id, String::new())).collect();
         let config = NodeConfig {
             id: 1,
             listen_addr: "127.0.0.1:0".to_string(),
             metrics_addr: "127.0.0.1:0".to_string(),
-            peers: HashMap::new(),
+            peers,
             storage_dir: std::env::temp_dir(),
         };
+        let mut outboxes = HashMap::new();
+        for &id in peer_ids {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            outboxes.insert(id, tx);
+        }
         let (_inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         let (cluster, _handle) = Cluster::new(
             config,
-            temp_wal(),
+            Wal::open(wal_path).unwrap(),
             Log::new(),
             KvStore::new(),
             PersistentState::default(),
-            HashMap::new(),
+            outboxes,
             inbox_rx,
         );
         cluster
+    }
+
+    fn build_cluster() -> Cluster {
+        make_cluster(&[], &unique_wal_path())
+    }
+
+    fn entry(term: Term, index: u64, command: &str) -> LogEntry {
+        LogEntry { term, index, command: command.as_bytes().to_vec() }
+    }
+
+    fn append_request(
+        term: Term,
+        leader_id: NodeId,
+        prev_log_index: u64,
+        prev_log_term: Term,
+        entries: Vec<LogEntry>,
+    ) -> RpcMessage {
+        RpcMessage::AppendEntries(AppendEntriesRequest {
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit: 0,
+        })
+    }
+
+    fn put_command(key: &str, value: &str) -> ClientCommand {
+        let (respond_to, _receiver) = oneshot::channel();
+        ClientCommand {
+            command: Command::Put { key: key.into(), value: value.as_bytes().to_vec() },
+            respond_to,
+        }
     }
 
     #[test]
@@ -537,6 +596,97 @@ mod tests {
         let result = receiver.await.unwrap();
         assert!(matches!(result, QueryResult::Value(Some(v)) if v == b"v".to_vec()));
     }
+
+    #[test]
+    fn follower_wal_mirrors_truncation_after_conflicting_append() {
+        let path = unique_wal_path();
+        let mut cluster = make_cluster(&[], &path);
+
+        // Term-1 leader replicates entries 1 and 2.
+        cluster.handle_rpc(
+            2,
+            append_request(1, 2, 0, 0, vec![entry(1, 1, "a"), entry(1, 2, "b")]),
+        );
+        // A term-2 leader disagrees about entry 2.
+        cluster.handle_rpc(3, append_request(2, 3, 1, 1, vec![entry(2, 2, "c")]));
+
+        assert_eq!(cluster.log.last_index(), 2);
+        assert_eq!(cluster.log.term_at(2), Some(2));
+
+        // What a restart would recover must equal the in-memory log.
+        let on_disk = Wal::replay(&path).unwrap();
+        assert_eq!(on_disk.len(), 2);
+        assert_eq!(on_disk[0].command, b"a".to_vec());
+        assert_eq!(on_disk[1].term, 2);
+        assert_eq!(on_disk[1].command, b"c".to_vec());
+    }
+
+    #[test]
+    fn duplicate_append_entries_does_not_duplicate_wal_records() {
+        let path = unique_wal_path();
+        let mut cluster = make_cluster(&[], &path);
+
+        let request = append_request(1, 2, 0, 0, vec![entry(1, 1, "a")]);
+        cluster.handle_rpc(2, request.clone());
+        cluster.handle_rpc(2, request);
+
+        assert_eq!(cluster.log.last_index(), 1);
+        assert_eq!(Wal::replay(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn follower_learns_leader_hint_even_when_its_log_does_not_match() {
+        let mut cluster = build_cluster();
+        // prev_log_index 5 can't match our empty log, so this is rejected...
+        cluster.handle_rpc(2, append_request(1, 2, 5, 1, vec![]));
+        // ...but it still came from the legitimate leader of term 1.
+        assert_eq!(cluster.known_leader, Some(2));
+    }
+
+    #[test]
+    fn leader_commit_uses_follower_reported_match_index_not_its_own_log_tail() {
+        let mut cluster = make_cluster(&[2, 3], &unique_wal_path());
+        cluster.persistent.current_term = 1;
+        cluster.become_leader(); // no-op at index 1
+        cluster.handle_client_command(put_command("a", "1")); // index 2
+        cluster.handle_client_command(put_command("b", "2")); // index 3
+        assert_eq!(cluster.log.last_index(), 3);
+
+        // Follower 2 acknowledges only index 1, even though the leader's log
+        // has already grown to 3 since that request was sent.
+        cluster.handle_rpc(
+            2,
+            RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                conflict_index: None,
+                match_index: 1,
+            }),
+        );
+
+        assert_eq!(cluster.leader_state.match_index.get(&2), Some(&1));
+        assert_eq!(
+            cluster.volatile.commit_index, 1,
+            "indices 2 and 3 are on only one node and must not be committed"
+        );
+    }
+
+    #[test]
+    fn leader_ignores_append_response_from_an_earlier_term() {
+        let mut cluster = make_cluster(&[2, 3], &unique_wal_path());
+        cluster.persistent.current_term = 2;
+        cluster.become_leader();
+
+        cluster.handle_rpc(
+            2,
+            RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                conflict_index: None,
+                match_index: 1,
+            }),
+        );
+
+        assert_eq!(cluster.leader_state.match_index.get(&2), Some(&0));
+    }
 }
-
-

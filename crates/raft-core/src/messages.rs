@@ -42,6 +42,12 @@ pub struct AppendEntriesResponse {
     /// On rejection, the follower's own last log index - lets the leader jump
     /// `next_index` back efficiently instead of decrementing one at a time.
     pub conflict_index: Option<u64>,
+    /// On success: the highest log index the follower has just verified matches
+    /// the leader's log (`prev_log_index + entries.len()` of the request being
+    /// answered). Echoing it makes every response self-describing, so the leader
+    /// never has to guess what a response refers to by looking at its own
+    /// (possibly newer) log tail. Always 0 on rejection.
+    pub match_index: u64,
 }
 
 /// Top-level envelope for everything sent over the wire between nodes.

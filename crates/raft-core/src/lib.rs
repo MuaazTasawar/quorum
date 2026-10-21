@@ -12,6 +12,6 @@ pub use messages::{
 };
 pub use replication::{
     advance_commit_index, build_append_entries, handle_append_entries,
-    handle_append_entries_response,
+    handle_append_entries_response, AppendEffect,
 };
 pub use state::{LeaderState, NodeId, PersistentState, Role, Term, VolatileState};
