@@ -1,4 +1,6 @@
-use crate::cluster::{ClientCommand, ClientCommandResult, ClientQuery, ClusterHandle, ClusterSnapshot, QueryResult};
+use crate::cluster::{
+    ClientCommand, ClientCommandResult, ClientQuery, ClusterHandle, ClusterSnapshot, QueryResult,
+};
 use crate::errors::AppError;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -6,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use storage::Command;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -14,14 +17,17 @@ pub struct AppState {
     pub command_tx: mpsc::UnboundedSender<ClientCommand>,
     pub query_tx: mpsc::UnboundedSender<ClientQuery>,
     pub snapshot_rx: watch::Receiver<ClusterSnapshot>,
+    /// Upper bound on how long one request waits for the cluster to answer.
+    pub request_timeout: Duration,
 }
 
 impl AppState {
-    pub fn from_handle(handle: ClusterHandle) -> Self {
+    pub fn from_handle(handle: ClusterHandle, request_timeout: Duration) -> Self {
         Self {
             command_tx: handle.command_tx,
             query_tx: handle.query_tx,
             snapshot_rx: handle.snapshot_rx,
+            request_timeout,
         }
     }
 }
@@ -38,6 +44,24 @@ pub fn router(state: AppState) -> Router {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.snapshot_rx.borrow().clone())
+}
+
+/// Waits for the cluster's answer, but never longer than `timeout`.
+///
+/// Without a deadline, a request to a leader that cannot reach a majority would
+/// sit here until the client's own connection timeout fired, and the client
+/// would learn nothing. `may_have_applied` says whether giving up here leaves
+/// the outcome genuinely unknown (true for writes, false for reads).
+async fn await_reply<T>(
+    receiver: oneshot::Receiver<T>,
+    timeout: Duration,
+    may_have_applied: bool,
+) -> Result<T, AppError> {
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_)) => Err(AppError::ChannelClosed),
+        Err(_) => Err(AppError::Timeout { may_have_applied }),
+    }
 }
 
 /// `is_leader` is the field clients must check first - `value: None` alone is
@@ -61,7 +85,7 @@ async fn get_key(
         .send(ClientQuery { key, respond_to })
         .map_err(|_| AppError::ChannelClosed)?;
 
-    match receiver.await.map_err(|_| AppError::ChannelClosed)? {
+    match await_reply(receiver, state.request_timeout, false).await? {
         QueryResult::Value(v) => Ok(Json(GetResponse {
             is_leader: true,
             value: v.map(|bytes| String::from_utf8_lossy(&bytes).to_string()),
@@ -87,48 +111,40 @@ struct WriteResponse {
     leader_hint: Option<u32>,
 }
 
-async fn put_key(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Json(body): Json<PutBody>,
-) -> Result<Json<WriteResponse>, AppError> {
+/// Submits a write and waits for it to be committed and applied. Shared by PUT
+/// and DELETE so both have identical redirect, timeout and leadership-loss
+/// behaviour.
+async fn submit_write(state: &AppState, command: Command) -> Result<Json<WriteResponse>, AppError> {
     let (respond_to, receiver) = oneshot::channel();
     state
         .command_tx
-        .send(ClientCommand {
-            command: Command::Put { key, value: body.value.into_bytes() },
-            respond_to,
-        })
+        .send(ClientCommand { command, respond_to })
         .map_err(|_| AppError::ChannelClosed)?;
 
-    match receiver.await.map_err(|_| AppError::ChannelClosed)? {
+    match await_reply(receiver, state.request_timeout, true).await? {
         ClientCommandResult::Applied(_) => {
             Ok(Json(WriteResponse { is_leader: true, applied: true, leader_hint: None }))
         }
         ClientCommandResult::NotLeader { leader_hint } => {
             Ok(Json(WriteResponse { is_leader: false, applied: false, leader_hint }))
         }
+        ClientCommandResult::LeadershipLost => Err(AppError::LeadershipLost),
     }
+}
+
+async fn put_key(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<PutBody>,
+) -> Result<Json<WriteResponse>, AppError> {
+    submit_write(&state, Command::Put { key, value: body.value.into_bytes() }).await
 }
 
 async fn delete_key(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<Json<WriteResponse>, AppError> {
-    let (respond_to, receiver) = oneshot::channel();
-    state
-        .command_tx
-        .send(ClientCommand { command: Command::Delete { key }, respond_to })
-        .map_err(|_| AppError::ChannelClosed)?;
-
-    match receiver.await.map_err(|_| AppError::ChannelClosed)? {
-        ClientCommandResult::Applied(_) => {
-            Ok(Json(WriteResponse { is_leader: true, applied: true, leader_hint: None }))
-        }
-        ClientCommandResult::NotLeader { leader_hint } => {
-            Ok(Json(WriteResponse { is_leader: false, applied: false, leader_hint }))
-        }
-    }
+    submit_write(&state, Command::Delete { key }).await
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {

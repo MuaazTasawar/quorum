@@ -23,6 +23,11 @@ pub struct ClientCommand {
 pub enum ClientCommandResult {
     Applied(Option<Vec<u8>>),
     NotLeader { leader_hint: Option<NodeId> },
+    /// This node was the leader when it accepted the write but lost leadership
+    /// before the write was confirmed. The outcome is UNKNOWN, not "failed": the
+    /// entry may already be on a majority, in which case the next leader will
+    /// commit it, or it may be discarded. Callers must not assume either.
+    LeadershipLost,
 }
 
 /// A read request. Deliberately NOT a `Command` / NOT routed through the
@@ -176,6 +181,7 @@ impl Cluster {
                     self.handle_client_query(query);
                 }
                 _ = heartbeat_ticker.tick(), if self.volatile.role == Role::Leader => {
+                    self.prune_abandoned_commands();
                     self.broadcast_append_entries();
                 }
                 _ = election_sleep, if self.volatile.role != Role::Leader => {
@@ -188,7 +194,43 @@ impl Cluster {
         }
     }
 
+    /// Handles one inbound RPC. Leadership can be lost inside almost any handler
+    /// (a higher term arriving in a vote request, an append, or either response),
+    /// so rather than patching every path this wrapper checks for the transition
+    /// once, afterwards, and fails the writes that were waiting on this node.
     fn handle_rpc(&mut self, from: NodeId, msg: RpcMessage) {
+        let was_leader = self.volatile.role == Role::Leader;
+        self.dispatch_rpc(from, msg);
+        if was_leader && self.volatile.role != Role::Leader {
+            self.abort_pending_commands();
+        }
+    }
+
+    /// Answers every write still waiting on this node with `LeadershipLost`.
+    /// Without this, a deposed leader would leave its clients waiting forever on
+    /// entries it can no longer commit.
+    fn abort_pending_commands(&mut self) {
+        if self.pending_commands.is_empty() {
+            return;
+        }
+        info!(
+            pending = self.pending_commands.len(),
+            "lost leadership - failing writes that were waiting on this node"
+        );
+        for (_, respond_to) in self.pending_commands.drain() {
+            let _ = respond_to.send(ClientCommandResult::LeadershipLost);
+        }
+    }
+
+    /// Drops bookkeeping for requests whose caller has already gone away (an HTTP
+    /// request that timed out, or a client that disconnected). The log entry
+    /// itself stays and is committed or discarded as usual; only the reply slot
+    /// is released, so an unreachable majority cannot make this map grow forever.
+    fn prune_abandoned_commands(&mut self) {
+        self.pending_commands.retain(|_, respond_to| !respond_to.is_closed());
+    }
+
+    fn dispatch_rpc(&mut self, from: NodeId, msg: RpcMessage) {
         match msg {
             RpcMessage::Hello(_) => {} // handshake only matters at connect time
 
@@ -581,11 +623,30 @@ mod tests {
     }
 
     fn put_command(key: &str, value: &str) -> ClientCommand {
-        let (respond_to, _receiver) = oneshot::channel();
-        ClientCommand {
+        put_command_with_receiver(key, value).0
+    }
+
+    /// Like `put_command`, but keeps the receiving end so a test can see what
+    /// the client would have been told.
+    fn put_command_with_receiver(
+        key: &str,
+        value: &str,
+    ) -> (ClientCommand, oneshot::Receiver<ClientCommandResult>) {
+        let (respond_to, receiver) = oneshot::channel();
+        let command = ClientCommand {
             command: Command::Put { key: key.into(), value: value.as_bytes().to_vec() },
             respond_to,
-        }
+        };
+        (command, receiver)
+    }
+
+    fn higher_term_response(term: Term) -> RpcMessage {
+        RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term,
+            success: false,
+            conflict_index: None,
+            match_index: 0,
+        })
     }
 
     /// The vote reply this node sent to `peer`, if any.
@@ -852,5 +913,112 @@ mod tests {
         let cluster = build_cluster(&dir, &[]);
         assert_eq!(cluster.log.last_index(), 2);
         assert_eq!(cluster.log.term_at(2), Some(1));
+    }
+
+    // ---- request lifecycle --------------------------------------------------
+
+    #[test]
+    fn losing_leadership_fails_every_write_that_was_waiting() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+
+        let (first, mut first_rx) = put_command_with_receiver("a", "1");
+        let (second, mut second_rx) = put_command_with_receiver("b", "2");
+        cluster.handle_client_command(first);
+        cluster.handle_client_command(second);
+        // Nothing is committed (no follower has answered), so both are waiting.
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
+
+        // A response from a newer term deposes this leader.
+        cluster.handle_rpc(2, higher_term_response(7));
+
+        assert_eq!(cluster.volatile.role, Role::Follower);
+        assert!(matches!(first_rx.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+        assert!(matches!(second_rx.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+        assert!(cluster.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn a_vote_request_from_a_newer_term_also_fails_waiting_writes() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+
+        let (command, mut receiver) = put_command_with_receiver("a", "1");
+        cluster.handle_client_command(command);
+
+        // Leadership is lost inside the vote handler, not via step_down().
+        cluster.handle_rpc(3, vote_request(9, 3));
+
+        assert_eq!(cluster.volatile.role, Role::Follower);
+        assert!(matches!(receiver.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+    }
+
+    #[test]
+    fn an_append_from_a_newer_leader_also_fails_waiting_writes() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+
+        let (command, mut receiver) = put_command_with_receiver("a", "1");
+        cluster.handle_client_command(command);
+
+        cluster.handle_rpc(2, append_request(5, 2, 0, 0, vec![]));
+
+        assert_eq!(cluster.volatile.role, Role::Follower);
+        assert!(matches!(receiver.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+    }
+
+    #[test]
+    fn writes_keep_waiting_while_leadership_is_intact() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+
+        let (command, mut receiver) = put_command_with_receiver("a", "1");
+        cluster.handle_client_command(command);
+
+        // A same-term response that does not carry the entry changes nothing.
+        cluster.handle_rpc(
+            2,
+            RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                conflict_index: None,
+                match_index: 1,
+            }),
+        );
+
+        assert_eq!(cluster.volatile.role, Role::Leader);
+        assert!(receiver.try_recv().is_err(), "still waiting, not failed");
+        assert_eq!(cluster.pending_commands.len(), 1);
+    }
+
+    #[test]
+    fn abandoned_requests_are_pruned_but_live_ones_are_kept() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+
+        let (abandoned, abandoned_rx) = put_command_with_receiver("a", "1");
+        let (live, _live_rx) = put_command_with_receiver("b", "2");
+        cluster.handle_client_command(abandoned);
+        cluster.handle_client_command(live);
+        assert_eq!(cluster.pending_commands.len(), 2);
+
+        // The first caller gives up (e.g. its HTTP request timed out).
+        drop(abandoned_rx);
+        cluster.prune_abandoned_commands();
+
+        assert_eq!(cluster.pending_commands.len(), 1);
+        // The entry itself is still in the log: only the reply slot was released.
+        assert_eq!(cluster.log.last_index(), 3);
     }
 }

@@ -14,8 +14,10 @@ use node::cluster::{
     QueryResult,
 };
 use node::config::NodeConfig;
+use node::metrics_api::{router, AppState};
 use raft_core::{NodeId, RpcMessage};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,6 +247,27 @@ impl TestCluster {
     }
 
     // ---- client operations --------------------------------------------------
+
+    /// Serves node `id`'s real HTTP API (the same router the node binary uses) on
+    /// a free local port and returns its address. Lets a test exercise the whole
+    /// path: HTTP request -> cluster -> consensus -> HTTP response.
+    pub async fn serve_http(&self, id: NodeId, request_timeout: Duration) -> SocketAddr {
+        let handle = &self.nodes[&id].handle;
+        let state = AppState {
+            command_tx: handle.command_tx.clone(),
+            query_tx: handle.query_tx.clone(),
+            snapshot_rx: handle.snapshot_rx.clone(),
+            request_timeout,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local port should be bindable");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(state)).await;
+        });
+        addr
+    }
 
     pub async fn put(&self, id: NodeId, key: &str, value: &str) -> ClientCommandResult {
         let (respond_to, receiver) = oneshot::channel();
