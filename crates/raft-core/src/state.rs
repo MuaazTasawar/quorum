@@ -53,6 +53,31 @@ pub struct LeaderState {
     /// For each follower: highest log index known to be replicated on that follower.
     /// Used to compute commit_index (index replicated on a majority).
     pub match_index: std::collections::HashMap<NodeId, u64>,
+    /// For each follower: when it last answered this leader (any AppendEntries
+    /// response from the current term, accepting or rejecting - either proves the
+    /// follower is reachable and still recognises this leader). Check-quorum uses
+    /// this to notice a leader that has been cut off from the majority.
+    pub last_ack: std::collections::HashMap<NodeId, Instant>,
+}
+
+impl LeaderState {
+    /// Records that `peer` answered this leader at `now`.
+    pub fn record_ack(&mut self, peer: NodeId, now: Instant) {
+        self.last_ack.insert(peer, now);
+    }
+
+    /// True if, counting the leader itself, a majority of the cluster has answered
+    /// within `window` of `now`. A leader for which this is false cannot commit
+    /// anything and no longer has any claim to being the leader, so it should
+    /// step down rather than keep accepting writes it cannot complete.
+    pub fn has_recent_quorum(&self, cluster_size: usize, now: Instant, window: Duration) -> bool {
+        let recent_peers = self
+            .last_ack
+            .values()
+            .filter(|&&acked_at| now.saturating_duration_since(acked_at) <= window)
+            .count();
+        recent_peers + 1 >= cluster_size / 2 + 1
+    }
 }
 
 impl VolatileState {
@@ -69,5 +94,58 @@ impl VolatileState {
     /// Follower should become a Candidate and start an election.
     pub fn election_timed_out(&self, timeout: Duration) -> bool {
         self.last_heartbeat.elapsed() > timeout
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_millis(300);
+
+    fn leader_with_acks(acks: &[(NodeId, Instant)]) -> LeaderState {
+        let mut state = LeaderState::default();
+        for &(peer, at) in acks {
+            state.record_ack(peer, at);
+        }
+        state
+    }
+
+    #[test]
+    fn a_single_node_cluster_always_has_quorum() {
+        let state = LeaderState::default();
+        assert!(state.has_recent_quorum(1, Instant::now(), WINDOW));
+    }
+
+    #[test]
+    fn three_nodes_need_one_recent_peer_besides_the_leader() {
+        let now = Instant::now();
+        assert!(!leader_with_acks(&[]).has_recent_quorum(3, now, WINDOW));
+        assert!(leader_with_acks(&[(2, now)]).has_recent_quorum(3, now, WINDOW));
+    }
+
+    #[test]
+    fn five_nodes_need_two_recent_peers_besides_the_leader() {
+        let now = Instant::now();
+        assert!(!leader_with_acks(&[(2, now)]).has_recent_quorum(5, now, WINDOW));
+        assert!(leader_with_acks(&[(2, now), (3, now)]).has_recent_quorum(5, now, WINDOW));
+    }
+
+    #[test]
+    fn acks_older_than_the_window_do_not_count() {
+        let long_ago = Instant::now();
+        let now = long_ago + Duration::from_millis(500);
+        let state = leader_with_acks(&[(2, long_ago), (3, long_ago)]);
+        assert!(!state.has_recent_quorum(3, now, WINDOW));
+    }
+
+    #[test]
+    fn a_newer_ack_replaces_an_older_one() {
+        let long_ago = Instant::now();
+        let now = long_ago + Duration::from_millis(500);
+        let mut state = leader_with_acks(&[(2, long_ago)]);
+        assert!(!state.has_recent_quorum(3, now, WINDOW));
+        state.record_ack(2, now);
+        assert!(state.has_recent_quorum(3, now, WINDOW));
     }
 }

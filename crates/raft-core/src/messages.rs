@@ -20,6 +20,32 @@ pub struct RequestVoteResponse {
     pub vote_granted: bool,
 }
 
+/// Sent by a node whose election timer fired, BEFORE it changes anything, to ask
+/// "would you vote for me if I started an election?". Nothing about the sender's
+/// or receiver's term or vote changes as a result (Raft dissertation §9.6), so a
+/// node that is cut off from the cluster can ask forever without inflating its
+/// term and then deposing a healthy leader when it reconnects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreVoteRequest {
+    /// The term the sender WOULD use (its current term + 1). It is not adopted
+    /// by anyone who receives it.
+    pub term: Term,
+    pub candidate_id: NodeId,
+    pub last_log_index: u64,
+    pub last_log_term: Term,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreVoteResponse {
+    /// The responder's own current term. A higher one than the asker's tells the
+    /// asker it is out of date.
+    pub term: Term,
+    pub vote_granted: bool,
+    /// Echo of `PreVoteRequest::term`, so the asker can tell an answer to the
+    /// current round from a late answer to an earlier one.
+    pub request_term: Term,
+}
+
 /// Sent by the Leader to replicate log entries and as a heartbeat (empty `entries`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesRequest {
@@ -62,4 +88,6 @@ pub enum RpcMessage {
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntriesRequest),
     AppendEntriesResponse(AppendEntriesResponse),
+    PreVote(PreVoteRequest),
+    PreVoteResponse(PreVoteResponse),
 }

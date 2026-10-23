@@ -64,9 +64,10 @@ async fn http_round_trip_against_a_healthy_cluster() {
 }
 
 /// The case that used to hang: the leader accepts a write, is cut off, and the
-/// rest of the cluster moves on without it. When the partition heals the old
-/// leader steps down, and the client must be told right away, long before any
-/// deadline, rather than being left waiting on an entry that will never commit.
+/// rest of the cluster moves on without it. The old leader loses leadership (it
+/// notices it has no majority, or hears of the newer term when the partition
+/// heals) and the client must be told right away, long before any deadline,
+/// rather than being left waiting on an entry that will never commit.
 #[tokio::test]
 async fn a_write_waiting_on_a_deposed_leader_is_failed_promptly() {
     let cluster = TestCluster::start(&[1, 2, 3]);
@@ -106,13 +107,15 @@ async fn a_write_waiting_on_a_deposed_leader_is_failed_promptly() {
     let _ = new_leader;
 }
 
-/// A leader that simply cannot reach a majority, and is never told otherwise,
-/// must still answer: with a 504 at the deadline, not by never answering.
+/// A deadline shorter than the leader's own check-quorum window (an election
+/// timeout, 300 ms) must still produce an answer: a 504 at the deadline, not
+/// silence. The deadline is set well inside that window so this test exercises
+/// the timeout path rather than racing the step-down.
 #[tokio::test]
-async fn a_write_that_cannot_reach_a_majority_times_out_with_504() {
+async fn a_write_that_cannot_finish_before_its_deadline_times_out_with_504() {
     let cluster = TestCluster::start(&[1, 2, 3]);
     let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
-    let addr = cluster.serve_http(leader, Duration::from_millis(300)).await;
+    let addr = cluster.serve_http(leader, Duration::from_millis(100)).await;
 
     cluster.isolate(leader);
 
@@ -123,22 +126,58 @@ async fn a_write_that_cannot_reach_a_majority_times_out_with_504() {
     assert_eq!(status, 504, "{body}");
     assert!(body.contains("\"outcome_unknown\":true"), "{body}");
     assert!(
-        elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(3),
+        elapsed >= Duration::from_millis(80) && elapsed < Duration::from_secs(2),
         "should answer at the deadline, took {elapsed:?}"
     );
 }
 
-/// A leader that is cut off from the cluster must still answer its own
-/// `/health` endpoint, because that is how an operator finds out what is wrong.
+/// The other half of the picture: with a generous deadline, a leader that has been
+/// cut off from the majority does not make the client wait for it. Check-quorum
+/// makes the leader give up on its own, and the waiting write is failed within an
+/// election timeout or so, not after 60 seconds.
 #[tokio::test]
-async fn health_stays_available_while_the_leader_is_cut_off() {
+async fn a_leader_cut_off_from_the_majority_fails_waiting_writes_quickly() {
+    let cluster = TestCluster::start(&[1, 2, 3]);
+    let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
+    let addr = cluster.serve_http(leader, Duration::from_secs(60)).await;
+
+    cluster.isolate(leader);
+
+    let started = Instant::now();
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        http(addr, "PUT", "/kv/stuck", Some(PUT_BODY)),
+    )
+    .await
+    .expect("check-quorum must free the client long before the 60 s deadline");
+    let elapsed = started.elapsed();
+
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("\"outcome_unknown\":true"), "{body}");
+    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+}
+
+/// A node that is cut off from the cluster must still answer its own `/health`
+/// endpoint, because that is how an operator finds out what is wrong. Here that
+/// answer shows the leader noticing it has no majority and stepping down.
+#[tokio::test]
+async fn health_stays_available_and_shows_a_cut_off_leader_stepping_down() {
     let cluster = TestCluster::start(&[1, 2, 3]);
     let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
     let addr = cluster.serve_http(leader, Duration::from_millis(300)).await;
 
-    cluster.isolate(leader);
-
     let (status, body) = http(addr, "GET", "/health", None).await;
     assert_eq!(status, 200);
     assert!(body.contains("\"role\":\"Leader\""), "{body}");
+
+    cluster.isolate(leader);
+    cluster
+        .wait_until(Duration::from_secs(3), "the cut-off leader to step down", |c| {
+            c.snapshot(leader).role != "Leader"
+        })
+        .await;
+
+    let (status, body) = http(addr, "GET", "/health", None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"role\":\"Follower\""), "{body}");
 }

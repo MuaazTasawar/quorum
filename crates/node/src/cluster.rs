@@ -1,7 +1,8 @@
 use raft_core::{
     advance_commit_index, build_append_entries, handle_append_entries,
-    handle_append_entries_response, handle_request_vote, start_election, ElectionTimeoutConfig,
-    LeaderState, Log, NodeId, PersistentState, Role, RpcMessage, Term, VoteTally, VolatileState,
+    handle_append_entries_response, handle_pre_vote, handle_request_vote, start_election,
+    ElectionTimeoutConfig, LeaderState, Log, NodeId, PersistentState, PreVoteRequest, Role,
+    RpcMessage, Term, VoteTally, VolatileState,
 };
 use std::collections::HashMap;
 use storage::{Command, KvStore, Persistence, Recovered};
@@ -85,12 +86,21 @@ fn persist_must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T 
     }
 }
 
+/// An in-progress pre-vote round: the term this node WOULD use, and the answers
+/// collected so far. Nothing here is persisted or visible to peers as a term
+/// change; if the round fails it simply evaporates.
+struct PreVoteRound {
+    term: Term,
+    tally: VoteTally,
+}
+
 pub struct Cluster {
     config: NodeConfig,
     persistent: PersistentState,
     volatile: VolatileState,
     leader_state: LeaderState,
     vote_tally: Option<VoteTally>,
+    pre_vote: Option<PreVoteRound>,
     log: Log,
     persistence: Persistence,
     kv_store: KvStore,
@@ -140,6 +150,7 @@ impl Cluster {
             volatile: VolatileState::new(),
             leader_state: LeaderState::default(),
             vote_tally: None,
+            pre_vote: None,
             log,
             persistence,
             kv_store,
@@ -181,11 +192,14 @@ impl Cluster {
                     self.handle_client_query(query);
                 }
                 _ = heartbeat_ticker.tick(), if self.volatile.role == Role::Leader => {
-                    self.prune_abandoned_commands();
-                    self.broadcast_append_entries();
+                    self.check_quorum();
+                    if self.volatile.role == Role::Leader {
+                        self.prune_abandoned_commands();
+                        self.broadcast_append_entries();
+                    }
                 }
                 _ = election_sleep, if self.volatile.role != Role::Leader => {
-                    self.begin_election();
+                    self.begin_pre_vote();
                 }
             }
 
@@ -267,6 +281,33 @@ impl Cluster {
                 }
             }
 
+            RpcMessage::PreVote(req) => {
+                // Read-only by construction: no term change, no vote recorded, no
+                // timer reset, nothing to persist. Answering must never have side
+                // effects, or a disruptive node could use it to suppress elections.
+                let resp = handle_pre_vote(&self.persistent, &self.log, &req, self.leader_is_active());
+                self.send_to(from, RpcMessage::PreVoteResponse(resp));
+            }
+
+            RpcMessage::PreVoteResponse(resp) => {
+                if resp.term > self.persistent.current_term {
+                    // Someone is already in a newer term: we are the stale one.
+                    self.step_down(resp.term);
+                    return;
+                }
+                let won = match self.pre_vote.as_mut() {
+                    // Ignore a denial, or a late answer to an earlier round.
+                    Some(round) if resp.vote_granted && resp.request_term == round.term => {
+                        round.tally.record_vote(from);
+                        round.tally.has_majority()
+                    }
+                    _ => false,
+                };
+                if won {
+                    self.begin_election();
+                }
+            }
+
             RpcMessage::AppendEntries(req) => {
                 let term_before = self.persistent.current_term;
                 let is_new_term = req.term > term_before;
@@ -296,6 +337,8 @@ impl Cluster {
                 // clients hitting this follower get a useful leader_hint.
                 if req.term >= term_before {
                     self.known_leader = Some(leader_id);
+                    // A live leader exists, so there is nothing to elect.
+                    self.pre_vote = None;
                 }
                 if is_new_term {
                     self.vote_tally = None;
@@ -318,6 +361,9 @@ impl Cluster {
                 if self.volatile.role != Role::Leader {
                     return;
                 }
+                // Any same-term answer, even a rejection, proves this follower is
+                // reachable and still recognises us as its leader.
+                self.leader_state.record_ack(from, std::time::Instant::now());
                 handle_append_entries_response(&mut self.leader_state, from, &resp);
                 self.advance_leader_commit();
             }
@@ -370,10 +416,89 @@ impl Cluster {
         self.persist_hard_state();
         self.volatile.role = Role::Follower;
         self.vote_tally = None;
+        self.pre_vote = None;
         self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
     }
 
+    /// True if this node has reason to believe a working leader exists: it IS the
+    /// leader, or it heard from one within the minimum election timeout. Used to
+    /// refuse pre-votes, so a node returning from a partition cannot force an
+    /// election against a leader that never stopped.
+    fn leader_is_active(&self) -> bool {
+        self.volatile.role == Role::Leader
+            || self.volatile.last_heartbeat.elapsed() < self.election_timeout.min
+    }
+
+    /// The election timer fired. Instead of immediately bumping the term and
+    /// asking for real votes, first ask whether a majority WOULD vote for us. Only
+    /// if they would does a real election start. A node that cannot reach anyone
+    /// therefore never changes its term (or writes to disk) no matter how long it
+    /// stays cut off.
+    fn begin_pre_vote(&mut self) {
+        // With no peers there is no one to ask; a one-node cluster just elects itself.
+        if self.config.cluster_size() == 1 {
+            self.begin_election();
+            return;
+        }
+
+        let proposed_term = self.persistent.current_term + 1;
+        self.pre_vote = Some(PreVoteRound {
+            term: proposed_term,
+            tally: VoteTally::new(self.config.id, self.config.cluster_size()),
+        });
+        // If this round gets no majority, the timer fires again and we ask again.
+        self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
+        info!(proposed_term, "election timeout - asking peers whether they would vote");
+
+        let req = PreVoteRequest {
+            term: proposed_term,
+            candidate_id: self.config.id,
+            last_log_index: self.log.last_index(),
+            last_log_term: self.log.last_term(),
+        };
+        let peer_ids: Vec<NodeId> = self.peer_outboxes.keys().copied().collect();
+        for peer_id in peer_ids {
+            self.send_to(peer_id, RpcMessage::PreVote(req.clone()));
+        }
+    }
+
+    /// Check-quorum: a leader that no majority has answered within an election
+    /// timeout cannot commit anything and may already have been replaced, so it
+    /// steps down instead of accepting writes it can never finish. The wait is the
+    /// MAXIMUM election timeout, so a leader never steps down earlier than the
+    /// followers could have given up on it.
+    fn check_quorum(&mut self) {
+        if self.config.cluster_size() == 1 {
+            return;
+        }
+        let has_quorum = self.leader_state.has_recent_quorum(
+            self.config.cluster_size(),
+            std::time::Instant::now(),
+            self.election_timeout.max,
+        );
+        if !has_quorum {
+            warn!(
+                term = self.persistent.current_term,
+                "no majority has answered this leader within an election timeout - stepping down"
+            );
+            self.lose_leadership();
+        }
+    }
+
+    /// Gives up leadership without any change of term (the term is only ever
+    /// changed by hearing about a newer one), and answers every write that was
+    /// waiting on this node.
+    fn lose_leadership(&mut self) {
+        self.volatile.role = Role::Follower;
+        self.vote_tally = None;
+        self.pre_vote = None;
+        self.known_leader = None;
+        self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
+        self.abort_pending_commands();
+    }
+
     fn begin_election(&mut self) {
+        self.pre_vote = None;
         let req = start_election(&mut self.persistent, &mut self.volatile, &self.log, self.config.id);
         // The new term and our vote for ourselves must be durable before any
         // RequestVote leaves this node.
@@ -399,11 +524,17 @@ impl Cluster {
         self.known_leader = Some(self.config.id);
         self.vote_tally = None;
 
+        self.pre_vote = None;
+
         let next = self.log.last_index() + 1;
         self.leader_state = LeaderState::default();
+        let elected_at = std::time::Instant::now();
         for &peer_id in self.peer_outboxes.keys() {
             self.leader_state.next_index.insert(peer_id, next);
             self.leader_state.match_index.insert(peer_id, 0);
+            // A majority just voted for us, so every peer starts with a fresh
+            // acknowledgement; check-quorum only fires if that goes stale.
+            self.leader_state.record_ack(peer_id, elected_at);
         }
 
         // Raft paper section 8: immediately append a no-op entry in this
@@ -524,8 +655,8 @@ impl Cluster {
 mod tests {
     use super::*;
     use raft_core::{
-        AppendEntriesRequest, AppendEntriesResponse, LogEntry, RequestVoteRequest,
-        RequestVoteResponse,
+        AppendEntriesRequest, AppendEntriesResponse, LogEntry, PreVoteResponse,
+        RequestVoteRequest, RequestVoteResponse,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -647,6 +778,47 @@ mod tests {
             conflict_index: None,
             match_index: 0,
         })
+    }
+
+    fn pre_vote_request(term: Term, candidate_id: NodeId) -> RpcMessage {
+        RpcMessage::PreVote(PreVoteRequest {
+            term,
+            candidate_id,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+    }
+
+    fn pre_vote_response(term: Term, vote_granted: bool, request_term: Term) -> RpcMessage {
+        RpcMessage::PreVoteResponse(PreVoteResponse { term, vote_granted, request_term })
+    }
+
+    /// Makes the node behave as if it last heard from a leader long ago.
+    fn forget_leader_contact(cluster: &mut Cluster) {
+        let long_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .unwrap_or_else(std::time::Instant::now);
+        cluster.volatile.last_heartbeat = long_ago;
+    }
+
+    /// Makes every follower's last acknowledgement of this leader ancient.
+    fn age_all_acks(cluster: &mut Cluster) {
+        let long_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .unwrap_or_else(std::time::Instant::now);
+        for acked_at in cluster.leader_state.last_ack.values_mut() {
+            *acked_at = long_ago;
+        }
+    }
+
+    /// Every message this node has queued for `peer`, oldest first.
+    fn drain(outputs: &mut Outputs, peer: NodeId) -> Vec<RpcMessage> {
+        let rx = outputs.get_mut(&peer).unwrap();
+        let mut messages = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        messages
     }
 
     /// The vote reply this node sent to `peer`, if any.
@@ -1020,5 +1192,263 @@ mod tests {
         assert_eq!(cluster.pending_commands.len(), 1);
         // The entry itself is still in the log: only the reply slot was released.
         assert_eq!(cluster.log.last_index(), 3);
+    }
+
+    // ---- pre-vote -----------------------------------------------------------
+
+    #[test]
+    fn an_election_timeout_starts_a_pre_vote_and_changes_no_state() {
+        let dir = TestDir::new();
+        {
+            let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+            cluster.begin_pre_vote();
+
+            assert_eq!(cluster.persistent.current_term, 0, "term must not move");
+            assert_eq!(cluster.persistent.voted_for, None, "no vote may be cast");
+            assert_eq!(cluster.volatile.role, Role::Follower);
+
+            for peer in [2, 3] {
+                let sent = drain(&mut outputs, peer);
+                assert_eq!(sent.len(), 1);
+                assert!(
+                    matches!(&sent[0], RpcMessage::PreVote(req) if req.term == 1 && req.candidate_id == 1),
+                    "peer {peer} should be asked about term 1, got {sent:?}"
+                );
+            }
+        }
+        // And nothing was written to disk either: a node that is cut off and
+        // timing out over and over costs no fsyncs.
+        let cluster = build_cluster(&dir, &[2, 3]);
+        assert_eq!(cluster.persistent.current_term, 0);
+    }
+
+    #[test]
+    fn a_pre_vote_majority_starts_the_real_election() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.begin_pre_vote();
+        drain(&mut outputs, 2);
+        drain(&mut outputs, 3);
+
+        // One peer's yes plus our own makes 2 of 3.
+        cluster.handle_rpc(2, pre_vote_response(0, true, 1));
+
+        assert_eq!(cluster.persistent.current_term, 1);
+        assert_eq!(cluster.persistent.voted_for, Some(1));
+        assert_eq!(cluster.volatile.role, Role::Candidate);
+        let sent = drain(&mut outputs, 3);
+        assert!(
+            sent.iter().any(|m| matches!(m, RpcMessage::RequestVote(req) if req.term == 1)),
+            "real vote requests must follow, got {sent:?}"
+        );
+    }
+
+    #[test]
+    fn denied_pre_votes_never_start_an_election() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.begin_pre_vote();
+
+        cluster.handle_rpc(2, pre_vote_response(0, false, 1));
+        cluster.handle_rpc(3, pre_vote_response(0, false, 1));
+
+        assert_eq!(cluster.persistent.current_term, 0);
+        assert_eq!(cluster.volatile.role, Role::Follower);
+    }
+
+    #[test]
+    fn a_late_answer_to_an_earlier_pre_vote_round_is_ignored() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.begin_pre_vote(); // proposes term 1
+
+        cluster.handle_rpc(2, pre_vote_response(0, true, 99));
+
+        assert_eq!(cluster.persistent.current_term, 0);
+        assert_eq!(cluster.volatile.role, Role::Follower);
+    }
+
+    #[test]
+    fn a_pre_vote_denial_from_a_newer_term_makes_the_asker_step_down_to_it() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.begin_pre_vote();
+
+        cluster.handle_rpc(2, pre_vote_response(8, false, 1));
+
+        assert_eq!(cluster.persistent.current_term, 8, "learns it was out of date");
+        assert!(cluster.pre_vote.is_none());
+    }
+
+    #[test]
+    fn hearing_from_a_leader_cancels_a_pre_vote_in_progress() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.begin_pre_vote();
+        assert!(cluster.pre_vote.is_some());
+
+        cluster.handle_rpc(2, append_request(1, 2, 0, 0, vec![]));
+
+        assert!(cluster.pre_vote.is_none());
+    }
+
+    #[test]
+    fn answering_a_pre_vote_has_no_side_effects_on_the_voter() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 3;
+        forget_leader_contact(&mut cluster);
+        let deadline_before = cluster.election_deadline;
+
+        cluster.handle_rpc(2, pre_vote_request(4, 2));
+
+        let sent = drain(&mut outputs, 2);
+        assert!(
+            matches!(&sent[..], [RpcMessage::PreVoteResponse(r)] if r.vote_granted && r.term == 3 && r.request_term == 4),
+            "expected a single grant, got {sent:?}"
+        );
+        assert_eq!(cluster.persistent.current_term, 3, "term must not change");
+        assert_eq!(cluster.persistent.voted_for, None, "vote must not be spent");
+        assert_eq!(cluster.volatile.role, Role::Follower);
+        assert_eq!(cluster.election_deadline, deadline_before, "timer must not be reset");
+    }
+
+    #[test]
+    fn a_follower_that_recently_heard_from_a_leader_denies_pre_votes() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        // A real leader (node 2) is heard from right now.
+        cluster.handle_rpc(2, append_request(1, 2, 0, 0, vec![]));
+        drain(&mut outputs, 2);
+
+        cluster.handle_rpc(3, pre_vote_request(2, 3));
+
+        let sent = drain(&mut outputs, 3);
+        assert!(
+            matches!(&sent[..], [RpcMessage::PreVoteResponse(r)] if !r.vote_granted),
+            "a node with a live leader must refuse, got {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_leader_denies_pre_votes() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        drain(&mut outputs, 2);
+
+        cluster.handle_rpc(2, pre_vote_request(2, 2));
+
+        let sent = drain(&mut outputs, 2);
+        assert!(
+            matches!(&sent[..], [RpcMessage::PreVoteResponse(r)] if !r.vote_granted),
+            "a working leader must refuse, got {sent:?}"
+        );
+        assert_eq!(cluster.volatile.role, Role::Leader);
+    }
+
+    #[test]
+    fn a_single_node_cluster_skips_the_pre_vote() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
+        cluster.begin_pre_vote();
+        assert_eq!(cluster.volatile.role, Role::Leader);
+    }
+
+    // ---- check-quorum -------------------------------------------------------
+
+    #[test]
+    fn a_leader_no_majority_has_answered_steps_down_and_fails_its_waiting_writes() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        let (command, mut receiver) = put_command_with_receiver("a", "1");
+        cluster.handle_client_command(command);
+
+        age_all_acks(&mut cluster);
+        cluster.check_quorum();
+
+        assert_eq!(cluster.volatile.role, Role::Follower);
+        assert_eq!(cluster.persistent.current_term, 1, "stepping down must not touch the term");
+        assert!(matches!(receiver.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+        assert_eq!(cluster.known_leader, None);
+    }
+
+    #[test]
+    fn a_leader_that_a_majority_answered_recently_keeps_its_leadership() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        age_all_acks(&mut cluster);
+
+        // Node 2 answers now: the leader plus node 2 is 2 of 3.
+        cluster.handle_rpc(
+            2,
+            RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                conflict_index: None,
+                match_index: 1,
+            }),
+        );
+        cluster.check_quorum();
+
+        assert_eq!(cluster.volatile.role, Role::Leader);
+    }
+
+    #[test]
+    fn a_rejection_still_counts_as_the_follower_being_reachable() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        age_all_acks(&mut cluster);
+
+        cluster.handle_rpc(
+            2,
+            RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: false,
+                conflict_index: Some(0),
+                match_index: 0,
+            }),
+        );
+        cluster.check_quorum();
+
+        assert_eq!(cluster.volatile.role, Role::Leader);
+    }
+
+    #[test]
+    fn a_response_from_an_earlier_term_does_not_count_as_contact() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 2;
+        cluster.become_leader();
+        age_all_acks(&mut cluster);
+
+        cluster.handle_rpc(
+            2,
+            RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                conflict_index: None,
+                match_index: 1,
+            }),
+        );
+        cluster.check_quorum();
+
+        assert_eq!(cluster.volatile.role, Role::Follower, "a stale response proves nothing");
+    }
+
+    #[test]
+    fn a_single_node_leader_never_steps_down() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
+        cluster.begin_election();
+        cluster.check_quorum();
+        assert_eq!(cluster.volatile.role, Role::Leader);
     }
 }

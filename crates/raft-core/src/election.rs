@@ -1,5 +1,5 @@
 use crate::log::Log;
-use crate::messages::{RequestVoteRequest, RequestVoteResponse};
+use crate::messages::{PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse};
 use crate::state::{NodeId, PersistentState, VolatileState, Role};
 use rand::Rng;
 use std::collections::HashSet;
@@ -124,6 +124,43 @@ pub fn handle_request_vote(
     }
 }
 
+/// Answers a pre-vote: "would you vote for me if I started an election?"
+/// (Raft dissertation §9.6.)
+///
+/// This is deliberately READ-ONLY. It takes `&PersistentState` and never touches
+/// `VolatileState`, so answering cannot change the term, spend the node's vote,
+/// change its role, or reset its election timer. That is the whole point: a
+/// node that keeps timing out because it is cut off from the cluster can send as
+/// many of these as it likes without any effect on anyone, instead of bumping
+/// its own term each time and then deposing a healthy leader on reconnect.
+///
+/// A pre-vote is granted only if ALL of these hold:
+///   1. The proposed term is genuinely newer than ours.
+///   2. The asker's log is at least as up-to-date as ours (the same rule as a
+///      real vote, so a node missing committed entries can never get started).
+///   3. We have no reason to think a leader is alive. `leader_active` is true if
+///      this node IS the leader, or has heard from one within the minimum
+///      election timeout. Without this, a node rejoining after a partition (whose
+///      log may be perfectly up to date) would collect pre-votes and force an
+///      election against a leader that never stopped working.
+pub fn handle_pre_vote(
+    persistent: &PersistentState,
+    log: &Log,
+    req: &PreVoteRequest,
+    leader_active: bool,
+) -> PreVoteResponse {
+    let candidate_log_up_to_date = (req.last_log_term, req.last_log_index)
+        >= (log.last_term(), log.last_index());
+
+    let granted = req.term > persistent.current_term && candidate_log_up_to_date && !leader_active;
+
+    PreVoteResponse {
+        term: persistent.current_term,
+        vote_granted: granted,
+        request_term: req.term,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +234,74 @@ mod tests {
         assert!(!tally.has_majority()); // 2/5 votes
         tally.record_vote(3);
         assert!(tally.has_majority()); // 3/5 votes - majority reached
+    }
+
+    // ---- pre-vote -----------------------------------------------------------
+
+    fn pre_vote(term: u64, candidate_id: NodeId, last_log_index: u64, last_log_term: u64) -> PreVoteRequest {
+        PreVoteRequest { term, candidate_id, last_log_index, last_log_term }
+    }
+
+    #[test]
+    fn pre_vote_is_granted_for_a_newer_term_with_an_up_to_date_log_and_no_active_leader() {
+        let (mut persistent, _, log) = fresh_state();
+        persistent.current_term = 3;
+        let resp = handle_pre_vote(&persistent, &log, &pre_vote(4, 2, 0, 0), false);
+        assert!(resp.vote_granted);
+        assert_eq!(resp.term, 3);
+    }
+
+    #[test]
+    fn pre_vote_is_denied_while_a_leader_is_active() {
+        let (persistent, _, log) = fresh_state();
+        let resp = handle_pre_vote(&persistent, &log, &pre_vote(1, 2, 0, 0), true);
+        assert!(!resp.vote_granted, "a healthy leader must not be disrupted by a rejoining node");
+    }
+
+    #[test]
+    fn pre_vote_is_denied_when_the_askers_log_is_behind() {
+        let (persistent, _, mut log) = fresh_state();
+        log.append(1, b"entry".to_vec());
+        let resp = handle_pre_vote(&persistent, &log, &pre_vote(2, 2, 0, 0), false);
+        assert!(!resp.vote_granted);
+    }
+
+    #[test]
+    fn pre_vote_is_denied_for_a_term_that_is_not_newer() {
+        let (mut persistent, _, log) = fresh_state();
+        persistent.current_term = 5;
+        assert!(!handle_pre_vote(&persistent, &log, &pre_vote(5, 2, 0, 0), false).vote_granted);
+        assert!(!handle_pre_vote(&persistent, &log, &pre_vote(4, 2, 0, 0), false).vote_granted);
+    }
+
+    #[test]
+    fn a_denial_reports_the_responders_higher_term() {
+        let (mut persistent, _, log) = fresh_state();
+        persistent.current_term = 9;
+        let resp = handle_pre_vote(&persistent, &log, &pre_vote(2, 2, 0, 0), false);
+        assert!(!resp.vote_granted);
+        assert_eq!(resp.term, 9, "the asker learns it is out of date");
+    }
+
+    #[test]
+    fn the_response_echoes_the_requested_term() {
+        let (persistent, _, log) = fresh_state();
+        let resp = handle_pre_vote(&persistent, &log, &pre_vote(7, 2, 0, 0), false);
+        assert_eq!(resp.request_term, 7);
+    }
+
+    #[test]
+    fn granting_a_pre_vote_does_not_use_up_the_voters_real_vote() {
+        let (mut persistent, mut volatile, log) = fresh_state();
+
+        // Promise node 2 a pre-vote for term 1...
+        let pre = handle_pre_vote(&persistent, &log, &pre_vote(1, 2, 0, 0), false);
+        assert!(pre.vote_granted);
+        assert_eq!(persistent.voted_for, None, "a pre-vote must not record a vote");
+        assert_eq!(persistent.current_term, 0, "a pre-vote must not change the term");
+
+        // ...the real vote for term 1 is still free, and can go to a different node.
+        let real = RequestVoteRequest { term: 1, candidate_id: 3, last_log_index: 0, last_log_term: 0 };
+        assert!(handle_request_vote(&mut persistent, &mut volatile, &log, &real).vote_granted);
     }
 }

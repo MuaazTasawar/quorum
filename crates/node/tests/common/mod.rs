@@ -181,6 +181,13 @@ impl TestCluster {
         }
     }
 
+    /// Cuts ONE direction of one link: messages from `from` to `to` are dropped,
+    /// while `to` can still reach `from`. Models the awkward real-world failure
+    /// where a follower stops hearing its leader but can still talk to everyone.
+    pub fn cut_link(&self, from: NodeId, to: NodeId) {
+        self.network.blocked.lock().unwrap().insert((from, to));
+    }
+
     /// Restores every cut link.
     pub fn heal(&self) {
         self.network.blocked.lock().unwrap().clear();
