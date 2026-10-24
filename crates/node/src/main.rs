@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = NodeConfig::from_env()?;
-    tracing::info!(node_id = config.id, "starting quorum node");
+    tracing::info!(node_id = config.id, read_mode = ?config.read_mode, "starting quorum node");
 
     // Recovers the log AND the hard state (current_term / voted_for) from disk.
     // A node that restarts without its vote could vote twice in one term, so a

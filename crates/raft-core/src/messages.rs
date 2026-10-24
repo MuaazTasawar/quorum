@@ -59,6 +59,12 @@ pub struct AppendEntriesRequest {
     /// Leader's commit_index, so followers know they can safely apply entries
     /// up to this point to their own state machine.
     pub leader_commit: u64,
+    /// Which heartbeat round of this leader's term this request belongs to. The
+    /// leader numbers every broadcast it sends and the follower echoes the number
+    /// back, so the leader can tell exactly which round an answer refers to. That
+    /// is what lets it prove, for a read, that a majority recognised it as leader
+    /// AFTER the read arrived (ReadIndex, Raft dissertation §6.4).
+    pub seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +80,8 @@ pub struct AppendEntriesResponse {
     /// never has to guess what a response refers to by looking at its own
     /// (possibly newer) log tail. Always 0 on rejection.
     pub match_index: u64,
+    /// Echo of `AppendEntriesRequest::seq`: the heartbeat round this answers.
+    pub seq: u64,
 }
 
 /// Top-level envelope for everything sent over the wire between nodes.

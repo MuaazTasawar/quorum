@@ -9,6 +9,22 @@ use std::time::Duration;
 /// server instead of giving up on a connection it can no longer interpret.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(3000);
 
+/// How this node answers reads.
+///
+/// `Linearizable` (the default) confirms with a majority that this node is still
+/// the leader before answering, so a read can never return data that a newer
+/// leader has already overwritten. It costs one extra round trip to the followers.
+///
+/// `Local` answers straight from this node's own applied state. It is faster, but
+/// a leader that has just been cut off from the cluster, and does not yet know it,
+/// can return a stale value. Opt in with `QUORUM_LOCAL_READS=true` only if that
+/// trade is acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadMode {
+    Linearizable,
+    Local,
+}
+
 /// Static configuration for one node. Loaded from environment variables
 /// rather than a config file so docker-compose (Phase 11) can set each
 /// node up purely through its `environment:` block.
@@ -19,6 +35,7 @@ pub struct NodeConfig {
     pub metrics_addr: String,
     pub peers: HashMap<NodeId, String>,
     pub storage_dir: PathBuf,
+    pub read_mode: ReadMode,
 }
 
 impl NodeConfig {
@@ -33,6 +50,7 @@ impl NodeConfig {
     ///   QUORUM_PEERS=2=node2:7000,3=node3:7000
     ///   QUORUM_STORAGE_DIR=/data
     ///   QUORUM_REQUEST_TIMEOUT_MS=3000   (optional, see `request_timeout_from_env`)
+    ///   QUORUM_LOCAL_READS=false         (optional; true = fast but possibly stale reads)
     pub fn from_env() -> anyhow::Result<Self> {
         let id: NodeId = std::env::var("QUORUM_NODE_ID")
             .map_err(|_| anyhow::anyhow!("QUORUM_NODE_ID not set"))?
@@ -54,7 +72,27 @@ impl NodeConfig {
             }
         }
 
-        Ok(Self { id, listen_addr, metrics_addr, peers, storage_dir })
+        let read_mode = parse_read_mode(std::env::var("QUORUM_LOCAL_READS").ok().as_deref())?;
+
+        Ok(Self { id, listen_addr, metrics_addr, peers, storage_dir, read_mode })
+    }
+}
+
+/// Parses `QUORUM_LOCAL_READS`. Unset means linearizable reads; `true`/`1` opts in
+/// to local (possibly stale) reads; `false`/`0` explicitly asks for the default.
+/// Anything else is an error rather than a guess, because silently picking the
+/// weaker consistency level on a typo would be the wrong way to fail.
+pub fn parse_read_mode(raw: Option<&str>) -> anyhow::Result<ReadMode> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        None => Ok(ReadMode::Linearizable),
+        Some(value) => match value.as_str() {
+            "true" | "1" => Ok(ReadMode::Local),
+            "false" | "0" => Ok(ReadMode::Linearizable),
+            _ => anyhow::bail!(
+                "QUORUM_LOCAL_READS must be true, false, 1 or 0, got {:?}",
+                raw.unwrap_or("")
+            ),
+        },
     }
 }
 
@@ -101,5 +139,26 @@ mod tests {
         assert!(parse_request_timeout(Some("soon")).is_err());
         assert!(parse_request_timeout(Some("-5")).is_err());
         assert!(parse_request_timeout(Some("")).is_err());
+    }
+
+    #[test]
+    fn reads_are_linearizable_unless_local_reads_are_requested() {
+        assert_eq!(parse_read_mode(None).unwrap(), ReadMode::Linearizable);
+        assert_eq!(parse_read_mode(Some("false")).unwrap(), ReadMode::Linearizable);
+        assert_eq!(parse_read_mode(Some("0")).unwrap(), ReadMode::Linearizable);
+    }
+
+    #[test]
+    fn local_reads_must_be_asked_for_explicitly() {
+        assert_eq!(parse_read_mode(Some("true")).unwrap(), ReadMode::Local);
+        assert_eq!(parse_read_mode(Some(" TRUE ")).unwrap(), ReadMode::Local);
+        assert_eq!(parse_read_mode(Some("1")).unwrap(), ReadMode::Local);
+    }
+
+    #[test]
+    fn a_typo_in_the_read_mode_is_an_error_not_a_silent_downgrade() {
+        assert!(parse_read_mode(Some("ture")).is_err());
+        assert!(parse_read_mode(Some("")).is_err());
+        assert!(parse_read_mode(Some("yes")).is_err());
     }
 }

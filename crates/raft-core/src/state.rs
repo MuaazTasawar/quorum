@@ -58,12 +58,34 @@ pub struct LeaderState {
     /// follower is reachable and still recognises this leader). Check-quorum uses
     /// this to notice a leader that has been cut off from the majority.
     pub last_ack: std::collections::HashMap<NodeId, Instant>,
+    /// For each follower: the highest heartbeat round (`AppendEntriesRequest::seq`)
+    /// it has answered in this leadership. A read that must prove leadership
+    /// waits until a majority has answered a round that began after the read
+    /// arrived (ReadIndex).
+    pub ack_seq: std::collections::HashMap<NodeId, u64>,
 }
 
 impl LeaderState {
     /// Records that `peer` answered this leader at `now`.
     pub fn record_ack(&mut self, peer: NodeId, now: Instant) {
         self.last_ack.insert(peer, now);
+    }
+
+    /// Records that `peer` answered heartbeat round `seq`. Only ever moves forward:
+    /// a late answer to an older round cannot lower what the peer has confirmed.
+    pub fn record_ack_seq(&mut self, peer: NodeId, seq: u64) {
+        let confirmed = self.ack_seq.entry(peer).or_insert(0);
+        *confirmed = (*confirmed).max(seq);
+    }
+
+    /// True if, counting the leader itself, a majority of the cluster has answered
+    /// heartbeat round `seq` or a later one. For a read that arrived before round
+    /// `seq` was sent, this proves a majority still recognised this node as leader
+    /// after the read arrived, so no newer leader can have committed a write the
+    /// read would miss.
+    pub fn has_quorum_acked(&self, seq: u64, cluster_size: usize) -> bool {
+        let confirmed_peers = self.ack_seq.values().filter(|&&acked| acked >= seq).count();
+        confirmed_peers + 1 >= cluster_size / 2 + 1
     }
 
     /// True if, counting the leader itself, a majority of the cluster has answered
@@ -147,5 +169,45 @@ mod tests {
         assert!(!state.has_recent_quorum(3, now, WINDOW));
         state.record_ack(2, now);
         assert!(state.has_recent_quorum(3, now, WINDOW));
+    }
+
+    // ---- heartbeat round acknowledgements (ReadIndex) -----------------------
+
+    #[test]
+    fn a_single_node_cluster_confirms_any_round_by_itself() {
+        assert!(LeaderState::default().has_quorum_acked(99, 1));
+    }
+
+    #[test]
+    fn a_round_is_confirmed_once_a_majority_has_answered_it() {
+        let mut state = LeaderState::default();
+        assert!(!state.has_quorum_acked(5, 5), "nobody has answered yet");
+        state.record_ack_seq(2, 5);
+        assert!(!state.has_quorum_acked(5, 5), "leader + 1 of 5 is not a majority");
+        state.record_ack_seq(3, 5);
+        assert!(state.has_quorum_acked(5, 5), "leader + 2 of 5 is a majority");
+    }
+
+    #[test]
+    fn answers_to_an_earlier_round_do_not_confirm_a_later_one() {
+        let mut state = LeaderState::default();
+        state.record_ack_seq(2, 4);
+        assert!(!state.has_quorum_acked(5, 3), "round 4 was sent before round 5 began");
+        assert!(state.has_quorum_acked(4, 3));
+    }
+
+    #[test]
+    fn answering_a_later_round_also_confirms_earlier_ones() {
+        let mut state = LeaderState::default();
+        state.record_ack_seq(2, 9);
+        assert!(state.has_quorum_acked(3, 3));
+    }
+
+    #[test]
+    fn a_late_answer_never_lowers_what_a_peer_has_confirmed() {
+        let mut state = LeaderState::default();
+        state.record_ack_seq(2, 9);
+        state.record_ack_seq(2, 3);
+        assert_eq!(state.ack_seq.get(&2), Some(&9));
     }
 }

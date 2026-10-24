@@ -13,7 +13,7 @@ use node::cluster::{
     ClientCommand, ClientCommandResult, ClientQuery, Cluster, ClusterHandle, ClusterSnapshot,
     QueryResult,
 };
-use node::config::NodeConfig;
+use node::config::{NodeConfig, ReadMode};
 use node::metrics_api::{router, AppState};
 use raft_core::{NodeId, RpcMessage};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -88,12 +88,18 @@ pub struct TestCluster {
     network: Arc<Network>,
     nodes: BTreeMap<NodeId, TestNode>,
     base_dir: PathBuf,
+    read_mode: ReadMode,
 }
 
 impl TestCluster {
     /// Starts every node in `ids`, fully meshed, each over its own fresh
     /// storage directory. Must be called from inside a tokio runtime.
     pub fn start(ids: &[NodeId]) -> Self {
+        Self::start_with_read_mode(ids, ReadMode::Linearizable)
+    }
+
+    /// Like `start`, but with an explicit read mode for every node.
+    pub fn start_with_read_mode(ids: &[NodeId], read_mode: ReadMode) -> Self {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         let base_dir = std::env::temp_dir().join(format!("quorum-itest-{nanos}-{n}"));
@@ -104,6 +110,7 @@ impl TestCluster {
             network: Arc::new(Network::default()),
             nodes: BTreeMap::new(),
             base_dir,
+            read_mode,
         };
         for &id in ids {
             cluster.launch(id);
@@ -134,6 +141,7 @@ impl TestCluster {
             metrics_addr: "127.0.0.1:0".to_string(),
             peers: peer_outboxes.keys().map(|&pid| (pid, String::new())).collect(),
             storage_dir: self.node_dir(id),
+            read_mode: self.read_mode,
         };
 
         let recovered = Persistence::open(self.node_dir(id)).expect("storage should open");

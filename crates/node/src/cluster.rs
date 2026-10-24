@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, ReadMode};
 
 /// A write command submitted by a client. `respond_to` is resolved once the
 /// command's log entry is actually committed and applied - not when it's
@@ -33,13 +33,14 @@ pub enum ClientCommandResult {
 
 /// A read request. Deliberately NOT a `Command` / NOT routed through the
 /// replicated log - a read doesn't change state, so there's nothing to
-/// replicate. Answered directly from the leader's locally-applied KvStore.
+/// replicate.
 ///
-/// Known simplification: this serves from `last_applied` state without the
-/// read-index/lease-read protocol from the Raft paper (§8), so it's not
-/// *strictly* linearizable under the rare case of a stale leader that hasn't
-/// yet learned it lost an election. Fine for an MVP/portfolio scope; a
-/// production system would add read-index confirmation before answering.
+/// By default reads are linearizable (ReadIndex, Raft dissertation §6.4): the
+/// leader records its commit index, proves with a heartbeat round that a majority
+/// still recognises it as leader, waits until its state machine has applied up to
+/// the recorded index, and only then answers from its local state. A leader that
+/// has been cut off therefore cannot return a stale value; it answers "not the
+/// leader" instead. `ReadMode::Local` skips the proof for speed.
 pub struct ClientQuery {
     pub key: String,
     pub respond_to: oneshot::Sender<QueryResult>,
@@ -86,6 +87,22 @@ fn persist_must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T 
     }
 }
 
+/// A read that is waiting for the leader to prove it is still the leader.
+struct PendingRead {
+    key: String,
+    respond_to: oneshot::Sender<QueryResult>,
+    /// The log index the state machine must have applied before this read may
+    /// be answered: the commit index when the read arrived, but never lower than
+    /// this leader's own first (no-op) entry, because until that entry commits
+    /// the leader cannot be sure its commit index reflects everything committed
+    /// under earlier leaders.
+    read_index: u64,
+    /// The first heartbeat round that began after the read arrived. A majority
+    /// answering this round (or a later one) proves leadership at a moment no
+    /// earlier than the read's arrival.
+    required_seq: u64,
+}
+
 /// An in-progress pre-vote round: the term this node WOULD use, and the answers
 /// collected so far. Nothing here is persisted or visible to peers as a term
 /// change; if the round fails it simply evaporates.
@@ -112,6 +129,12 @@ pub struct Cluster {
     command_rx: mpsc::UnboundedReceiver<ClientCommand>,
     query_rx: mpsc::UnboundedReceiver<ClientQuery>,
     pending_commands: HashMap<u64, oneshot::Sender<ClientCommandResult>>,
+    pending_reads: Vec<PendingRead>,
+    /// Numbers every AppendEntries broadcast this node sends. Never reset, so a
+    /// round number is never reused across leaderships of the same node.
+    heartbeat_seq: u64,
+    /// Index of the no-op this node appended when it last became leader.
+    noop_index: u64,
     snapshot_tx: watch::Sender<ClusterSnapshot>,
 }
 
@@ -162,6 +185,9 @@ impl Cluster {
             command_rx,
             query_rx,
             pending_commands: HashMap::new(),
+            pending_reads: Vec::new(),
+            heartbeat_seq: 0,
+            noop_index: 0,
             snapshot_tx,
         };
 
@@ -194,7 +220,7 @@ impl Cluster {
                 _ = heartbeat_ticker.tick(), if self.volatile.role == Role::Leader => {
                     self.check_quorum();
                     if self.volatile.role == Role::Leader {
-                        self.prune_abandoned_commands();
+                        self.prune_abandoned_requests();
                         self.broadcast_append_entries();
                     }
                 }
@@ -204,6 +230,7 @@ impl Cluster {
             }
 
             self.apply_committed_entries();
+            self.complete_ready_reads();
             self.publish_snapshot();
         }
     }
@@ -216,32 +243,53 @@ impl Cluster {
         let was_leader = self.volatile.role == Role::Leader;
         self.dispatch_rpc(from, msg);
         if was_leader && self.volatile.role != Role::Leader {
-            self.abort_pending_commands();
+            // Whoever we were told about by the message that deposed us (an append
+            // from the new leader) has already been recorded as `known_leader`. If
+            // nothing named a new leader, the only name we hold is our own, and
+            // pointing clients at ourselves would just bounce them straight back.
+            if self.known_leader == Some(self.config.id) {
+                self.known_leader = None;
+            }
+            self.abort_pending_requests();
         }
     }
 
-    /// Answers every write still waiting on this node with `LeadershipLost`.
-    /// Without this, a deposed leader would leave its clients waiting forever on
-    /// entries it can no longer commit.
-    fn abort_pending_commands(&mut self) {
-        if self.pending_commands.is_empty() {
-            return;
+    /// Answers everything still waiting on this node once it is no longer leader.
+    ///
+    /// Writes get `LeadershipLost`: their outcome is genuinely unknown, because the
+    /// entry may yet be committed by the next leader. Reads get `NotLeader`: a read
+    /// has no side effect to be unsure about, and "I am not the leader" is simply
+    /// true now, so the client is redirected like any other request to a follower.
+    /// Without this, a deposed leader would leave its clients waiting forever.
+    fn abort_pending_requests(&mut self) {
+        if !self.pending_commands.is_empty() {
+            info!(
+                pending = self.pending_commands.len(),
+                "lost leadership - failing writes that were waiting on this node"
+            );
+            for (_, respond_to) in self.pending_commands.drain() {
+                let _ = respond_to.send(ClientCommandResult::LeadershipLost);
+            }
         }
-        info!(
-            pending = self.pending_commands.len(),
-            "lost leadership - failing writes that were waiting on this node"
-        );
-        for (_, respond_to) in self.pending_commands.drain() {
-            let _ = respond_to.send(ClientCommandResult::LeadershipLost);
+        if !self.pending_reads.is_empty() {
+            info!(
+                pending = self.pending_reads.len(),
+                "lost leadership - redirecting reads that were waiting on this node"
+            );
+            let leader_hint = self.known_leader;
+            for read in self.pending_reads.drain(..) {
+                let _ = read.respond_to.send(QueryResult::NotLeader { leader_hint });
+            }
         }
     }
 
     /// Drops bookkeeping for requests whose caller has already gone away (an HTTP
-    /// request that timed out, or a client that disconnected). The log entry
-    /// itself stays and is committed or discarded as usual; only the reply slot
-    /// is released, so an unreachable majority cannot make this map grow forever.
-    fn prune_abandoned_commands(&mut self) {
+    /// request that timed out, or a client that disconnected). A write's log entry
+    /// stays and is committed or discarded as usual; only the reply slot is
+    /// released, so an unreachable majority cannot make these queues grow forever.
+    fn prune_abandoned_requests(&mut self) {
         self.pending_commands.retain(|_, respond_to| !respond_to.is_closed());
+        self.pending_reads.retain(|read| !read.respond_to.is_closed());
     }
 
     fn dispatch_rpc(&mut self, from: NodeId, msg: RpcMessage) {
@@ -378,6 +426,9 @@ impl Cluster {
                 // Any same-term answer, even a rejection, proves this follower is
                 // reachable and still recognises us as its leader.
                 self.leader_state.record_ack(from, std::time::Instant::now());
+                // And it names the heartbeat round it answered, which is what lets
+                // a waiting read prove leadership (see `complete_ready_reads`).
+                self.leader_state.record_ack_seq(from, resp.seq);
                 handle_append_entries_response(&mut self.leader_state, from, &resp);
                 self.advance_leader_commit();
             }
@@ -508,7 +559,7 @@ impl Cluster {
         self.pre_vote = None;
         self.known_leader = None;
         self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
-        self.abort_pending_commands();
+        self.abort_pending_requests();
     }
 
     fn begin_election(&mut self) {
@@ -561,6 +612,7 @@ impl Cluster {
         // (including those stranded entries) becomes committed too.
         let noop = Command::NoOp.encode().expect("NoOp always encodes");
         let noop_index = self.log.append(self.persistent.current_term, noop);
+        self.noop_index = noop_index;
         self.append_to_wal(noop_index);
 
         self.broadcast_append_entries();
@@ -571,7 +623,11 @@ impl Cluster {
         self.advance_leader_commit();
     }
 
+    /// Sends AppendEntries (which doubles as a heartbeat) to every peer. Each call
+    /// is one numbered "round"; followers echo the number back.
     fn broadcast_append_entries(&mut self) {
+        self.heartbeat_seq += 1;
+        let seq = self.heartbeat_seq;
         let peer_ids: Vec<NodeId> = self.peer_outboxes.keys().copied().collect();
         for peer_id in peer_ids {
             let next_index = *self.leader_state.next_index.get(&peer_id).unwrap_or(&1);
@@ -581,6 +637,7 @@ impl Cluster {
                 self.config.id,
                 next_index,
                 self.volatile.commit_index,
+                seq,
             );
             self.send_to(peer_id, RpcMessage::AppendEntries(req));
         }
@@ -613,9 +670,14 @@ impl Cluster {
         self.advance_leader_commit();
     }
 
-    /// Answers a read directly from local applied state - no log append, no
-    /// replication round-trip. Only the (believed) leader answers; followers
-    /// redirect, same as writes.
+    /// Handles a read. Only the (believed) leader answers; followers redirect,
+    /// same as writes.
+    ///
+    /// In `Linearizable` mode the read is parked until `complete_ready_reads` can
+    /// prove two things: that a majority still recognised this node as leader
+    /// after the read arrived, and that this node has applied everything that was
+    /// committed when it arrived. In `Local` mode it is answered at once from
+    /// local state.
     fn handle_client_query(&mut self, query: ClientQuery) {
         if self.volatile.role != Role::Leader {
             let _ = query
@@ -623,8 +685,57 @@ impl Cluster {
                 .send(QueryResult::NotLeader { leader_hint: self.known_leader });
             return;
         }
-        let value = self.kv_store.get(&query.key).cloned();
-        let _ = query.respond_to.send(QueryResult::Value(value));
+
+        if self.config.read_mode == ReadMode::Local {
+            let value = self.kv_store.get(&query.key).cloned();
+            let _ = query.respond_to.send(QueryResult::Value(value));
+            return;
+        }
+
+        // The index this read must see. Never below this leader's own no-op: until
+        // that entry commits, our commit index may lag what earlier leaders
+        // committed, and only the no-op committing settles that.
+        let read_index = self.volatile.commit_index.max(self.noop_index);
+
+        // Start a heartbeat round NOW, after the read arrived. A majority answering
+        // this round (or any later one) proves we were still the leader at a moment
+        // no earlier than the read's arrival. An older round would prove nothing:
+        // it could have been answered before a newer leader existed.
+        self.broadcast_append_entries();
+        let required_seq = self.heartbeat_seq;
+
+        self.pending_reads.push(PendingRead {
+            key: query.key,
+            respond_to: query.respond_to,
+            read_index,
+            required_seq,
+        });
+    }
+
+    /// Answers every waiting read that is now safe to answer. A read is safe once
+    /// (1) a majority has answered a heartbeat round that began after it arrived,
+    /// so leadership is proven, and (2) the state machine has applied up to the
+    /// read's index, so the value it reads includes everything committed before
+    /// the read began. Called at the end of every event-loop pass, after
+    /// committed entries are applied.
+    fn complete_ready_reads(&mut self) {
+        if self.pending_reads.is_empty() || self.volatile.role != Role::Leader {
+            return;
+        }
+        let cluster_size = self.config.cluster_size();
+        let last_applied = self.volatile.last_applied;
+
+        let mut still_waiting = Vec::new();
+        for read in self.pending_reads.drain(..) {
+            let leadership_proven = self.leader_state.has_quorum_acked(read.required_seq, cluster_size);
+            if leadership_proven && last_applied >= read.read_index {
+                let value = self.kv_store.get(&read.key).cloned();
+                let _ = read.respond_to.send(QueryResult::Value(value));
+            } else {
+                still_waiting.push(read);
+            }
+        }
+        self.pending_reads = still_waiting;
     }
 
     fn apply_committed_entries(&mut self) {
@@ -710,6 +821,14 @@ mod tests {
     /// Returns the receivers for each peer's outbound channel so a test can read
     /// exactly what this node replied.
     fn make_cluster_in(dir: &Path, peer_ids: &[NodeId]) -> (Cluster, Outputs) {
+        make_cluster_with_mode(dir, peer_ids, ReadMode::Linearizable)
+    }
+
+    fn make_cluster_with_mode(
+        dir: &Path,
+        peer_ids: &[NodeId],
+        read_mode: ReadMode,
+    ) -> (Cluster, Outputs) {
         let peers = peer_ids.iter().map(|&id| (id, String::new())).collect();
         let config = NodeConfig {
             id: 1,
@@ -717,6 +836,7 @@ mod tests {
             metrics_addr: "127.0.0.1:0".to_string(),
             peers,
             storage_dir: dir.to_path_buf(),
+            read_mode,
         };
         let mut outboxes = HashMap::new();
         let mut outputs = HashMap::new();
@@ -755,6 +875,7 @@ mod tests {
             prev_log_term,
             entries,
             leader_commit: 0,
+            seq: 0,
         })
     }
 
@@ -785,12 +906,42 @@ mod tests {
         (command, receiver)
     }
 
+    /// An AppendEntries answer for heartbeat round `seq`. A rejection still proves
+    /// the follower accepted this leader's term.
+    fn append_ack(term: Term, seq: u64, success: bool, match_index: u64) -> RpcMessage {
+        RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term,
+            success,
+            conflict_index: if success { None } else { Some(0) },
+            match_index,
+            seq,
+        })
+    }
+
+    fn read_query(key: &str) -> (ClientQuery, oneshot::Receiver<QueryResult>) {
+        let (respond_to, receiver) = oneshot::channel();
+        (ClientQuery { key: key.into(), respond_to }, receiver)
+    }
+
+    /// A 3-node cluster whose node 1 is leader in term 1 and has committed and
+    /// applied its own no-op (index 1), so reads are not held up by it.
+    fn settled_leader(dir: &TestDir) -> Cluster {
+        let mut cluster = build_cluster(dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader(); // heartbeat round 1, no-op at index 1
+        cluster.handle_rpc(2, append_ack(1, 1, true, 1)); // node 2 stores the no-op: committed
+        cluster.apply_committed_entries();
+        assert_eq!(cluster.volatile.last_applied, 1);
+        cluster
+    }
+
     fn higher_term_response(term: Term) -> RpcMessage {
         RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
             term,
             success: false,
             conflict_index: None,
             match_index: 0,
+            seq: 0,
         })
     }
 
@@ -910,6 +1061,10 @@ mod tests {
 
         let (respond_to, receiver) = oneshot::channel();
         cluster.handle_client_query(ClientQuery { key: "k".into(), respond_to });
+        // A read is parked until leadership is proven. A single node needs no peers
+        // to prove it, so the end-of-pass steps the event loop runs are enough.
+        cluster.apply_committed_entries();
+        cluster.complete_ready_reads();
         let result = receiver.await.unwrap();
         assert!(matches!(result, QueryResult::Value(Some(v)) if v == b"v".to_vec()));
     }
@@ -980,6 +1135,7 @@ mod tests {
                 success: true,
                 conflict_index: None,
                 match_index: 1,
+                seq: 0,
             }),
         );
 
@@ -1004,6 +1160,7 @@ mod tests {
                 success: true,
                 conflict_index: None,
                 match_index: 1,
+                seq: 0,
             }),
         );
 
@@ -1077,6 +1234,7 @@ mod tests {
                     success: false,
                     conflict_index: None,
                     match_index: 0,
+                    seq: 0,
                 }),
             );
             assert_eq!(cluster.volatile.role, Role::Follower);
@@ -1178,6 +1336,7 @@ mod tests {
                 success: true,
                 conflict_index: None,
                 match_index: 1,
+                seq: 0,
             }),
         );
 
@@ -1201,7 +1360,7 @@ mod tests {
 
         // The first caller gives up (e.g. its HTTP request timed out).
         drop(abandoned_rx);
-        cluster.prune_abandoned_commands();
+        cluster.prune_abandoned_requests();
 
         assert_eq!(cluster.pending_commands.len(), 1);
         // The entry itself is still in the log: only the reply slot was released.
@@ -1406,6 +1565,7 @@ mod tests {
                 success: true,
                 conflict_index: None,
                 match_index: 1,
+                seq: 0,
             }),
         );
         cluster.check_quorum();
@@ -1428,6 +1588,7 @@ mod tests {
                 success: false,
                 conflict_index: Some(0),
                 match_index: 0,
+                seq: 0,
             }),
         );
         cluster.check_quorum();
@@ -1450,6 +1611,7 @@ mod tests {
                 success: true,
                 conflict_index: None,
                 match_index: 1,
+                seq: 0,
             }),
         );
         cluster.check_quorum();
@@ -1464,5 +1626,218 @@ mod tests {
         cluster.begin_election();
         cluster.check_quorum();
         assert_eq!(cluster.volatile.role, Role::Leader);
+    }
+
+    // ---- linearizable reads (ReadIndex) -------------------------------------
+
+    #[test]
+    fn a_read_is_not_answered_until_a_majority_confirms_a_round_that_began_after_it() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+
+        let (query, mut reply) = read_query("k");
+        cluster.handle_client_query(query);
+        assert_eq!(cluster.heartbeat_seq, 2, "the read must start a fresh round");
+        cluster.complete_ready_reads();
+        assert!(reply.try_recv().is_err(), "nobody has answered round 2 yet");
+
+        // A late answer to the OLD round 1 proves nothing about this moment.
+        cluster.handle_rpc(2, append_ack(1, 1, true, 1));
+        cluster.complete_ready_reads();
+        assert!(reply.try_recv().is_err(), "an answer to an earlier round must not count");
+
+        // Node 2 answers round 2: the leader plus node 2 is a majority of 3.
+        cluster.handle_rpc(2, append_ack(1, 2, true, 1));
+        cluster.complete_ready_reads();
+        assert!(matches!(reply.try_recv(), Ok(QueryResult::Value(None))));
+    }
+
+    #[test]
+    fn a_read_waits_for_a_new_leaders_first_commit_even_after_leadership_is_proven() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader(); // no-op at index 1, NOT yet committed
+
+        let (query, mut reply) = read_query("k");
+        cluster.handle_client_query(query); // round 2
+
+        // Both followers answer round 2, but neither has stored the no-op, so it
+        // stays uncommitted: leadership is proven, the commit index is not trusted.
+        cluster.handle_rpc(2, append_ack(1, 2, false, 0));
+        cluster.handle_rpc(3, append_ack(1, 2, false, 0));
+        cluster.apply_committed_entries();
+        cluster.complete_ready_reads();
+        assert!(
+            reply.try_recv().is_err(),
+            "must not answer before the leader's own no-op has committed"
+        );
+
+        // Node 2 now stores the no-op: it commits, is applied, and the read completes.
+        cluster.handle_rpc(2, append_ack(1, 2, true, 1));
+        cluster.apply_committed_entries();
+        cluster.complete_ready_reads();
+        assert!(matches!(reply.try_recv(), Ok(QueryResult::Value(None))));
+    }
+
+    #[test]
+    fn each_read_waits_for_its_own_round() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+
+        let (first, mut first_reply) = read_query("a");
+        cluster.handle_client_query(first); // round 2
+        let (second, mut second_reply) = read_query("b");
+        cluster.handle_client_query(second); // round 3
+
+        // Round 2 confirmed: that satisfies the first read but not the second,
+        // which only began after round 2 had already been sent.
+        cluster.handle_rpc(2, append_ack(1, 2, true, 1));
+        cluster.complete_ready_reads();
+        assert!(matches!(first_reply.try_recv(), Ok(QueryResult::Value(None))));
+        assert!(second_reply.try_recv().is_err());
+
+        cluster.handle_rpc(2, append_ack(1, 3, true, 1));
+        cluster.complete_ready_reads();
+        assert!(matches!(second_reply.try_recv(), Ok(QueryResult::Value(None))));
+    }
+
+    #[test]
+    fn a_read_reflects_writes_that_were_committed_before_it_arrived() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]); // single node: commits immediately
+        cluster.begin_election();
+        cluster.handle_client_command(put_command("greeting", "hello"));
+        cluster.apply_committed_entries();
+
+        let (query, mut reply) = read_query("greeting");
+        cluster.handle_client_query(query);
+        cluster.complete_ready_reads();
+
+        assert!(matches!(reply.try_recv(), Ok(QueryResult::Value(Some(v))) if v == b"hello".to_vec()));
+    }
+
+    #[test]
+    fn losing_leadership_redirects_waiting_reads_instead_of_answering_them() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let (query, mut reply) = read_query("k");
+        cluster.handle_client_query(query);
+
+        cluster.handle_rpc(2, higher_term_response(7));
+
+        assert_eq!(cluster.volatile.role, Role::Follower);
+        assert!(matches!(reply.try_recv(), Ok(QueryResult::NotLeader { leader_hint: None })));
+    }
+
+    #[test]
+    fn a_read_deposed_by_a_new_leader_is_redirected_to_that_leader() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let (query, mut reply) = read_query("k");
+        cluster.handle_client_query(query);
+
+        cluster.handle_rpc(2, append_request(5, 2, 0, 0, vec![]));
+
+        assert!(matches!(reply.try_recv(), Ok(QueryResult::NotLeader { leader_hint: Some(2) })));
+    }
+
+    #[test]
+    fn a_leader_that_steps_down_for_lack_of_a_majority_redirects_waiting_reads() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let (query, mut reply) = read_query("k");
+        cluster.handle_client_query(query);
+
+        age_all_acks(&mut cluster);
+        cluster.check_quorum();
+
+        assert_eq!(cluster.volatile.role, Role::Follower);
+        assert!(matches!(reply.try_recv(), Ok(QueryResult::NotLeader { leader_hint: None })));
+    }
+
+    #[test]
+    fn a_deposed_leader_does_not_name_itself_as_the_leader() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        assert_eq!(cluster.known_leader, Some(1));
+
+        // Deposed by a vote request: nothing tells us who the new leader is.
+        cluster.handle_rpc(3, vote_request(9, 3));
+
+        assert_eq!(cluster.known_leader, None, "must not send clients back to ourselves");
+    }
+
+    #[test]
+    fn local_read_mode_answers_immediately_without_any_confirmation() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) =
+            make_cluster_with_mode(dir.path(), &[2, 3], ReadMode::Local);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        cluster.kv_store.apply(&Command::Put { key: "k".into(), value: b"v".to_vec() });
+
+        let (query, mut reply) = read_query("k");
+        cluster.handle_client_query(query);
+
+        // No round was started and no follower has answered anything.
+        assert!(matches!(reply.try_recv(), Ok(QueryResult::Value(Some(v))) if v == b"v".to_vec()));
+        assert!(cluster.pending_reads.is_empty());
+    }
+
+    #[test]
+    fn abandoned_reads_are_pruned() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let (query, reply) = read_query("k");
+        cluster.handle_client_query(query);
+        assert_eq!(cluster.pending_reads.len(), 1);
+
+        drop(reply); // the HTTP request timed out
+        cluster.prune_abandoned_requests();
+
+        assert!(cluster.pending_reads.is_empty());
+    }
+
+    #[test]
+    fn every_broadcast_carries_a_new_round_number() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        cluster.broadcast_append_entries();
+        cluster.broadcast_append_entries();
+
+        let seqs: Vec<u64> = drain(&mut outputs, 2)
+            .into_iter()
+            .filter_map(|m| match m {
+                RpcMessage::AppendEntries(req) => Some(req.seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_follower_echoes_the_round_number_it_was_sent() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let request = RpcMessage::AppendEntries(AppendEntriesRequest {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+            seq: 77,
+        });
+
+        cluster.handle_rpc(2, request);
+
+        let sent = drain(&mut outputs, 2);
+        assert!(
+            matches!(&sent[..], [RpcMessage::AppendEntriesResponse(r)] if r.seq == 77),
+            "expected the reply to carry round 77, got {sent:?}"
+        );
     }
 }

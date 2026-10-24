@@ -37,6 +37,7 @@ pub fn handle_append_entries(
             success: false,
             conflict_index: None,
             match_index: 0,
+            seq: req.seq,
         };
         return (resp, effect);
     }
@@ -65,6 +66,7 @@ pub fn handle_append_entries(
             success: false,
             conflict_index: None,
             match_index: 0,
+            seq: req.seq,
         };
         return (resp, effect);
     }
@@ -83,6 +85,7 @@ pub fn handle_append_entries(
             success: false,
             conflict_index: Some(conflict_index),
             match_index: 0,
+            seq: req.seq,
         };
         return (resp, effect);
     }
@@ -140,6 +143,7 @@ pub fn handle_append_entries(
         success: true,
         conflict_index: None,
         match_index: last_new_index,
+        seq: req.seq,
     };
     (resp, effect)
 }
@@ -147,12 +151,15 @@ pub fn handle_append_entries(
 /// Builds the AppendEntries request the leader should send to a specific
 /// follower, based on that follower's `next_index`. Called on the heartbeat
 /// interval and whenever a new entry is appended to the leader's own log.
+/// `seq` numbers the broadcast round this request belongs to; the follower
+/// echoes it in its response.
 pub fn build_append_entries(
     persistent: &PersistentState,
     log: &Log,
     leader_id: NodeId,
     follower_next_index: u64,
     commit_index: u64,
+    seq: u64,
 ) -> AppendEntriesRequest {
     let prev_log_index = follower_next_index.saturating_sub(1);
     let prev_log_term = log.term_at(prev_log_index).unwrap_or(0);
@@ -164,6 +171,7 @@ pub fn build_append_entries(
         prev_log_term,
         entries: log.entries_after(prev_log_index),
         leader_commit: commit_index,
+        seq,
     }
 }
 
@@ -272,15 +280,16 @@ mod tests {
             prev_log_term,
             entries,
             leader_commit,
+            seq: 0,
         }
     }
 
     fn ok_response(match_index: u64) -> AppendEntriesResponse {
-        AppendEntriesResponse { term: 1, success: true, conflict_index: None, match_index }
+        AppendEntriesResponse { term: 1, success: true, conflict_index: None, match_index, seq: 0 }
     }
 
     fn rejection(conflict_index: Option<u64>) -> AppendEntriesResponse {
-        AppendEntriesResponse { term: 1, success: false, conflict_index, match_index: 0 }
+        AppendEntriesResponse { term: 1, success: false, conflict_index, match_index: 0, seq: 0 }
     }
 
     // ---- receiver side: handle_append_entries -------------------------------
@@ -565,5 +574,62 @@ mod tests {
         leader_state.match_index.insert(3, 2);
         let result = advance_commit_index(&leader_state, &log, 2, 3, 2);
         assert_eq!(result, Some(2));
+    }
+
+    // ---- heartbeat round numbers (ReadIndex support) ------------------------
+
+    fn with_seq(mut req: AppendEntriesRequest, seq: u64) -> AppendEntriesRequest {
+        req.seq = seq;
+        req
+    }
+
+    #[test]
+    fn a_successful_response_echoes_the_round_number() {
+        let (mut persistent, mut volatile, mut log) = fresh_state();
+        persistent.current_term = 1;
+        let req = with_seq(request(1, 0, 0, vec![entry(1, 1, "a")], 0), 42);
+        let (resp, _) = handle_append_entries(&mut persistent, &mut volatile, &mut log, &req);
+        assert!(resp.success);
+        assert_eq!(resp.seq, 42);
+    }
+
+    #[test]
+    fn a_rejection_echoes_the_round_number_too() {
+        let (mut persistent, mut volatile, mut log) = fresh_state();
+        persistent.current_term = 1;
+        // prev_log_index 5 cannot match an empty log.
+        let req = with_seq(request(1, 5, 1, vec![], 0), 7);
+        let (resp, _) = handle_append_entries(&mut persistent, &mut volatile, &mut log, &req);
+        assert!(!resp.success);
+        assert_eq!(resp.seq, 7, "a rejection still proves the follower accepted this leader");
+    }
+
+    #[test]
+    fn a_stale_leaders_rejection_echoes_the_round_number() {
+        let (mut persistent, mut volatile, mut log) = fresh_state();
+        persistent.current_term = 5;
+        let req = with_seq(request(3, 0, 0, vec![], 0), 9);
+        let (resp, _) = handle_append_entries(&mut persistent, &mut volatile, &mut log, &req);
+        assert!(!resp.success);
+        assert_eq!(resp.seq, 9);
+    }
+
+    #[test]
+    fn a_malformed_batch_rejection_echoes_the_round_number() {
+        let (mut persistent, mut volatile, mut log) = fresh_state();
+        persistent.current_term = 1;
+        let req = with_seq(request(1, 0, 0, vec![entry(1, 5, "bogus")], 0), 11);
+        let (resp, _) = handle_append_entries(&mut persistent, &mut volatile, &mut log, &req);
+        assert!(!resp.success);
+        assert_eq!(resp.seq, 11);
+    }
+
+    #[test]
+    fn built_requests_carry_the_round_number_they_are_given() {
+        let persistent = PersistentState { current_term: 2, voted_for: None };
+        let log = Log::new();
+        let req = build_append_entries(&persistent, &log, 1, 1, 0, 123);
+        assert_eq!(req.seq, 123);
+        assert_eq!(req.term, 2);
     }
 }
