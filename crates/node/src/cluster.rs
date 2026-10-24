@@ -254,6 +254,13 @@ impl Cluster {
                 // The vote (and any term bump) must be on disk BEFORE the reply
                 // leaves this node, or a crash could make us forget it.
                 self.persist_hard_state();
+                if resp.vote_granted {
+                    // Granting a vote counts as contact (it is what stops us
+                    // granting pre-votes to a rival right afterwards). Stamp it
+                    // only now that the vote is durable: if the disk was slow, the
+                    // time spent writing must not make the contact look stale.
+                    self.volatile.last_heartbeat = std::time::Instant::now();
+                }
                 self.reset_election_deadline_if_follower();
                 self.send_to(from, RpcMessage::RequestVoteResponse(resp));
             }
@@ -339,6 +346,13 @@ impl Cluster {
                     self.known_leader = Some(leader_id);
                     // A live leader exists, so there is nothing to elect.
                     self.pre_vote = None;
+                    // Record the contact NOW, after the durable writes above. The
+                    // raft-core handler stamped it before they ran, so a slow disk
+                    // (persisting the term alone costs two fsyncs and a rename)
+                    // could make a contact from this very moment look older than
+                    // the minimum election timeout, and this node would then grant
+                    // pre-votes against a leader that is working fine.
+                    self.volatile.last_heartbeat = std::time::Instant::now();
                 }
                 if is_new_term {
                     self.vote_tally = None;

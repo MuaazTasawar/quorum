@@ -29,7 +29,7 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
       - name: Run tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       # Non-blocking until the codebase has been through rustfmt/clippy once.
       # Remove `continue-on-error` to make these hard gates.
