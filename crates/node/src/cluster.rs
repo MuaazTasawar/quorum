@@ -29,6 +29,10 @@ pub enum ClientCommandResult {
     /// entry may already be on a majority, in which case the next leader will
     /// commit it, or it may be discarded. Callers must not assume either.
     LeadershipLost,
+    /// The leader already holds as many unfinished writes as it will carry, so
+    /// this one was NOT accepted: nothing was logged or replicated. Retrying is
+    /// safe, unlike `LeadershipLost`.
+    Overloaded,
 }
 
 /// A read request. Deliberately NOT a `Command` / NOT routed through the
@@ -50,6 +54,8 @@ pub struct ClientQuery {
 pub enum QueryResult {
     Value(Option<Vec<u8>>),
     NotLeader { leader_hint: Option<NodeId> },
+    /// The leader already holds as many waiting reads as it will carry. Retry.
+    Overloaded,
 }
 
 /// Read-only view of cluster state, published after every event-loop
@@ -63,12 +69,34 @@ pub struct ClusterSnapshot {
     pub last_applied: u64,
     pub log_len: u64,
     pub leader_hint: Option<NodeId>,
+    /// Times the log has been forced to disk. With group commit this grows much
+    /// more slowly than the number of writes under load.
+    pub wal_syncs: u64,
+    /// Outbound peer messages discarded because that peer's queue was full.
+    pub dropped_messages: u64,
 }
 
 pub struct ClusterHandle {
-    pub command_tx: mpsc::UnboundedSender<ClientCommand>,
-    pub query_tx: mpsc::UnboundedSender<ClientQuery>,
+    pub command_tx: mpsc::Sender<ClientCommand>,
+    pub query_tx: mpsc::Sender<ClientQuery>,
     pub snapshot_rx: watch::Receiver<ClusterSnapshot>,
+}
+
+/// Takes `first` plus whatever else is already waiting in `queue`, up to `max`
+/// items in all, without ever waiting for more. Requests that arrive together are
+/// handled together, so they share one disk sync and one round of replication.
+/// Under light load the batch is a single item and nothing is delayed; under heavy
+/// load batches grow by themselves.
+fn collect_batch<T>(first: T, queue: &mut mpsc::Receiver<T>, max: usize) -> Vec<T> {
+    let mut batch = Vec::with_capacity(max.min(16));
+    batch.push(first);
+    while batch.len() < max {
+        match queue.try_recv() {
+            Ok(item) => batch.push(item),
+            Err(_) => break,
+        }
+    }
+    batch
 }
 
 /// Durable storage is the guarantee behind every acknowledgement and vote this
@@ -124,10 +152,12 @@ pub struct Cluster {
     election_timeout: ElectionTimeoutConfig,
     election_deadline: Instant,
     known_leader: Option<NodeId>,
-    peer_outboxes: HashMap<NodeId, mpsc::UnboundedSender<RpcMessage>>,
-    inbox_rx: mpsc::UnboundedReceiver<(NodeId, RpcMessage)>,
-    command_rx: mpsc::UnboundedReceiver<ClientCommand>,
-    query_rx: mpsc::UnboundedReceiver<ClientQuery>,
+    peer_outboxes: HashMap<NodeId, mpsc::Sender<RpcMessage>>,
+    inbox_rx: mpsc::Receiver<(NodeId, RpcMessage)>,
+    command_rx: mpsc::Receiver<ClientCommand>,
+    query_rx: mpsc::Receiver<ClientQuery>,
+    /// Outbound messages discarded because a peer's queue was full.
+    dropped_messages: u64,
     pending_commands: HashMap<u64, oneshot::Sender<ClientCommandResult>>,
     pending_reads: Vec<PendingRead>,
     /// Numbers every AppendEntries broadcast this node sends. Never reset, so a
@@ -146,14 +176,15 @@ impl Cluster {
     pub fn new(
         config: NodeConfig,
         recovered: Recovered,
-        peer_outboxes: HashMap<NodeId, mpsc::UnboundedSender<RpcMessage>>,
-        inbox_rx: mpsc::UnboundedReceiver<(NodeId, RpcMessage)>,
+        peer_outboxes: HashMap<NodeId, mpsc::Sender<RpcMessage>>,
+        inbox_rx: mpsc::Receiver<(NodeId, RpcMessage)>,
     ) -> (Self, ClusterHandle) {
-        let Recovered { persistence, hard_state: persistent, entries } = recovered;
+        let Recovered { persistence, hard_state: persistent, entries, .. } = recovered;
         let log = Log::from_entries(entries);
         let kv_store = KvStore::new();
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (query_tx, query_rx) = mpsc::unbounded_channel();
+        let capacity = config.limits.channel_capacity;
+        let (command_tx, command_rx) = mpsc::channel(capacity);
+        let (query_tx, query_rx) = mpsc::channel(capacity);
         let election_timeout = ElectionTimeoutConfig::default();
         let election_deadline = Instant::now() + election_timeout.random_timeout();
 
@@ -165,6 +196,8 @@ impl Cluster {
             last_applied: 0,
             log_len: log.last_index(),
             leader_hint: None,
+            wal_syncs: persistence.wal_sync_count(),
+            dropped_messages: 0,
         });
 
         let cluster = Self {
@@ -184,6 +217,7 @@ impl Cluster {
             inbox_rx,
             command_rx,
             query_rx,
+            dropped_messages: 0,
             pending_commands: HashMap::new(),
             pending_reads: Vec::new(),
             heartbeat_seq: 0,
@@ -212,10 +246,12 @@ impl Cluster {
                     self.handle_rpc(from, msg);
                 }
                 Some(cmd) = self.command_rx.recv() => {
-                    self.handle_client_command(cmd);
+                    let batch = collect_batch(cmd, &mut self.command_rx, self.config.limits.max_batch);
+                    self.handle_client_commands(batch);
                 }
                 Some(query) = self.query_rx.recv() => {
-                    self.handle_client_query(query);
+                    let batch = collect_batch(query, &mut self.query_rx, self.config.limits.max_batch);
+                    self.handle_client_queries(batch);
                 }
                 _ = heartbeat_ticker.tick(), if self.volatile.role == Role::Leader => {
                     self.check_quorum();
@@ -383,9 +419,8 @@ impl Cluster {
                 if let Some(from_index) = effect.truncated_from {
                     persist_must(self.persistence.truncate_from(from_index), "log truncate");
                 }
-                for entry in &effect.appended {
-                    persist_must(self.persistence.append(entry), "log append");
-                }
+                // One fsync for the whole batch, however many entries it carries.
+                persist_must(self.persistence.append_batch(&effect.appended), "log append");
 
                 // Any request from a current-or-newer term comes from the
                 // legitimate leader, even if its log didn't match ours - so
@@ -643,25 +678,58 @@ impl Cluster {
         }
     }
 
+    /// Most unfinished writes (and, separately, most waiting reads) this node will
+    /// hold at once. Past this the node says so immediately instead of queueing
+    /// more: if the majority is unreachable, an ever-growing pile of requests
+    /// that can never complete helps no one.
+    fn max_pending(&self) -> usize {
+        self.config.limits.channel_capacity
+    }
+
+    /// One-at-a-time form of `handle_client_commands`, for tests.
+    #[cfg(test)]
     fn handle_client_command(&mut self, cmd: ClientCommand) {
+        self.handle_client_commands(vec![cmd]);
+    }
+
+    /// Handles a batch of client writes as one unit: every accepted command is
+    /// appended to the log, the whole batch is made durable with a SINGLE fsync,
+    /// and one round of replication carries all of it. Nothing is acknowledged
+    /// until the entries are durable and committed, exactly as before; batching
+    /// only lets requests that arrived together share the cost of the disk sync.
+    fn handle_client_commands(&mut self, commands: Vec<ClientCommand>) {
         if self.volatile.role != Role::Leader {
-            let _ = cmd
-                .respond_to
-                .send(ClientCommandResult::NotLeader { leader_hint: self.known_leader });
+            for cmd in commands {
+                let _ = cmd
+                    .respond_to
+                    .send(ClientCommandResult::NotLeader { leader_hint: self.known_leader });
+            }
             return;
         }
 
-        let encoded = match cmd.command.encode() {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                warn!(error = %e, "failed to encode client command");
-                return;
+        let mut first_new_index: Option<u64> = None;
+        for cmd in commands {
+            if self.pending_commands.len() >= self.max_pending() {
+                let _ = cmd.respond_to.send(ClientCommandResult::Overloaded);
+                continue;
             }
-        };
+            let encoded = match cmd.command.encode() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!(error = %e, "failed to encode client command");
+                    continue;
+                }
+            };
+            let index = self.log.append(self.persistent.current_term, encoded);
+            first_new_index.get_or_insert(index);
+            self.pending_commands.insert(index, cmd.respond_to);
+        }
+        let Some(first) = first_new_index else { return };
 
-        let index = self.log.append(self.persistent.current_term, encoded);
-        self.append_to_wal(index);
-        self.pending_commands.insert(index, cmd.respond_to);
+        // Durable BEFORE anything is replicated or counted toward a majority.
+        let new_entries = self.log.entries_after(first - 1);
+        persist_must(self.persistence.append_batch(&new_entries), "log append");
+
         self.broadcast_append_entries();
 
         // A single-node cluster (or a leader whose own append already satisfies
@@ -670,46 +738,72 @@ impl Cluster {
         self.advance_leader_commit();
     }
 
-    /// Handles a read. Only the (believed) leader answers; followers redirect,
-    /// same as writes.
-    ///
-    /// In `Linearizable` mode the read is parked until `complete_ready_reads` can
-    /// prove two things: that a majority still recognised this node as leader
-    /// after the read arrived, and that this node has applied everything that was
-    /// committed when it arrived. In `Local` mode it is answered at once from
-    /// local state.
+    /// One-at-a-time form of `handle_client_queries`, for tests.
+    #[cfg(test)]
     fn handle_client_query(&mut self, query: ClientQuery) {
+        self.handle_client_queries(vec![query]);
+    }
+
+    /// Handles a batch of reads. Only the (believed) leader answers; followers
+    /// redirect, same as writes.
+    ///
+    /// In `Linearizable` mode the reads are parked until `complete_ready_reads` can
+    /// prove two things: that a majority still recognised this node as leader
+    /// after they arrived, and that this node has applied everything that was
+    /// committed when they arrived. The whole batch shares ONE heartbeat round,
+    /// which is sound because every read in it arrived before that round began. In
+    /// `Local` mode each is answered at once from local state.
+    fn handle_client_queries(&mut self, queries: Vec<ClientQuery>) {
         if self.volatile.role != Role::Leader {
-            let _ = query
-                .respond_to
-                .send(QueryResult::NotLeader { leader_hint: self.known_leader });
+            for query in queries {
+                let _ = query
+                    .respond_to
+                    .send(QueryResult::NotLeader { leader_hint: self.known_leader });
+            }
             return;
         }
 
         if self.config.read_mode == ReadMode::Local {
-            let value = self.kv_store.get(&query.key).cloned();
-            let _ = query.respond_to.send(QueryResult::Value(value));
+            for query in queries {
+                let value = self.kv_store.get(&query.key).cloned();
+                let _ = query.respond_to.send(QueryResult::Value(value));
+            }
             return;
         }
 
-        // The index this read must see. Never below this leader's own no-op: until
-        // that entry commits, our commit index may lag what earlier leaders
+        // The index these reads must see. Never below this leader's own no-op:
+        // until that entry commits, our commit index may lag what earlier leaders
         // committed, and only the no-op committing settles that.
         let read_index = self.volatile.commit_index.max(self.noop_index);
 
-        // Start a heartbeat round NOW, after the read arrived. A majority answering
-        // this round (or any later one) proves we were still the leader at a moment
-        // no earlier than the read's arrival. An older round would prove nothing:
-        // it could have been answered before a newer leader existed.
+        let mut accepted = Vec::new();
+        for query in queries {
+            if self.pending_reads.len() + accepted.len() >= self.max_pending() {
+                let _ = query.respond_to.send(QueryResult::Overloaded);
+            } else {
+                accepted.push(query);
+            }
+        }
+        if accepted.is_empty() {
+            return;
+        }
+
+        // Start a heartbeat round NOW, after every one of these reads arrived. A
+        // majority answering this round (or any later one) proves we were still
+        // the leader at a moment no earlier than their arrival. An older round
+        // would prove nothing: it could have been answered before a newer leader
+        // existed.
         self.broadcast_append_entries();
         let required_seq = self.heartbeat_seq;
 
-        self.pending_reads.push(PendingRead {
-            key: query.key,
-            respond_to: query.respond_to,
-            read_index,
-            required_seq,
-        });
+        for query in accepted {
+            self.pending_reads.push(PendingRead {
+                key: query.key,
+                respond_to: query.respond_to,
+                read_index,
+                required_seq,
+            });
+        }
     }
 
     /// Answers every waiting read that is now safe to answer. A read is safe once
@@ -757,9 +851,28 @@ impl Cluster {
         }
     }
 
-    fn send_to(&self, peer_id: NodeId, msg: RpcMessage) {
-        if let Some(tx) = self.peer_outboxes.get(&peer_id) {
-            let _ = tx.send(msg);
+    /// Queues a message for a peer without ever waiting. If that peer's queue is
+    /// full (it is down, or too slow to keep up) the message is dropped. That is
+    /// safe: Raft is built to tolerate lost messages, and the leader resends what
+    /// matters on its next heartbeat. What must never happen is the event loop
+    /// stalling on one slow peer while the rest of the cluster waits.
+    fn send_to(&mut self, peer_id: NodeId, msg: RpcMessage) {
+        let Some(tx) = self.peer_outboxes.get(&peer_id) else { return };
+        match tx.try_send(msg) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped_messages += 1;
+                // Log on the 1st, 2nd, 4th, 8th... drop: visible, but not a flood.
+                if self.dropped_messages.is_power_of_two() {
+                    warn!(
+                        peer_id,
+                        dropped_total = self.dropped_messages,
+                        "peer queue full - dropping messages to it"
+                    );
+                }
+            }
+            // The peer's connection task is gone (node shutting down).
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
@@ -772,6 +885,8 @@ impl Cluster {
             last_applied: self.volatile.last_applied,
             log_len: self.log.last_index(),
             leader_hint: self.known_leader,
+            wal_syncs: self.persistence.wal_sync_count(),
+            dropped_messages: self.dropped_messages,
         });
     }
 }
@@ -779,6 +894,7 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Limits;
     use raft_core::{
         AppendEntriesRequest, AppendEntriesResponse, LogEntry, PreVoteResponse,
         RequestVoteRequest, RequestVoteResponse,
@@ -814,7 +930,7 @@ mod tests {
         }
     }
 
-    type Outputs = HashMap<NodeId, mpsc::UnboundedReceiver<RpcMessage>>;
+    type Outputs = HashMap<NodeId, mpsc::Receiver<RpcMessage>>;
 
     /// Builds node 1 over `dir` with the given peers, recovering whatever is
     /// already stored there (so calling it twice on one directory is a restart).
@@ -829,6 +945,23 @@ mod tests {
         peer_ids: &[NodeId],
         read_mode: ReadMode,
     ) -> (Cluster, Outputs) {
+        make_cluster_full(dir, peer_ids, read_mode, Limits::default())
+    }
+
+    fn make_cluster_with_limits(
+        dir: &Path,
+        peer_ids: &[NodeId],
+        limits: Limits,
+    ) -> (Cluster, Outputs) {
+        make_cluster_full(dir, peer_ids, ReadMode::Linearizable, limits)
+    }
+
+    fn make_cluster_full(
+        dir: &Path,
+        peer_ids: &[NodeId],
+        read_mode: ReadMode,
+        limits: Limits,
+    ) -> (Cluster, Outputs) {
         let peers = peer_ids.iter().map(|&id| (id, String::new())).collect();
         let config = NodeConfig {
             id: 1,
@@ -837,15 +970,16 @@ mod tests {
             peers,
             storage_dir: dir.to_path_buf(),
             read_mode,
+            limits,
         };
         let mut outboxes = HashMap::new();
         let mut outputs = HashMap::new();
         for &id in peer_ids {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(limits.channel_capacity);
             outboxes.insert(id, tx);
             outputs.insert(id, rx);
         }
-        let (_inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+        let (_inbox_tx, inbox_rx) = mpsc::channel(limits.channel_capacity);
         let recovered = Persistence::open(dir).expect("storage should open");
         let (cluster, _handle) = Cluster::new(config, recovered, outboxes, inbox_rx);
         (cluster, outputs)
@@ -1839,5 +1973,276 @@ mod tests {
             matches!(&sent[..], [RpcMessage::AppendEntriesResponse(r)] if r.seq == 77),
             "expected the reply to carry round 77, got {sent:?}"
         );
+    }
+
+    // ---- group commit -------------------------------------------------------
+
+    #[test]
+    fn a_batch_of_writes_shares_one_disk_sync_and_one_replication_round() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let syncs_before = cluster.persistence.wal_sync_count();
+        let round_before = cluster.heartbeat_seq;
+
+        let batch: Vec<ClientCommand> =
+            (0..10).map(|i| put_command(&format!("k{i}"), "v")).collect();
+        cluster.handle_client_commands(batch);
+
+        assert_eq!(cluster.log.last_index(), 11, "no-op plus ten writes");
+        assert_eq!(cluster.pending_commands.len(), 10);
+        assert_eq!(
+            cluster.persistence.wal_sync_count() - syncs_before,
+            1,
+            "ten writes must share a single fsync"
+        );
+        assert_eq!(cluster.heartbeat_seq - round_before, 1, "and a single replication round");
+    }
+
+    #[test]
+    fn a_batch_is_durable_before_it_is_replicated_or_acknowledged() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        drain(&mut outputs, 2);
+
+        cluster.handle_client_commands((0..3).map(|i| put_command(&format!("k{i}"), "v")).collect());
+
+        // Everything the leader appended is already on disk by the time the
+        // replication messages exist.
+        let on_disk = Wal::replay(dir.wal_path()).unwrap();
+        assert_eq!(on_disk.len(), 4, "no-op plus three writes");
+        let sent = drain(&mut outputs, 2);
+        assert!(
+            sent.iter().any(|m| matches!(m, RpcMessage::AppendEntries(r) if r.entries.len() == 4)),
+            "the one replication message carries the whole batch, got {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_follower_stores_a_whole_batch_of_entries_with_one_sync() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
+        let syncs_before = cluster.persistence.wal_sync_count();
+
+        let entries: Vec<LogEntry> = (1..=8).map(|i| entry(1, i, "x")).collect();
+        cluster.handle_rpc(2, append_request(1, 2, 0, 0, entries));
+
+        assert_eq!(cluster.log.last_index(), 8);
+        assert_eq!(cluster.persistence.wal_sync_count() - syncs_before, 1);
+        assert_eq!(Wal::replay(dir.wal_path()).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn a_batch_sent_to_a_follower_replies_with_the_replicated_index() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let entries: Vec<LogEntry> = (1..=5).map(|i| entry(1, i, "x")).collect();
+
+        cluster.handle_rpc(2, append_request(1, 2, 0, 0, entries));
+
+        let sent = drain(&mut outputs, 2);
+        assert!(
+            matches!(&sent[..], [RpcMessage::AppendEntriesResponse(r)] if r.success && r.match_index == 5),
+            "got {sent:?}"
+        );
+    }
+
+    #[test]
+    fn writes_to_a_follower_are_redirected_without_touching_the_disk() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        let syncs_before = cluster.persistence.wal_sync_count();
+        let (first, mut first_rx) = put_command_with_receiver("a", "1");
+        let (second, mut second_rx) = put_command_with_receiver("b", "2");
+
+        cluster.handle_client_commands(vec![first, second]);
+
+        assert!(matches!(first_rx.try_recv(), Ok(ClientCommandResult::NotLeader { .. })));
+        assert!(matches!(second_rx.try_recv(), Ok(ClientCommandResult::NotLeader { .. })));
+        assert_eq!(cluster.persistence.wal_sync_count(), syncs_before);
+    }
+
+    #[test]
+    fn a_batch_collects_what_is_already_queued_up_to_the_limit() {
+        let (tx, mut rx) = mpsc::channel(32);
+        for i in 1..=10u32 {
+            tx.try_send(i).unwrap();
+        }
+
+        let batch = collect_batch(0u32, &mut rx, 4);
+
+        assert_eq!(batch, vec![0, 1, 2, 3], "capped at the batch limit, in arrival order");
+        assert_eq!(rx.try_recv().unwrap(), 4, "the rest stays queued for the next batch");
+    }
+
+    #[test]
+    fn a_lone_request_is_never_held_back_waiting_for_company() {
+        let (_tx, mut rx) = mpsc::channel::<u32>(8);
+        let batch = collect_batch(7u32, &mut rx, 128);
+        assert_eq!(batch, vec![7], "an idle node adds no latency");
+    }
+
+    #[test]
+    fn queued_reads_in_one_batch_share_one_heartbeat_round() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let round_before = cluster.heartbeat_seq;
+
+        let (queries, replies): (Vec<_>, Vec<_>) =
+            (0..5).map(|i| read_query(&format!("k{i}"))).unzip();
+        cluster.handle_client_queries(queries);
+
+        assert_eq!(cluster.heartbeat_seq - round_before, 1, "one round for five reads");
+        assert_eq!(cluster.pending_reads.len(), 5);
+
+        cluster.handle_rpc(2, append_ack(1, cluster.heartbeat_seq, true, 1));
+        cluster.complete_ready_reads();
+        for mut reply in replies {
+            assert!(matches!(reply.try_recv(), Ok(QueryResult::Value(None))));
+        }
+    }
+
+    // ---- backpressure -------------------------------------------------------
+
+    fn small_limits(capacity: usize) -> Limits {
+        Limits { channel_capacity: capacity, max_batch: 128 }
+    }
+
+    #[test]
+    fn writes_beyond_the_in_flight_limit_are_turned_away_immediately() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(3));
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+
+        let mut replies = Vec::new();
+        let mut batch = Vec::new();
+        for i in 0..5 {
+            let (cmd, rx) = put_command_with_receiver(&format!("k{i}"), "v");
+            batch.push(cmd);
+            replies.push(rx);
+        }
+        let log_before = cluster.log.last_index();
+        cluster.handle_client_commands(batch);
+
+        assert_eq!(cluster.pending_commands.len(), 3, "only 3 are held");
+        assert_eq!(cluster.log.last_index() - log_before, 3, "and only 3 reached the log");
+        for (i, mut reply) in replies.into_iter().enumerate() {
+            if i < 3 {
+                assert!(reply.try_recv().is_err(), "write {i} is accepted and waiting");
+            } else {
+                assert!(
+                    matches!(reply.try_recv(), Ok(ClientCommandResult::Overloaded)),
+                    "write {i} must be refused at once, not queued"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_write_leaves_nothing_behind_in_the_log() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        cluster.handle_client_command(put_command("accepted", "1"));
+        let log_before = cluster.log.last_index();
+        let syncs_before = cluster.persistence.wal_sync_count();
+
+        let (cmd, mut reply) = put_command_with_receiver("refused", "2");
+        cluster.handle_client_command(cmd);
+
+        assert!(matches!(reply.try_recv(), Ok(ClientCommandResult::Overloaded)));
+        assert_eq!(cluster.log.last_index(), log_before, "nothing was logged");
+        assert_eq!(cluster.persistence.wal_sync_count(), syncs_before, "and nothing was synced");
+    }
+
+    #[test]
+    fn capacity_frees_up_as_writes_complete() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[], small_limits(2));
+        cluster.begin_election(); // single node: writes commit immediately
+
+        for round in 0..6 {
+            let (cmd, mut reply) = put_command_with_receiver(&format!("k{round}"), "v");
+            cluster.handle_client_command(cmd);
+            cluster.apply_committed_entries();
+            assert!(
+                matches!(reply.try_recv(), Ok(ClientCommandResult::Applied(_))),
+                "round {round}: finished writes must not count against the limit"
+            );
+        }
+        assert!(cluster.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn reads_beyond_the_in_flight_limit_are_turned_away_immediately() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(2));
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+
+        let (queries, replies): (Vec<_>, Vec<_>) = (0..4).map(|i| read_query(&format!("k{i}"))).unzip();
+        cluster.handle_client_queries(queries);
+
+        assert_eq!(cluster.pending_reads.len(), 2);
+        let refused = replies
+            .into_iter()
+            .filter_map(|mut r| r.try_recv().ok())
+            .filter(|r| matches!(r, QueryResult::Overloaded))
+            .count();
+        assert_eq!(refused, 2);
+    }
+
+    #[test]
+    fn a_full_peer_queue_drops_messages_instead_of_blocking_the_node() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(2));
+        cluster.persistent.current_term = 1;
+
+        // Nobody reads node 2's queue, so it holds 2 messages and the rest do not fit.
+        for _ in 0..5 {
+            cluster.send_to(2, pre_vote_request(1, 1));
+        }
+
+        assert_eq!(cluster.dropped_messages, 3, "5 sent, 2 queued, 3 dropped");
+        assert_eq!(drain(&mut outputs, 2).len(), 2);
+        // Node 3's queue is unaffected by node 2 being slow.
+        cluster.send_to(3, pre_vote_request(1, 1));
+        assert_eq!(drain(&mut outputs, 3).len(), 1);
+    }
+
+    #[test]
+    fn a_leader_whose_followers_cannot_keep_up_still_makes_progress_locally() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+
+        // Far more broadcasts than either peer queue can hold.
+        for _ in 0..50 {
+            cluster.broadcast_append_entries();
+        }
+
+        assert!(cluster.dropped_messages > 0, "excess messages were dropped");
+        assert_eq!(cluster.volatile.role, Role::Leader, "the node itself was never stalled");
+    }
+
+    #[test]
+    fn dropped_messages_and_disk_syncs_are_reported_in_the_snapshot() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        for _ in 0..5 {
+            cluster.broadcast_append_entries();
+        }
+        let mut snapshot_rx = cluster.snapshot_tx.subscribe();
+        cluster.publish_snapshot();
+
+        let snapshot = snapshot_rx.borrow_and_update().clone();
+        assert!(snapshot.dropped_messages > 0);
+        assert!(snapshot.wal_syncs >= 1, "the leader's no-op was synced");
     }
 }

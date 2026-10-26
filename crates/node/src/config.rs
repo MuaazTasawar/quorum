@@ -25,6 +25,35 @@ pub enum ReadMode {
     Local,
 }
 
+/// Default capacity of every queue between the parts of a node (client requests,
+/// inbound peer messages, each peer's outbound messages), and the most client
+/// requests one node will hold in flight.
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Default most requests handled together as one batch (one disk sync, one round
+/// of replication).
+pub const DEFAULT_MAX_BATCH: usize = 128;
+
+/// Sizes that bound how much work a node will hold at once. Every queue is
+/// bounded so that a node under more load than it can carry pushes back on its
+/// callers (an HTTP 503 with `Retry-After`, or TCP backpressure from a peer)
+/// instead of growing memory until it falls over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Capacity of each internal queue, and the cap on writes (and on reads)
+    /// waiting for the cluster at any moment.
+    pub channel_capacity: usize,
+    /// Most queued requests taken together as one batch: they share a single
+    /// `fsync` and a single replication round.
+    pub max_batch: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { channel_capacity: DEFAULT_CHANNEL_CAPACITY, max_batch: DEFAULT_MAX_BATCH }
+    }
+}
+
 /// Static configuration for one node. Loaded from environment variables
 /// rather than a config file so docker-compose (Phase 11) can set each
 /// node up purely through its `environment:` block.
@@ -36,6 +65,7 @@ pub struct NodeConfig {
     pub peers: HashMap<NodeId, String>,
     pub storage_dir: PathBuf,
     pub read_mode: ReadMode,
+    pub limits: Limits,
 }
 
 impl NodeConfig {
@@ -51,6 +81,8 @@ impl NodeConfig {
     ///   QUORUM_STORAGE_DIR=/data
     ///   QUORUM_REQUEST_TIMEOUT_MS=3000   (optional, see `request_timeout_from_env`)
     ///   QUORUM_LOCAL_READS=false         (optional; true = fast but possibly stale reads)
+    ///   QUORUM_CHANNEL_CAPACITY=1024     (optional; size of every internal queue)
+    ///   QUORUM_MAX_BATCH=128             (optional; most requests per disk sync)
     pub fn from_env() -> anyhow::Result<Self> {
         let id: NodeId = std::env::var("QUORUM_NODE_ID")
             .map_err(|_| anyhow::anyhow!("QUORUM_NODE_ID not set"))?
@@ -74,8 +106,43 @@ impl NodeConfig {
 
         let read_mode = parse_read_mode(std::env::var("QUORUM_LOCAL_READS").ok().as_deref())?;
 
-        Ok(Self { id, listen_addr, metrics_addr, peers, storage_dir, read_mode })
+        let limits = limits_from_env()?;
+
+        Ok(Self { id, listen_addr, metrics_addr, peers, storage_dir, read_mode, limits })
     }
+}
+
+/// Reads `QUORUM_CHANNEL_CAPACITY` and `QUORUM_MAX_BATCH`.
+pub fn limits_from_env() -> anyhow::Result<Limits> {
+    Ok(Limits {
+        channel_capacity: parse_limit(
+            "QUORUM_CHANNEL_CAPACITY",
+            std::env::var("QUORUM_CHANNEL_CAPACITY").ok().as_deref(),
+            DEFAULT_CHANNEL_CAPACITY,
+        )?,
+        max_batch: parse_limit(
+            "QUORUM_MAX_BATCH",
+            std::env::var("QUORUM_MAX_BATCH").ok().as_deref(),
+            DEFAULT_MAX_BATCH,
+        )?,
+    })
+}
+
+/// Parses a size setting: a whole number of at least 1 (a queue of zero slots
+/// cannot hold anything, and a batch of zero would never make progress), or the
+/// default when unset.
+pub fn parse_limit(name: &str, raw: Option<&str>, default: usize) -> anyhow::Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{name} must be a whole number, got {raw:?}"))?;
+    if value == 0 {
+        anyhow::bail!("{name} must be at least 1");
+    }
+    Ok(value)
 }
 
 /// Parses `QUORUM_LOCAL_READS`. Unset means linearizable reads; `true`/`1` opts in
@@ -160,5 +227,32 @@ mod tests {
         assert!(parse_read_mode(Some("ture")).is_err());
         assert!(parse_read_mode(Some("")).is_err());
         assert!(parse_read_mode(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn limits_default_when_unset() {
+        assert_eq!(parse_limit("X", None, 1024).unwrap(), 1024);
+        assert_eq!(Limits::default().channel_capacity, DEFAULT_CHANNEL_CAPACITY);
+        assert_eq!(Limits::default().max_batch, DEFAULT_MAX_BATCH);
+    }
+
+    #[test]
+    fn limits_parse_whole_numbers() {
+        assert_eq!(parse_limit("X", Some("64"), 1024).unwrap(), 64);
+        assert_eq!(parse_limit("X", Some(" 7 "), 1024).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_limit_of_zero_or_garbage_is_rejected() {
+        assert!(parse_limit("X", Some("0"), 1024).is_err());
+        assert!(parse_limit("X", Some("many"), 1024).is_err());
+        assert!(parse_limit("X", Some("-3"), 1024).is_err());
+        assert!(parse_limit("X", Some(""), 1024).is_err());
+    }
+
+    #[test]
+    fn a_rejected_limit_names_the_setting() {
+        let message = parse_limit("QUORUM_MAX_BATCH", Some("0"), 128).unwrap_err().to_string();
+        assert!(message.contains("QUORUM_MAX_BATCH"), "{message}");
     }
 }

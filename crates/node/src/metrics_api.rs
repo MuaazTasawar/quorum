@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub command_tx: mpsc::UnboundedSender<ClientCommand>,
-    pub query_tx: mpsc::UnboundedSender<ClientQuery>,
+    pub command_tx: mpsc::Sender<ClientCommand>,
+    pub query_tx: mpsc::Sender<ClientQuery>,
     pub snapshot_rx: watch::Receiver<ClusterSnapshot>,
     /// Upper bound on how long one request waits for the cluster to answer.
     pub request_timeout: Duration,
@@ -44,6 +44,18 @@ pub fn router(state: AppState) -> Router {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.snapshot_rx.borrow().clone())
+}
+
+/// Queues a request for the cluster without ever waiting for room. A full queue
+/// means the node already has all the work it will hold, so the request is turned
+/// away at once with `Overloaded` (HTTP 503 + Retry-After) rather than parked
+/// here, where a growing pile of waiting requests would only make things worse.
+fn enqueue<T>(queue: &mpsc::Sender<T>, item: T) -> Result<(), AppError> {
+    match queue.try_send(item) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(AppError::Overloaded),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(AppError::ChannelClosed),
+    }
 }
 
 /// Waits for the cluster's answer, but never longer than `timeout`.
@@ -80,10 +92,7 @@ async fn get_key(
     Path(key): Path<String>,
 ) -> Result<Json<GetResponse>, AppError> {
     let (respond_to, receiver) = oneshot::channel();
-    state
-        .query_tx
-        .send(ClientQuery { key, respond_to })
-        .map_err(|_| AppError::ChannelClosed)?;
+    enqueue(&state.query_tx, ClientQuery { key, respond_to })?;
 
     match await_reply(receiver, state.request_timeout, false).await? {
         QueryResult::Value(v) => Ok(Json(GetResponse {
@@ -96,6 +105,7 @@ async fn get_key(
             value: None,
             leader_hint,
         })),
+        QueryResult::Overloaded => Err(AppError::Overloaded),
     }
 }
 
@@ -116,10 +126,7 @@ struct WriteResponse {
 /// behaviour.
 async fn submit_write(state: &AppState, command: Command) -> Result<Json<WriteResponse>, AppError> {
     let (respond_to, receiver) = oneshot::channel();
-    state
-        .command_tx
-        .send(ClientCommand { command, respond_to })
-        .map_err(|_| AppError::ChannelClosed)?;
+    enqueue(&state.command_tx, ClientCommand { command, respond_to })?;
 
     match await_reply(receiver, state.request_timeout, true).await? {
         ClientCommandResult::Applied(_) => {
@@ -129,6 +136,7 @@ async fn submit_write(state: &AppState, command: Command) -> Result<Json<WriteRe
             Ok(Json(WriteResponse { is_leader: false, applied: false, leader_hint }))
         }
         ClientCommandResult::LeadershipLost => Err(AppError::LeadershipLost),
+        ClientCommandResult::Overloaded => Err(AppError::Overloaded),
     }
 }
 

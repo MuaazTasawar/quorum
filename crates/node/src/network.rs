@@ -11,13 +11,19 @@ use transport::Connection;
 /// sender the rest of the node uses to queue outbound RpcMessages - the task
 /// owns the actual socket and handles reconnects transparently, so callers
 /// never need to know a reconnect happened.
+///
+/// The queue to the peer holds at most `capacity` messages. If the peer is down or
+/// slow and the queue fills, the node drops further messages to it rather than
+/// buffering them without limit; Raft tolerates lost messages, because the leader
+/// resends on its next heartbeat.
 pub fn spawn_outbound(
     self_id: NodeId,
     peer_id: NodeId,
     addr: String,
-    inbox_tx: mpsc::UnboundedSender<(NodeId, RpcMessage)>,
-) -> mpsc::UnboundedSender<RpcMessage> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<RpcMessage>();
+    inbox_tx: mpsc::Sender<(NodeId, RpcMessage)>,
+    capacity: usize,
+) -> mpsc::Sender<RpcMessage> {
+    let (tx, mut rx) = mpsc::channel::<RpcMessage>(capacity);
 
     tokio::spawn(async move {
         loop {
@@ -50,9 +56,9 @@ pub fn spawn_outbound(
 /// incoming messages with `peer_id` (known for certain, since we dialed them).
 async fn drive_outbound(
     mut conn: Connection,
-    rx: &mut mpsc::UnboundedReceiver<RpcMessage>,
+    rx: &mut mpsc::Receiver<RpcMessage>,
     peer_id: NodeId,
-    inbox_tx: &mpsc::UnboundedSender<(NodeId, RpcMessage)>,
+    inbox_tx: &mpsc::Sender<(NodeId, RpcMessage)>,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
@@ -63,7 +69,10 @@ async fn drive_outbound(
                 }
             }
             incoming = conn.recv() => {
-                inbox_tx.send((peer_id, incoming?)).ok();
+                // Waiting for room here is deliberate backpressure: while the node
+                // is behind, this connection is simply not read, and TCP flow
+                // control slows the peer down instead of memory filling up.
+                inbox_tx.send((peer_id, incoming?)).await.ok();
             }
         }
     }
@@ -74,7 +83,7 @@ async fn drive_outbound(
 /// calling, since raw TCP carries no identity. After the handshake, every
 /// further frame from that connection is tagged with the now-known peer_id
 /// and forwarded into the shared inbox.
-pub async fn run_accept_loop(listener: TcpListener, inbox_tx: mpsc::UnboundedSender<(NodeId, RpcMessage)>) {
+pub async fn run_accept_loop(listener: TcpListener, inbox_tx: mpsc::Sender<(NodeId, RpcMessage)>) {
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(pair) => pair,
@@ -105,7 +114,9 @@ pub async fn run_accept_loop(listener: TcpListener, inbox_tx: mpsc::UnboundedSen
             loop {
                 match conn.recv().await {
                     Ok(msg) => {
-                        inbox_tx.send((peer_id, msg)).ok();
+                        // Backpressure, as above: not reading while the node is
+                        // behind makes TCP slow the sender down.
+                        inbox_tx.send((peer_id, msg)).await.ok();
                     }
                     Err(e) => {
                         warn!(peer_id, error = %e, "inbound connection closed");

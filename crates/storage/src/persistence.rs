@@ -1,5 +1,5 @@
 use crate::hard_state::{load_hard_state, save_hard_state, HardStateError};
-use crate::wal::{Wal, WalError};
+use crate::wal::{Wal, WalError, WalRecovery};
 use raft_core::{LogEntry, NodeId, PersistentState, Term};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,10 @@ pub struct Recovered {
     pub persistence: Persistence,
     pub hard_state: PersistentState,
     pub entries: Vec<LogEntry>,
+    /// Bytes of an unfinished write cut off the end of the WAL during recovery.
+    /// Non-zero means the previous run died mid-append; nothing that write held
+    /// was ever acknowledged, so nothing promised was lost.
+    pub discarded_wal_bytes: u64,
 }
 
 /// Everything Raft requires to survive a crash, behind one handle: the log
@@ -48,7 +52,7 @@ impl Persistence {
         let wal_path = dir.join(WAL_FILE);
         let hard_state_path = dir.join(HARD_STATE_FILE);
 
-        let entries = Wal::replay(&wal_path)?;
+        let WalRecovery { entries, discarded_bytes } = Wal::recover(&wal_path)?;
         let wal = Wal::open(&wal_path)?;
         let mut hard_state = load_hard_state(&hard_state_path)?;
         let last_saved = (hard_state.current_term, hard_state.voted_for);
@@ -70,6 +74,7 @@ impl Persistence {
             persistence: Persistence { dir, wal, hard_state_path, last_saved },
             hard_state,
             entries,
+            discarded_wal_bytes: discarded_bytes,
         })
     }
 
@@ -77,6 +82,20 @@ impl Persistence {
     pub fn append(&mut self, entry: &LogEntry) -> Result<(), PersistenceError> {
         self.wal.append(entry)?;
         Ok(())
+    }
+
+    /// Appends several entries with a single fsync (group commit). Entries that
+    /// arrive together share one disk sync instead of paying for one each; none of
+    /// them may be acknowledged until this returns.
+    pub fn append_batch(&mut self, entries: &[LogEntry]) -> Result<(), PersistenceError> {
+        self.wal.append_batch(entries)?;
+        Ok(())
+    }
+
+    /// How many times the log has been forced to disk. Observability, and how the
+    /// tests check that a batch really shares a sync.
+    pub fn wal_sync_count(&self) -> u64 {
+        self.wal.sync_count()
     }
 
     /// Durably discards every log entry with index >= `from_index`.
@@ -217,5 +236,47 @@ mod tests {
         }
         let recovered = Persistence::open(&dir.0).unwrap();
         assert_eq!(recovered.hard_state.current_term, 4);
+    }
+
+    #[test]
+    fn a_batch_survives_a_reopen_and_costs_one_sync() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            let batch: Vec<LogEntry> = (1..=20).map(|i| entry(1, i, "x")).collect();
+            p.append_batch(&batch).unwrap();
+            assert_eq!(p.wal_sync_count(), 1);
+        }
+        let recovered = Persistence::open(&dir.0).unwrap();
+        assert_eq!(recovered.entries.len(), 20);
+        assert_eq!(recovered.discarded_wal_bytes, 0);
+    }
+
+    #[test]
+    fn opening_after_a_crash_mid_append_recovers_the_complete_records() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            p.append(&entry(1, 1, "a")).unwrap();
+            p.append(&entry(1, 2, "b")).unwrap();
+        }
+        // The process died part-way through writing a third record.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.0.join(WAL_FILE))
+            .unwrap()
+            .write_all(&[40, 0, 0, 0, 1, 2, 3])
+            .unwrap();
+
+        let recovered = Persistence::open(&dir.0).unwrap();
+
+        assert_eq!(recovered.entries.len(), 2, "the unfinished record is dropped");
+        assert_eq!(recovered.discarded_wal_bytes, 7);
+        // The node can carry on appending to a clean file.
+        let mut p = recovered.persistence;
+        p.append(&entry(1, 3, "c")).unwrap();
+        drop(p);
+        assert_eq!(Persistence::open(&dir.0).unwrap().entries.len(), 3);
     }
 }

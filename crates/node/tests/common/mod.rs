@@ -13,7 +13,7 @@ use node::cluster::{
     ClientCommand, ClientCommandResult, ClientQuery, Cluster, ClusterHandle, ClusterSnapshot,
     QueryResult,
 };
-use node::config::{NodeConfig, ReadMode};
+use node::config::{Limits, NodeConfig, ReadMode};
 use node::metrics_api::{router, AppState};
 use raft_core::{NodeId, RpcMessage};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -26,7 +26,7 @@ use storage::{Command, Persistence};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-type Inbox = mpsc::UnboundedSender<(NodeId, RpcMessage)>;
+type Inbox = mpsc::Sender<(NodeId, RpcMessage)>;
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -63,15 +63,17 @@ fn spawn_link(
     network: Arc<Network>,
     from: NodeId,
     to: NodeId,
-) -> mpsc::UnboundedSender<RpcMessage> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<RpcMessage>();
+    capacity: usize,
+) -> mpsc::Sender<RpcMessage> {
+    let (tx, mut rx) = mpsc::channel::<RpcMessage>(capacity);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if network.is_blocked(from, to) {
                 continue;
             }
             if let Some(inbox) = network.inbox(to) {
-                let _ = inbox.send((from, msg));
+                // Like a real socket, waiting for room pushes back on the sender.
+                let _ = inbox.send((from, msg)).await;
             }
         }
     });
@@ -89,6 +91,7 @@ pub struct TestCluster {
     nodes: BTreeMap<NodeId, TestNode>,
     base_dir: PathBuf,
     read_mode: ReadMode,
+    limits: Limits,
 }
 
 impl TestCluster {
@@ -100,6 +103,15 @@ impl TestCluster {
 
     /// Like `start`, but with an explicit read mode for every node.
     pub fn start_with_read_mode(ids: &[NodeId], read_mode: ReadMode) -> Self {
+        Self::start_full(ids, read_mode, Limits::default())
+    }
+
+    /// Like `start`, but with explicit queue limits for every node.
+    pub fn start_with_limits(ids: &[NodeId], limits: Limits) -> Self {
+        Self::start_full(ids, ReadMode::Linearizable, limits)
+    }
+
+    fn start_full(ids: &[NodeId], read_mode: ReadMode, limits: Limits) -> Self {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         let base_dir = std::env::temp_dir().join(format!("quorum-itest-{nanos}-{n}"));
@@ -111,6 +123,7 @@ impl TestCluster {
             nodes: BTreeMap::new(),
             base_dir,
             read_mode,
+            limits,
         };
         for &id in ids {
             cluster.launch(id);
@@ -122,16 +135,24 @@ impl TestCluster {
         self.base_dir.join(format!("node{id}"))
     }
 
+    /// Where node `id` keeps its write-ahead log.
+    pub fn wal_path(&self, id: NodeId) -> PathBuf {
+        self.node_dir(id).join(storage::WAL_FILE)
+    }
+
     /// Brings node `id` up over its storage directory, recovering whatever is
     /// already there. Used for both first start and restart.
     fn launch(&mut self, id: NodeId) {
-        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+        let (inbox_tx, inbox_rx) = mpsc::channel(self.limits.channel_capacity);
         self.network.register(id, inbox_tx);
 
         let mut peer_outboxes = HashMap::new();
         for &peer in &self.ids {
             if peer != id {
-                peer_outboxes.insert(peer, spawn_link(self.network.clone(), id, peer));
+                peer_outboxes.insert(
+                    peer,
+                    spawn_link(self.network.clone(), id, peer, self.limits.channel_capacity),
+                );
             }
         }
 
@@ -142,6 +163,7 @@ impl TestCluster {
             peers: peer_outboxes.keys().map(|&pid| (pid, String::new())).collect(),
             storage_dir: self.node_dir(id),
             read_mode: self.read_mode,
+            limits: self.limits,
         };
 
         let recovered = Persistence::open(self.node_dir(id)).expect("storage should open");
@@ -285,6 +307,17 @@ impl TestCluster {
     }
 
     pub async fn put(&self, id: NodeId, key: &str, value: &str) -> ClientCommandResult {
+        self.submit(id, key, value).await.await.expect("cluster should respond")
+    }
+
+    /// Queues a write and returns at once with the receiver for its eventual
+    /// result, so a test can have many writes in flight together.
+    pub async fn submit(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: &str,
+    ) -> oneshot::Receiver<ClientCommandResult> {
         let (respond_to, receiver) = oneshot::channel();
         self.nodes[&id]
             .handle
@@ -293,8 +326,24 @@ impl TestCluster {
                 command: Command::Put { key: key.to_string(), value: value.as_bytes().to_vec() },
                 respond_to,
             })
+            .await
             .expect("command channel should be open");
-        receiver.await.expect("cluster should respond")
+        receiver
+    }
+
+    /// Fires `count` writes at node `id` back to back and waits for all of them.
+    /// They are all queued before the node gets a turn, which is exactly the load
+    /// that group commit exists for.
+    pub async fn put_many(&self, id: NodeId, count: usize) -> Vec<ClientCommandResult> {
+        let mut receivers = Vec::with_capacity(count);
+        for i in 0..count {
+            receivers.push(self.submit(id, &format!("key-{i}"), "value").await);
+        }
+        let mut results = Vec::with_capacity(count);
+        for receiver in receivers {
+            results.push(receiver.await.expect("cluster should respond"));
+        }
+        results
     }
 
     pub async fn get(&self, id: NodeId, key: &str) -> QueryResult {
@@ -303,6 +352,7 @@ impl TestCluster {
             .handle
             .query_tx
             .send(ClientQuery { key: key.to_string(), respond_to })
+            .await
             .expect("query channel should be open");
         receiver.await.expect("cluster should respond")
     }

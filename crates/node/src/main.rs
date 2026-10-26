@@ -28,12 +28,31 @@ async fn main() -> anyhow::Result<()> {
         recovered_entries = recovered.entries.len(),
         "recovered state from disk"
     );
+    if recovered.discarded_wal_bytes > 0 {
+        // The previous run died part-way through writing a log entry. That write
+        // never finished, so nothing acknowledged was lost; the partial tail was cut off.
+        tracing::warn!(
+            discarded_bytes = recovered.discarded_wal_bytes,
+            "dropped an unfinished write from the end of the log left by a crash"
+        );
+    }
 
-    let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+    tracing::info!(
+        channel_capacity = config.limits.channel_capacity,
+        max_batch = config.limits.max_batch,
+        "queue limits"
+    );
+    let (inbox_tx, inbox_rx) = mpsc::channel(config.limits.channel_capacity);
 
     let mut peer_outboxes = HashMap::new();
     for (&peer_id, addr) in &config.peers {
-        let tx = network::spawn_outbound(config.id, peer_id, addr.clone(), inbox_tx.clone());
+        let tx = network::spawn_outbound(
+            config.id,
+            peer_id,
+            addr.clone(),
+            inbox_tx.clone(),
+            config.limits.channel_capacity,
+        );
         peer_outboxes.insert(peer_id, tx);
     }
 

@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
@@ -19,6 +19,11 @@ pub enum AppError {
     ChannelClosed,
     #[error("invalid key: {0}")]
     InvalidKey(String),
+    /// The node is carrying all the work it will hold at once. The request was
+    /// NOT accepted (nothing was logged or replicated), so retrying is always
+    /// safe, unlike a timeout, where a write may already have taken effect.
+    #[error("this node is overloaded and did not accept the request; retry shortly")]
+    Overloaded,
     #[error(
         "this node lost leadership before the write was confirmed; \
          it may or may not have been applied"
@@ -49,6 +54,7 @@ impl AppError {
         match self {
             AppError::ChannelClosed => StatusCode::SERVICE_UNAVAILABLE,
             AppError::InvalidKey(_) => StatusCode::BAD_REQUEST,
+            AppError::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             AppError::LeadershipLost => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         }
@@ -58,7 +64,7 @@ impl AppError {
         match self {
             AppError::LeadershipLost => true,
             AppError::Timeout { may_have_applied } => *may_have_applied,
-            AppError::ChannelClosed | AppError::InvalidKey(_) => false,
+            AppError::ChannelClosed | AppError::InvalidKey(_) | AppError::Overloaded => false,
         }
     }
 }
@@ -66,8 +72,15 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
+        let retry_after = matches!(self, AppError::Overloaded);
         let body = ErrorBody { error: self.to_string(), outcome_unknown: self.outcome_unknown() };
-        (status, Json(body)).into_response()
+        if retry_after {
+            // Tells well-behaved clients to back off instead of hammering a node
+            // that is already struggling.
+            (status, [(header::RETRY_AFTER, "1")], Json(body)).into_response()
+        } else {
+            (status, Json(body)).into_response()
+        }
     }
 }
 
@@ -114,5 +127,22 @@ mod tests {
     async fn an_invalid_key_is_400() {
         let (status, _) = render(AppError::InvalidKey("empty".into())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn overload_is_503_with_retry_after_and_is_safe_to_retry() {
+        let response = AppError::Overloaded.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("\"outcome_unknown\":false"), "a rejected request took no effect: {body}");
+    }
+
+    #[tokio::test]
+    async fn only_overload_carries_a_retry_after_header() {
+        for error in [AppError::LeadershipLost, AppError::ChannelClosed] {
+            assert!(error.into_response().headers().get(header::RETRY_AFTER).is_none());
+        }
     }
 }
