@@ -1,24 +1,32 @@
 use crate::cluster::{
-    ClientCommand, ClientCommandResult, ClientQuery, ClusterHandle, ClusterSnapshot, QueryResult,
+    AdminResult, ClientAdmin, ClientCommand, ClientCommandResult, ClientQuery, ClusterHandle,
+    ClusterSnapshot, MembershipChange, QueryResult,
 };
 use crate::errors::AppError;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use storage::Command;
 use tokio::sync::{mpsc, oneshot, watch};
 
+/// How many times longer than an ordinary request a membership change may take.
+const ADMIN_TIMEOUT_FACTOR: u32 = 10;
+
 #[derive(Clone)]
 pub struct AppState {
     pub command_tx: mpsc::Sender<ClientCommand>,
     pub query_tx: mpsc::Sender<ClientQuery>,
+    pub admin_tx: mpsc::Sender<ClientAdmin>,
     pub snapshot_rx: watch::Receiver<ClusterSnapshot>,
     /// Upper bound on how long one request waits for the cluster to answer.
     pub request_timeout: Duration,
+    /// Upper bound for a membership change. Longer than `request_timeout`: adding
+    /// a node includes copying it the whole log before it is admitted.
+    pub admin_timeout: Duration,
 }
 
 impl AppState {
@@ -26,8 +34,10 @@ impl AppState {
         Self {
             command_tx: handle.command_tx,
             query_tx: handle.query_tx,
+            admin_tx: handle.admin_tx,
             snapshot_rx: handle.snapshot_rx,
             request_timeout,
+            admin_timeout: request_timeout * ADMIN_TIMEOUT_FACTOR,
         }
     }
 }
@@ -38,6 +48,8 @@ pub fn router(state: AppState) -> Router {
         .route("/kv/{key}", get(get_key))
         .route("/kv/{key}", put(put_key))
         .route("/kv/{key}", delete(delete_key))
+        .route("/admin/members", post(add_member))
+        .route("/admin/members/{id}", delete(remove_member))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -153,6 +165,64 @@ async fn delete_key(
     Path(key): Path<String>,
 ) -> Result<Json<WriteResponse>, AppError> {
     submit_write(&state, Command::Delete { key }).await
+}
+
+#[derive(Deserialize)]
+struct AddMemberBody {
+    id: u32,
+    addr: String,
+}
+
+#[derive(Serialize)]
+struct MembershipResponse {
+    is_leader: bool,
+    applied: bool,
+    leader_hint: Option<u32>,
+    /// The voting members once the change took effect.
+    members: Vec<u32>,
+}
+
+/// Submits a membership change and waits until it is committed. A refused change
+/// is a 409 (nothing was logged, safe to retry); losing leadership or timing out
+/// mid-change is a 503/504 that says the outcome is unknown, like a write. Look at
+/// `/health` on any node to see what the membership actually is.
+async fn submit_membership_change(
+    state: &AppState,
+    change: MembershipChange,
+) -> Result<Json<MembershipResponse>, AppError> {
+    let (respond_to, receiver) = oneshot::channel();
+    enqueue(&state.admin_tx, ClientAdmin { change, respond_to })?;
+
+    match await_reply(receiver, state.admin_timeout, true).await? {
+        AdminResult::Applied { members } => Ok(Json(MembershipResponse {
+            is_leader: true,
+            applied: true,
+            leader_hint: None,
+            members,
+        })),
+        AdminResult::NotLeader { leader_hint } => Ok(Json(MembershipResponse {
+            is_leader: false,
+            applied: false,
+            leader_hint,
+            members: Vec::new(),
+        })),
+        AdminResult::Rejected(reason) => Err(AppError::MembershipRejected(reason)),
+        AdminResult::LeadershipLost => Err(AppError::LeadershipLost),
+    }
+}
+
+async fn add_member(
+    State(state): State<AppState>,
+    Json(body): Json<AddMemberBody>,
+) -> Result<Json<MembershipResponse>, AppError> {
+    submit_membership_change(&state, MembershipChange::Add { id: body.id, addr: body.addr }).await
+}
+
+async fn remove_member(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> Result<Json<MembershipResponse>, AppError> {
+    submit_membership_change(&state, MembershipChange::Remove { id }).await
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {

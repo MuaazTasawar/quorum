@@ -1,4 +1,5 @@
 use crate::log::Log;
+use crate::membership::Membership;
 use crate::messages::{PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse};
 use crate::state::{NodeId, PersistentState, VolatileState, Role};
 use rand::Rng;
@@ -33,17 +34,22 @@ impl ElectionTimeoutConfig {
 /// Tracks votes received while this node is a Candidate. Not part of
 /// `PersistentState` (doesn't survive restart - a restarted node just starts a
 /// fresh election) and not part of `LeaderState` (only relevant pre-leadership).
+///
+/// Only votes from the voting members count, and the candidate's own vote counts
+/// only if it is itself a member. The membership is copied in when the tally is
+/// created: a candidate cannot receive a configuration change mid-election,
+/// because accepting an append would end its candidacy.
 #[derive(Debug, Default)]
 pub struct VoteTally {
     votes_received: HashSet<NodeId>,
-    cluster_size: usize,
+    members: Membership,
 }
 
 impl VoteTally {
-    pub fn new(self_id: NodeId, cluster_size: usize) -> Self {
+    pub fn new(self_id: NodeId, membership: &Membership) -> Self {
         let mut votes_received = HashSet::new();
         votes_received.insert(self_id); // a candidate always votes for itself
-        Self { votes_received, cluster_size }
+        Self { votes_received, members: membership.clone() }
     }
 
     pub fn record_vote(&mut self, voter: NodeId) {
@@ -51,9 +57,10 @@ impl VoteTally {
     }
 
     /// A candidate becomes leader once it has votes from a strict majority of
-    /// the cluster (including itself) - e.g. 3 out of 5, not 3 out of 3 others.
+    /// the voting members - e.g. 3 out of 5. Votes from anyone who is not a member
+    /// (a learner, a removed node) are ignored.
     pub fn has_majority(&self) -> bool {
-        self.votes_received.len() > self.cluster_size / 2
+        self.members.is_quorum(self.votes_received.iter().copied())
     }
 }
 
@@ -228,12 +235,38 @@ mod tests {
 
     #[test]
     fn vote_tally_reaches_majority_at_correct_threshold() {
-        let mut tally = VoteTally::new(1, 5); // 5-node cluster, self_id = 1
+        let mut tally = VoteTally::new(1, &Membership::of_ids(1..=5)); // 5-node cluster, self_id = 1
         assert!(!tally.has_majority()); // 1/5 votes
         tally.record_vote(2);
         assert!(!tally.has_majority()); // 2/5 votes
         tally.record_vote(3);
         assert!(tally.has_majority()); // 3/5 votes - majority reached
+    }
+
+    #[test]
+    fn votes_from_non_members_do_not_count() {
+        // Members {1,2,3}; 8 and 9 are learners or strangers.
+        let mut tally = VoteTally::new(1, &Membership::of_ids([1, 2, 3]));
+        tally.record_vote(8);
+        tally.record_vote(9);
+        assert!(!tally.has_majority(), "1 member vote out of 3 plus two outsiders");
+        tally.record_vote(2);
+        assert!(tally.has_majority());
+    }
+
+    #[test]
+    fn a_candidate_that_is_not_a_member_does_not_count_its_own_vote() {
+        // Members {2,3,4}; the candidate (1) is not one of them.
+        let mut tally = VoteTally::new(1, &Membership::of_ids([2, 3, 4]));
+        tally.record_vote(2);
+        assert!(!tally.has_majority(), "one member vote of three");
+        tally.record_vote(3);
+        assert!(tally.has_majority());
+    }
+
+    #[test]
+    fn a_single_member_candidate_wins_on_its_own_vote() {
+        assert!(VoteTally::new(1, &Membership::of_ids([1])).has_majority());
     }
 
     // ---- pre-vote -----------------------------------------------------------

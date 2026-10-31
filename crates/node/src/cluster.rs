@@ -1,10 +1,11 @@
 use raft_core::{
     advance_commit_index, build_append_entries, handle_append_entries,
     handle_append_entries_response, handle_pre_vote, handle_request_vote, start_election,
-    ElectionTimeoutConfig, LeaderState, Log, NodeId, PersistentState, PreVoteRequest, Role,
+    ConfigChange, ConfigHistory, ElectionTimeoutConfig, LeaderState, Log, LogEntry, Membership,
+    NodeId, PersistentState, PreVoteRequest, PreVoteResponse, RequestVoteResponse, Role,
     RpcMessage, Term, VoteTally, VolatileState,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use storage::{Command, KvStore, Persistence, Recovered};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
@@ -58,6 +59,82 @@ pub enum QueryResult {
     Overloaded,
 }
 
+/// How a node opens a connection to a peer it has just learned about (a node
+/// being added to the cluster). Given the peer's id and address it returns the
+/// queue that messages for that peer are written to; the connection behind it is
+/// the connector's business, and may be a real TCP link or, in tests, a channel
+/// into a simulated network. The cluster itself never touches a socket.
+pub type PeerConnector = Box<dyn Fn(NodeId, &str) -> mpsc::Sender<RpcMessage> + Send + 'static>;
+
+/// A change to the cluster's membership, one server at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// Add `id`, reachable at `addr`, as a voting member. The node first joins as
+    /// a non-voting learner and is only promoted once it has caught up.
+    Add { id: NodeId, addr: String },
+    /// Remove `id` from the voting members.
+    Remove { id: NodeId },
+}
+
+pub struct ClientAdmin {
+    pub change: MembershipChange,
+    /// Resolved once the change is COMMITTED, not merely accepted.
+    pub respond_to: oneshot::Sender<AdminResult>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdminResult {
+    /// The change was committed and is in effect cluster-wide.
+    Applied { members: Vec<NodeId> },
+    NotLeader { leader_hint: Option<NodeId> },
+    /// The change was refused and NOTHING was logged, so retrying (once the reason
+    /// has gone) is always safe.
+    Rejected(AdminRejection),
+    /// This node lost leadership while the change was in progress. The outcome is
+    /// UNKNOWN: the entry may already be on a majority and be committed by the next
+    /// leader. Check the membership before retrying.
+    LeadershipLost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminRejection {
+    /// This leader has not yet committed an entry of its own term, so it cannot be
+    /// sure what the current configuration is. Retry in a moment.
+    NotReady,
+    /// Another membership change has not finished. Only one may be in flight, which
+    /// is exactly what makes single-server changes safe.
+    ChangeInProgress,
+    AlreadyMember,
+    NotMember,
+    /// The cluster must keep at least one voting member.
+    LastMember,
+    /// A node to add needs an address the others can dial.
+    BadAddress,
+    /// The joining node did not catch up with the log in time, or the caller gave
+    /// up waiting. It was not added.
+    CatchUpFailed,
+}
+
+impl std::fmt::Display for AdminRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AdminRejection::NotReady => {
+                "this leader has not committed an entry of its own term yet; retry shortly"
+            }
+            AdminRejection::ChangeInProgress => {
+                "another membership change is still in progress; only one at a time is allowed"
+            }
+            AdminRejection::AlreadyMember => "that node is already a member of the cluster",
+            AdminRejection::NotMember => "that node is not a member of the cluster",
+            AdminRejection::LastMember => "the last remaining member cannot be removed",
+            AdminRejection::BadAddress => "a node to add needs a non-empty address (host:port)",
+            AdminRejection::CatchUpFailed => {
+                "the new node did not catch up with the log in time and was not added"
+            }
+        })
+    }
+}
+
 /// Read-only view of cluster state, published after every event-loop
 /// iteration for the dashboard to stream over WebSocket.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -74,11 +151,18 @@ pub struct ClusterSnapshot {
     pub wal_syncs: u64,
     /// Outbound peer messages discarded because that peer's queue was full.
     pub dropped_messages: u64,
+    /// The voting members this node currently believes in, in id order. A change
+    /// shows here as soon as the entry reaches this node's log, before it commits.
+    pub members: Vec<NodeId>,
+    /// Nodes the leader is bringing up to date before admitting them as voters.
+    /// Only ever non-empty on a leader with an add in progress.
+    pub learners: Vec<NodeId>,
 }
 
 pub struct ClusterHandle {
     pub command_tx: mpsc::Sender<ClientCommand>,
     pub query_tx: mpsc::Sender<ClientQuery>,
+    pub admin_tx: mpsc::Sender<ClientAdmin>,
     pub snapshot_rx: watch::Receiver<ClusterSnapshot>,
 }
 
@@ -131,6 +215,28 @@ struct PendingRead {
     required_seq: u64,
 }
 
+/// The one membership change this leader has in flight.
+struct PendingAdmin {
+    respond_to: oneshot::Sender<AdminResult>,
+    stage: AdminStage,
+}
+
+enum AdminStage {
+    /// The node being added is a learner: it receives the log, but nothing counts
+    /// its acknowledgements. It is promoted once its match index reaches the
+    /// leader's commit index, so that adding it can never leave the cluster one
+    /// slow disk away from losing its majority.
+    CatchingUp { id: NodeId, addr: String, deadline: Instant },
+    /// The configuration entry is in the log and in effect; waiting for it to be
+    /// committed and applied.
+    Committing { index: u64, removes_self: bool },
+}
+
+/// The change a log entry carries, if it carries one.
+fn config_change_of(command: &[u8]) -> Option<ConfigChange> {
+    Command::decode(command).ok().and_then(|c| c.config_change())
+}
+
 /// An in-progress pre-vote round: the term this node WOULD use, and the answers
 /// collected so far. Nothing here is persisted or visible to peers as a term
 /// change; if the round fails it simply evaporates.
@@ -156,6 +262,18 @@ pub struct Cluster {
     inbox_rx: mpsc::Receiver<(NodeId, RpcMessage)>,
     command_rx: mpsc::Receiver<ClientCommand>,
     query_rx: mpsc::Receiver<ClientQuery>,
+    admin_rx: mpsc::Receiver<ClientAdmin>,
+    /// Every configuration entry in the log, on top of the bootstrap membership.
+    /// The log is the source of truth for who is in the cluster.
+    history: ConfigHistory,
+    /// `history.current()`, cached: who votes right now. A change is in effect from
+    /// the moment its entry is appended, long before it commits.
+    membership: Membership,
+    /// Leader only: nodes being caught up before they are admitted.
+    learners: BTreeMap<NodeId, String>,
+    /// The membership change this leader is working through, if any.
+    pending_admin: Option<PendingAdmin>,
+    connector: PeerConnector,
     /// Outbound messages discarded because a peer's queue was full.
     dropped_messages: u64,
     pending_commands: HashMap<u64, oneshot::Sender<ClientCommandResult>>,
@@ -173,18 +291,31 @@ impl Cluster {
     /// `current_term` / `voted_for` it had before it last stopped. Starting from
     /// the recovered term and vote (rather than from zero) is what stops a
     /// restarted node from voting twice in a term it already voted in.
+    ///
+    /// The cluster's membership is rebuilt from the log (on top of the bootstrap
+    /// membership in `config`), and `connector` is how the node dials any member
+    /// it learns about that it has no connection to yet.
     pub fn new(
         config: NodeConfig,
         recovered: Recovered,
         peer_outboxes: HashMap<NodeId, mpsc::Sender<RpcMessage>>,
         inbox_rx: mpsc::Receiver<(NodeId, RpcMessage)>,
+        connector: PeerConnector,
     ) -> (Self, ClusterHandle) {
         let Recovered { persistence, hard_state: persistent, entries, .. } = recovered;
+        let mut history = ConfigHistory::new(config.base_membership());
+        for entry in &entries {
+            if let Some(change) = config_change_of(&entry.command) {
+                history.record(entry.index, change);
+            }
+        }
+        let membership = history.current();
         let log = Log::from_entries(entries);
         let kv_store = KvStore::new();
         let capacity = config.limits.channel_capacity;
         let (command_tx, command_rx) = mpsc::channel(capacity);
         let (query_tx, query_rx) = mpsc::channel(capacity);
+        let (admin_tx, admin_rx) = mpsc::channel(capacity);
         let election_timeout = ElectionTimeoutConfig::default();
         let election_deadline = Instant::now() + election_timeout.random_timeout();
 
@@ -198,9 +329,11 @@ impl Cluster {
             leader_hint: None,
             wal_syncs: persistence.wal_sync_count(),
             dropped_messages: 0,
+            members: membership.ids().collect(),
+            learners: Vec::new(),
         });
 
-        let cluster = Self {
+        let mut cluster = Self {
             config,
             persistent,
             volatile: VolatileState::new(),
@@ -217,6 +350,12 @@ impl Cluster {
             inbox_rx,
             command_rx,
             query_rx,
+            admin_rx,
+            history,
+            membership,
+            learners: BTreeMap::new(),
+            pending_admin: None,
+            connector,
             dropped_messages: 0,
             pending_commands: HashMap::new(),
             pending_reads: Vec::new(),
@@ -225,7 +364,12 @@ impl Cluster {
             snapshot_tx,
         };
 
-        (cluster, ClusterHandle { command_tx, query_tx, snapshot_rx })
+        // The log may name members this process was not told about on startup, and
+        // the peers it WAS told about may since have been removed.
+        cluster.connect_missing_peers();
+        cluster.drop_peers_outside_membership();
+
+        (cluster, ClusterHandle { command_tx, query_tx, admin_tx, snapshot_rx })
     }
 
     /// Heartbeat interval must sit well below the minimum election timeout -
@@ -253,6 +397,9 @@ impl Cluster {
                     let batch = collect_batch(query, &mut self.query_rx, self.config.limits.max_batch);
                     self.handle_client_queries(batch);
                 }
+                Some(admin) = self.admin_rx.recv() => {
+                    self.handle_client_admin(admin);
+                }
                 _ = heartbeat_ticker.tick(), if self.volatile.role == Role::Leader => {
                     self.check_quorum();
                     if self.volatile.role == Role::Leader {
@@ -266,6 +413,7 @@ impl Cluster {
             }
 
             self.apply_committed_entries();
+            self.drive_admin();
             self.complete_ready_reads();
             self.publish_snapshot();
         }
@@ -307,6 +455,14 @@ impl Cluster {
                 let _ = respond_to.send(ClientCommandResult::LeadershipLost);
             }
         }
+        // A membership change in flight is answered like a write: the entry (if it
+        // was logged) may still be committed by the next leader, so the outcome is
+        // unknown. Learners are this leader's alone; the next leader starts afresh.
+        if let Some(pending) = self.pending_admin.take() {
+            info!("lost leadership - failing the membership change that was in progress");
+            let _ = pending.respond_to.send(AdminResult::LeadershipLost);
+        }
+        self.drop_learners();
         if !self.pending_reads.is_empty() {
             info!(
                 pending = self.pending_reads.len(),
@@ -331,6 +487,31 @@ impl Cluster {
     fn dispatch_rpc(&mut self, from: NodeId, msg: RpcMessage) {
         match msg {
             RpcMessage::Hello(_) => {} // handshake only matters at connect time
+
+            RpcMessage::RequestVote(req) if !self.membership.contains(req.candidate_id) => {
+                // A node that is not a voting member (a removed server that never
+                // heard, or one not yet admitted) has no business starting an
+                // election. Refuse WITHOUT looking at its term, or a stale server
+                // could depose a healthy leader just by timing out (dissertation §4.2.3).
+                self.send_to(
+                    from,
+                    RpcMessage::RequestVoteResponse(RequestVoteResponse {
+                        term: self.persistent.current_term,
+                        vote_granted: false,
+                    }),
+                );
+            }
+
+            RpcMessage::PreVote(req) if !self.membership.contains(req.candidate_id) => {
+                self.send_to(
+                    from,
+                    RpcMessage::PreVoteResponse(PreVoteResponse {
+                        term: self.persistent.current_term,
+                        vote_granted: false,
+                        request_term: req.term,
+                    }),
+                );
+            }
 
             RpcMessage::RequestVote(req) => {
                 let resp =
@@ -422,6 +603,10 @@ impl Cluster {
                 // One fsync for the whole batch, however many entries it carries.
                 persist_must(self.persistence.append_batch(&effect.appended), "log append");
 
+                // A configuration entry is in effect as soon as it is in the log,
+                // and one that was truncated away must stop counting.
+                self.track_config_entries(effect.truncated_from, &effect.appended);
+
                 // Any request from a current-or-newer term comes from the
                 // legitimate leader, even if its log didn't match ours - so
                 // clients hitting this follower get a useful leader_hint.
@@ -478,7 +663,8 @@ impl Cluster {
             &self.leader_state,
             &self.log,
             self.persistent.current_term,
-            self.config.cluster_size(),
+            self.config.id,
+            &self.membership,
             self.log.last_index(),
         ) {
             self.volatile.commit_index = new_commit;
@@ -535,8 +721,17 @@ impl Cluster {
     /// therefore never changes its term (or writes to disk) no matter how long it
     /// stays cut off.
     fn begin_pre_vote(&mut self) {
-        // With no peers there is no one to ask; a one-node cluster just elects itself.
-        if self.config.cluster_size() == 1 {
+        // A node that is not a voting member never campaigns: a node waiting to be
+        // admitted would otherwise elect itself leader of a cluster of one, and a
+        // removed node would keep pestering the cluster it has left. It just keeps
+        // waiting, in case the log later says it is a member after all.
+        if !self.membership.contains(self.config.id) {
+            self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
+            return;
+        }
+
+        // With no one else to ask, a one-member cluster just elects itself.
+        if self.membership.len() == 1 {
             self.begin_election();
             return;
         }
@@ -544,7 +739,7 @@ impl Cluster {
         let proposed_term = self.persistent.current_term + 1;
         self.pre_vote = Some(PreVoteRound {
             term: proposed_term,
-            tally: VoteTally::new(self.config.id, self.config.cluster_size()),
+            tally: VoteTally::new(self.config.id, &self.membership),
         });
         // If this round gets no majority, the timer fires again and we ask again.
         self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
@@ -556,7 +751,8 @@ impl Cluster {
             last_log_index: self.log.last_index(),
             last_log_term: self.log.last_term(),
         };
-        let peer_ids: Vec<NodeId> = self.peer_outboxes.keys().copied().collect();
+        let peer_ids: Vec<NodeId> =
+            self.membership.ids().filter(|&id| id != self.config.id).collect();
         for peer_id in peer_ids {
             self.send_to(peer_id, RpcMessage::PreVote(req.clone()));
         }
@@ -568,11 +764,12 @@ impl Cluster {
     /// MAXIMUM election timeout, so a leader never steps down earlier than the
     /// followers could have given up on it.
     fn check_quorum(&mut self) {
-        if self.config.cluster_size() == 1 {
+        if self.membership.len() == 1 && self.membership.contains(self.config.id) {
             return;
         }
         let has_quorum = self.leader_state.has_recent_quorum(
-            self.config.cluster_size(),
+            self.config.id,
+            &self.membership,
             std::time::Instant::now(),
             self.election_timeout.max,
         );
@@ -604,11 +801,12 @@ impl Cluster {
         // RequestVote leaves this node.
         self.persist_hard_state();
         self.known_leader = None;
-        self.vote_tally = Some(VoteTally::new(self.config.id, self.config.cluster_size()));
+        self.vote_tally = Some(VoteTally::new(self.config.id, &self.membership));
         self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
         info!(term = self.persistent.current_term, "starting election");
 
-        let peer_ids: Vec<NodeId> = self.peer_outboxes.keys().copied().collect();
+        let peer_ids: Vec<NodeId> =
+            self.membership.ids().filter(|&id| id != self.config.id).collect();
         for peer_id in peer_ids {
             self.send_to(peer_id, RpcMessage::RequestVote(req.clone()));
         }
@@ -816,12 +1014,15 @@ impl Cluster {
         if self.pending_reads.is_empty() || self.volatile.role != Role::Leader {
             return;
         }
-        let cluster_size = self.config.cluster_size();
         let last_applied = self.volatile.last_applied;
 
         let mut still_waiting = Vec::new();
         for read in self.pending_reads.drain(..) {
-            let leadership_proven = self.leader_state.has_quorum_acked(read.required_seq, cluster_size);
+            let leadership_proven = self.leader_state.has_quorum_acked(
+                read.required_seq,
+                self.config.id,
+                &self.membership,
+            );
             if leadership_proven && last_applied >= read.read_index {
                 let value = self.kv_store.get(&read.key).cloned();
                 let _ = read.respond_to.send(QueryResult::Value(value));
@@ -832,12 +1033,273 @@ impl Cluster {
         self.pending_reads = still_waiting;
     }
 
+    // ---- membership ---------------------------------------------------------
+
+    /// Why a membership change cannot be started right now, if it cannot.
+    ///
+    /// Two rules make single-server changes safe. Only ONE change may be in flight,
+    /// so any majority of the old configuration overlaps any majority of the new
+    /// one. And a new leader must first commit an entry of its own term (its no-op),
+    /// because until then it cannot know whether the configuration it sees in its log
+    /// has itself been committed.
+    fn admin_rejection(&self, change: &MembershipChange) -> Option<AdminRejection> {
+        let change_in_log_uncommitted = self
+            .history
+            .last_change_index()
+            .map_or(false, |index| index > self.volatile.commit_index);
+        if self.pending_admin.is_some() || change_in_log_uncommitted {
+            return Some(AdminRejection::ChangeInProgress);
+        }
+        if self.volatile.commit_index < self.noop_index {
+            return Some(AdminRejection::NotReady);
+        }
+        match change {
+            MembershipChange::Add { id, addr } => {
+                if addr.trim().is_empty() {
+                    Some(AdminRejection::BadAddress)
+                } else if self.membership.contains(*id) {
+                    Some(AdminRejection::AlreadyMember)
+                } else {
+                    None
+                }
+            }
+            MembershipChange::Remove { id } => {
+                if !self.membership.contains(*id) {
+                    Some(AdminRejection::NotMember)
+                } else if self.membership.len() == 1 {
+                    Some(AdminRejection::LastMember)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn handle_client_admin(&mut self, admin: ClientAdmin) {
+        if self.volatile.role != Role::Leader {
+            let _ = admin.respond_to.send(AdminResult::NotLeader { leader_hint: self.known_leader });
+            return;
+        }
+        if let Some(rejection) = self.admin_rejection(&admin.change) {
+            let _ = admin.respond_to.send(AdminResult::Rejected(rejection));
+            return;
+        }
+
+        match admin.change {
+            MembershipChange::Add { id, addr } => {
+                info!(id, %addr, "adding a member: bringing it up to date as a learner first");
+                // Open the connection and start replicating to it, but do NOT let it
+                // vote or count toward any majority yet.
+                let outbox = (self.connector)(id, &addr);
+                self.peer_outboxes.insert(id, outbox);
+                self.leader_state.next_index.insert(id, self.log.last_index() + 1);
+                self.leader_state.match_index.insert(id, 0);
+                self.leader_state.last_ack.remove(&id);
+                self.leader_state.ack_seq.remove(&id);
+                self.learners.insert(id, addr.clone());
+                self.pending_admin = Some(PendingAdmin {
+                    respond_to: admin.respond_to,
+                    stage: AdminStage::CatchingUp {
+                        id,
+                        addr,
+                        deadline: Instant::now() + self.config.catch_up_timeout,
+                    },
+                });
+                self.broadcast_append_entries();
+            }
+            MembershipChange::Remove { id } => {
+                info!(id, "removing a member");
+                let index = self.append_config_entry(Command::RemoveNode { id });
+                self.pending_admin = Some(PendingAdmin {
+                    respond_to: admin.respond_to,
+                    stage: AdminStage::Committing { index, removes_self: id == self.config.id },
+                });
+                self.broadcast_append_entries();
+                // The new, smaller configuration is already in effect, and it may
+                // be satisfied by what is already replicated.
+                self.advance_leader_commit();
+            }
+        }
+    }
+
+    /// Moves the in-flight membership change along. Run after every event, because
+    /// what it waits for (a learner catching up, an entry committing) is changed by
+    /// ordinary replication traffic.
+    fn drive_admin(&mut self) {
+        let Some(pending) = self.pending_admin.take() else { return };
+        if self.volatile.role != Role::Leader {
+            // Leadership was lost; `abort_pending_requests` answers the caller.
+            self.pending_admin = Some(pending);
+            return;
+        }
+        let PendingAdmin { respond_to, stage } = pending;
+
+        match stage {
+            AdminStage::CatchingUp { id, addr, deadline } => {
+                if respond_to.is_closed() || Instant::now() >= deadline {
+                    // The caller gave up, or the node is not catching up. Nothing was
+                    // logged, so there is nothing to undo but the learner itself.
+                    warn!(id, "new node did not catch up in time - abandoning the add");
+                    self.drop_learner(id);
+                    let _ = respond_to.send(AdminResult::Rejected(AdminRejection::CatchUpFailed));
+                    return;
+                }
+                let matched = self.leader_state.match_index.get(&id).copied().unwrap_or(0);
+                if matched >= self.volatile.commit_index {
+                    info!(id, matched, "learner has caught up - admitting it as a voting member");
+                    let index = self.append_config_entry(Command::AddNode { id, addr });
+                    self.pending_admin = Some(PendingAdmin {
+                        respond_to,
+                        stage: AdminStage::Committing { index, removes_self: false },
+                    });
+                    self.broadcast_append_entries();
+                    self.advance_leader_commit();
+                } else {
+                    self.pending_admin = Some(PendingAdmin {
+                        respond_to,
+                        stage: AdminStage::CatchingUp { id, addr, deadline },
+                    });
+                }
+            }
+            AdminStage::Committing { index, removes_self } => {
+                if self.volatile.last_applied >= index {
+                    let members = self.membership.ids().collect();
+                    let _ = respond_to.send(AdminResult::Applied { members });
+                    if removes_self {
+                        // The change that took this node out of the cluster is now
+                        // committed. It led the cluster through its own removal; now it
+                        // hands over. It is not a member, so it will not campaign again.
+                        info!("this node's removal is committed - stepping down");
+                        self.lose_leadership();
+                    }
+                } else {
+                    self.pending_admin = Some(PendingAdmin {
+                        respond_to,
+                        stage: AdminStage::Committing { index, removes_self },
+                    });
+                }
+            }
+        }
+    }
+
+    /// Appends a configuration entry to this leader's log, makes it durable, and
+    /// puts it into effect. Returns its index.
+    fn append_config_entry(&mut self, command: Command) -> u64 {
+        let change = command.config_change().expect("only membership commands come through here");
+        let encoded = command.encode().expect("membership commands always encode");
+        let index = self.log.append(self.persistent.current_term, encoded);
+        self.append_to_wal(index);
+        self.history.record(index, change);
+        self.refresh_membership();
+        index
+    }
+
+    /// Keeps the configuration in step with what just happened to the log: entries
+    /// that were truncated away stop counting, entries that were appended start.
+    fn track_config_entries(&mut self, truncated_from: Option<u64>, appended: &[LogEntry]) {
+        let mut changed = false;
+        if let Some(from_index) = truncated_from {
+            let before = self.history.len();
+            self.history.truncate_from(from_index);
+            changed |= self.history.len() != before;
+        }
+        for entry in appended {
+            if let Some(change) = config_change_of(&entry.command) {
+                self.history.record(entry.index, change);
+                changed = true;
+            }
+        }
+        if changed {
+            self.refresh_membership();
+        }
+    }
+
+    /// Recomputes who votes, and makes sure there is a connection to every member.
+    fn refresh_membership(&mut self) {
+        self.membership = self.history.current();
+        let membership = &self.membership;
+        // A learner that has just become a member is a learner no more.
+        self.learners.retain(|id, _| !membership.contains(*id));
+        self.connect_missing_peers();
+    }
+
+    /// Opens a connection to every member this node is not yet connected to. The
+    /// address comes from the configuration entry that added the member.
+    fn connect_missing_peers(&mut self) {
+        let missing: Vec<(NodeId, String)> = self
+            .membership
+            .iter()
+            .filter(|(id, _)| *id != self.config.id && !self.peer_outboxes.contains_key(id))
+            .map(|(id, addr)| (id, addr.to_string()))
+            .collect();
+        for (id, addr) in missing {
+            if addr.trim().is_empty() {
+                warn!(id, "member has no known address - cannot connect to it");
+                continue;
+            }
+            info!(id, %addr, "connecting to a new member");
+            let outbox = (self.connector)(id, &addr);
+            self.peer_outboxes.insert(id, outbox);
+            // Only meaningful on a leader, harmless elsewhere (reset on election).
+            self.leader_state.next_index.entry(id).or_insert(self.log.last_index() + 1);
+            self.leader_state.match_index.entry(id).or_insert(0);
+        }
+    }
+
+    /// At startup: stop talking to peers the log says are no longer in the cluster.
+    fn drop_peers_outside_membership(&mut self) {
+        let membership = &self.membership;
+        let learners = &self.learners;
+        self.peer_outboxes.retain(|id, _| membership.contains(*id) || learners.contains_key(id));
+    }
+
+    /// A removal has committed. Stop sending to the node (it is not a member, and
+    /// the leader must not keep its bookkeeping for it forever), unless it has been
+    /// added back since.
+    fn forget_removed_peer(&mut self, id: NodeId) {
+        if self.membership.contains(id) || self.learners.contains_key(&id) {
+            return;
+        }
+        self.peer_outboxes.remove(&id);
+        self.leader_state.next_index.remove(&id);
+        self.leader_state.match_index.remove(&id);
+        self.leader_state.last_ack.remove(&id);
+        self.leader_state.ack_seq.remove(&id);
+    }
+
+    fn drop_learner(&mut self, id: NodeId) {
+        if self.learners.remove(&id).is_some() && !self.membership.contains(id) {
+            self.peer_outboxes.remove(&id);
+            self.leader_state.next_index.remove(&id);
+            self.leader_state.match_index.remove(&id);
+            self.leader_state.last_ack.remove(&id);
+            self.leader_state.ack_seq.remove(&id);
+        }
+    }
+
+    fn drop_learners(&mut self) {
+        let ids: Vec<NodeId> = self.learners.keys().copied().collect();
+        for id in ids {
+            self.drop_learner(id);
+        }
+    }
+
     fn apply_committed_entries(&mut self) {
         while self.volatile.last_applied < self.volatile.commit_index {
             let next_index = self.volatile.last_applied + 1;
             let Some(entry) = self.log.get(next_index) else { break };
             let result = match Command::decode(&entry.command) {
-                Ok(command) => self.kv_store.apply(&command),
+                Ok(command) => {
+                    let removed = match command.config_change() {
+                        Some(ConfigChange::Remove { id }) => Some(id),
+                        _ => None,
+                    };
+                    let result = self.kv_store.apply(&command);
+                    if let Some(id) = removed {
+                        self.forget_removed_peer(id);
+                    }
+                    result
+                }
                 Err(e) => {
                     warn!(error = %e, "failed to decode committed command");
                     None
@@ -887,6 +1349,8 @@ impl Cluster {
             leader_hint: self.known_leader,
             wal_syncs: self.persistence.wal_sync_count(),
             dropped_messages: self.dropped_messages,
+            members: self.membership.ids().collect(),
+            learners: self.learners.keys().copied().collect(),
         });
     }
 }
@@ -962,6 +1426,18 @@ mod tests {
         read_mode: ReadMode,
         limits: Limits,
     ) -> (Cluster, Outputs) {
+        let (cluster, outputs) =
+            make_cluster_core(dir, peer_ids, read_mode, limits, discarding_connector());
+        (cluster, outputs)
+    }
+
+    fn make_cluster_core(
+        dir: &Path,
+        peer_ids: &[NodeId],
+        read_mode: ReadMode,
+        limits: Limits,
+        connector: PeerConnector,
+    ) -> (Cluster, Outputs) {
         let peers = peer_ids.iter().map(|&id| (id, String::new())).collect();
         let config = NodeConfig {
             id: 1,
@@ -971,6 +1447,8 @@ mod tests {
             storage_dir: dir.to_path_buf(),
             read_mode,
             limits,
+            join: false,
+            catch_up_timeout: crate::config::DEFAULT_CATCH_UP_TIMEOUT,
         };
         let mut outboxes = HashMap::new();
         let mut outputs = HashMap::new();
@@ -981,8 +1459,14 @@ mod tests {
         }
         let (_inbox_tx, inbox_rx) = mpsc::channel(limits.channel_capacity);
         let recovered = Persistence::open(dir).expect("storage should open");
-        let (cluster, _handle) = Cluster::new(config, recovered, outboxes, inbox_rx);
+        let (cluster, _handle) = Cluster::new(config, recovered, outboxes, inbox_rx, connector);
         (cluster, outputs)
+    }
+
+    /// A connector whose connections lead nowhere: whatever the node sends through
+    /// them is dropped. For tests that never look at traffic to a new member.
+    fn discarding_connector() -> PeerConnector {
+        Box::new(|_, _| mpsc::channel(1024).0)
     }
 
     /// For tests that never look at what the node sends: the peers' receivers
@@ -2244,5 +2728,614 @@ mod tests {
         let snapshot = snapshot_rx.borrow_and_update().clone();
         assert!(snapshot.dropped_messages > 0);
         assert!(snapshot.wal_syncs >= 1, "the leader's no-op was synced");
+    }
+
+    // ---- membership changes ---------------------------------------------------
+
+    use std::sync::{Arc, Mutex};
+
+    /// The connections a node opened through its `PeerConnector`, keyed by peer.
+    type Connections = Arc<Mutex<HashMap<NodeId, mpsc::Receiver<RpcMessage>>>>;
+
+    fn recording_connector(connections: &Connections) -> PeerConnector {
+        let connections = connections.clone();
+        Box::new(move |id, _addr| {
+            let (tx, rx) = mpsc::channel(1024);
+            connections.lock().unwrap().insert(id, rx);
+            tx
+        })
+    }
+
+    fn make_cluster_recording(dir: &Path, peer_ids: &[NodeId]) -> (Cluster, Outputs, Connections) {
+        let connections = Connections::default();
+        let (cluster, outputs) = make_cluster_core(
+            dir,
+            peer_ids,
+            ReadMode::Linearizable,
+            Limits::default(),
+            recording_connector(&connections),
+        );
+        (cluster, outputs, connections)
+    }
+
+    /// What this node has sent to `peer` over a connection it opened itself.
+    fn drain_connection(connections: &Connections, peer: NodeId) -> Vec<RpcMessage> {
+        let mut guard = connections.lock().unwrap();
+        let rx = guard.get_mut(&peer).unwrap_or_else(|| panic!("no connection to node {peer}"));
+        let mut messages = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        messages
+    }
+
+    fn admin(change: MembershipChange) -> (ClientAdmin, oneshot::Receiver<AdminResult>) {
+        let (respond_to, receiver) = oneshot::channel();
+        (ClientAdmin { change, respond_to }, receiver)
+    }
+
+    fn add(id: NodeId) -> MembershipChange {
+        MembershipChange::Add { id, addr: format!("node{id}:7000") }
+    }
+
+    fn remove(id: NodeId) -> MembershipChange {
+        MembershipChange::Remove { id }
+    }
+
+    /// What the event loop does after every event.
+    fn settle(cluster: &mut Cluster) {
+        cluster.apply_committed_entries();
+        cluster.drive_admin();
+    }
+
+    fn members(cluster: &Cluster) -> Vec<NodeId> {
+        cluster.membership.ids().collect()
+    }
+
+    fn ack(cluster: &mut Cluster, from: NodeId, match_index: u64) {
+        let term = cluster.persistent.current_term;
+        cluster.handle_rpc(from, append_ack(term, cluster.heartbeat_seq, true, match_index));
+        settle(cluster);
+    }
+
+    fn request_change(
+        cluster: &mut Cluster,
+        change: MembershipChange,
+    ) -> oneshot::Receiver<AdminResult> {
+        let (request, receiver) = admin(change);
+        cluster.handle_client_admin(request);
+        settle(cluster);
+        receiver
+    }
+
+    fn rejected(mut receiver: oneshot::Receiver<AdminResult>) -> AdminRejection {
+        match receiver.try_recv() {
+            Ok(AdminResult::Rejected(reason)) => reason,
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    fn config_entry_commands(cluster: &Cluster) -> Vec<Command> {
+        (1..=cluster.log.last_index())
+            .filter_map(|i| Command::decode(&cluster.log.get(i).unwrap().command).ok())
+            .filter(|c| c.config_change().is_some())
+            .collect()
+    }
+
+    #[test]
+    fn a_follower_refuses_a_membership_change_and_names_the_leader() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.known_leader = Some(2);
+        let mut receiver = request_change(&mut cluster, add(4));
+        match receiver.try_recv() {
+            Ok(AdminResult::NotLeader { leader_hint }) => assert_eq!(leader_hint, Some(2)),
+            other => panic!("expected NotLeader, got {other:?}"),
+        }
+        assert!(cluster.learners.is_empty());
+    }
+
+    #[test]
+    fn a_new_leader_refuses_changes_until_its_own_noop_has_committed() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader(); // no-op at index 1, not yet committed
+        assert_eq!(rejected(request_change(&mut cluster, add(4))), AdminRejection::NotReady);
+        assert_eq!(rejected(request_change(&mut cluster, remove(3))), AdminRejection::NotReady);
+        assert_eq!(cluster.log.last_index(), 1, "a refused change must log nothing");
+
+        ack(&mut cluster, 2, 1); // the no-op commits
+        let receiver = request_change(&mut cluster, add(4));
+        drop(receiver);
+        assert!(cluster.learners.contains_key(&4), "now it is accepted");
+    }
+
+    #[test]
+    fn a_new_member_starts_as_a_learner_that_is_sent_the_log_but_not_logged() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+
+        let mut receiver = request_change(&mut cluster, add(4));
+
+        assert!(cluster.learners.contains_key(&4));
+        assert_eq!(members(&cluster), vec![1, 2, 3], "not a voter yet");
+        assert_eq!(config_entry_commands(&cluster).len(), 0, "nothing logged yet");
+        assert!(receiver.try_recv().is_err(), "the caller is still waiting");
+        let sent = drain_connection(&connections, 4);
+        assert!(
+            sent.iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))),
+            "the learner is sent the log: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_learner_that_has_not_caught_up_is_not_admitted() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let _receiver = request_change(&mut cluster, add(4));
+
+        // It answers, but only to say it has nothing yet (match 0 < commit 1).
+        let term = cluster.persistent.current_term;
+        cluster.handle_rpc(4, append_ack(term, cluster.heartbeat_seq, false, 0));
+        settle(&mut cluster);
+
+        assert_eq!(config_entry_commands(&cluster).len(), 0);
+        assert_eq!(members(&cluster), vec![1, 2, 3]);
+        assert!(cluster.learners.contains_key(&4));
+    }
+
+    #[test]
+    fn a_caught_up_learner_is_admitted_and_the_new_configuration_applies_at_once() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let mut receiver = request_change(&mut cluster, add(4));
+
+        ack(&mut cluster, 4, 1); // caught up to the commit index
+
+        assert_eq!(
+            config_entry_commands(&cluster),
+            vec![Command::AddNode { id: 4, addr: "node4:7000".into() }]
+        );
+        assert_eq!(members(&cluster), vec![1, 2, 3, 4], "in effect on append, before commit");
+        assert!(cluster.learners.is_empty(), "no longer a learner");
+        assert_eq!(cluster.volatile.commit_index, 1, "the entry itself is not committed yet");
+        assert!(receiver.try_recv().is_err(), "still waiting for the commit");
+    }
+
+    #[test]
+    fn once_a_member_is_added_a_majority_of_the_larger_cluster_is_needed() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let mut receiver = request_change(&mut cluster, add(4));
+        ack(&mut cluster, 4, 1); // AddNode appended at index 2, members {1,2,3,4}, quorum 3
+
+        ack(&mut cluster, 2, 2); // leader + node 2 = 2 of 4: NOT a majority any more
+        assert_eq!(cluster.volatile.commit_index, 1);
+        assert!(receiver.try_recv().is_err());
+
+        ack(&mut cluster, 3, 2); // leader + 2 + 3 = 3 of 4
+        assert_eq!(cluster.volatile.commit_index, 2);
+        match receiver.try_recv() {
+            Ok(AdminResult::Applied { members }) => assert_eq!(members, vec![1, 2, 3, 4]),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_learner_acknowledging_a_write_does_not_commit_it() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let _add = request_change(&mut cluster, add(4));
+
+        let (put, _put_rx) = put_command_with_receiver("k", "v"); // index 2
+        cluster.handle_client_command(put);
+        ack(&mut cluster, 4, 2); // the learner has it; no voting member besides the leader does
+
+        assert_eq!(cluster.volatile.commit_index, 1, "a learner's copy is not a vote");
+    }
+
+    #[test]
+    fn a_learner_whose_acknowledgements_arrive_does_not_keep_a_dead_cluster_alive() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let _add = request_change(&mut cluster, add(4));
+        cluster.handle_rpc(4, append_ack(1, cluster.heartbeat_seq, true, 1));
+
+        age_all_acks(&mut cluster);
+        // Only the learner (not a member) answers now; members 2 and 3 are silent.
+        cluster.leader_state.record_ack(4, std::time::Instant::now());
+        cluster.check_quorum();
+
+        assert_eq!(cluster.volatile.role, Role::Follower, "check-quorum ignores learners");
+    }
+
+    #[test]
+    fn only_one_membership_change_may_be_in_flight() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+
+        let _first = request_change(&mut cluster, add(4));
+        // While the new node is catching up...
+        assert_eq!(rejected(request_change(&mut cluster, add(5))), AdminRejection::ChangeInProgress);
+        assert_eq!(rejected(request_change(&mut cluster, remove(3))), AdminRejection::ChangeInProgress);
+
+        // ...and while its entry is committing.
+        ack(&mut cluster, 4, 1);
+        assert_eq!(rejected(request_change(&mut cluster, add(5))), AdminRejection::ChangeInProgress);
+
+        // Once it has committed, the next change is allowed.
+        ack(&mut cluster, 2, 2);
+        ack(&mut cluster, 3, 2);
+        let receiver = request_change(&mut cluster, remove(3));
+        drop(receiver);
+        assert_eq!(config_entry_commands(&cluster).len(), 2);
+    }
+
+    #[test]
+    fn adding_a_member_or_removing_a_stranger_is_refused_and_logs_nothing() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let before = cluster.log.last_index();
+        assert_eq!(rejected(request_change(&mut cluster, add(2))), AdminRejection::AlreadyMember);
+        assert_eq!(rejected(request_change(&mut cluster, remove(9))), AdminRejection::NotMember);
+        assert_eq!(
+            rejected(request_change(
+                &mut cluster,
+                MembershipChange::Add { id: 4, addr: "  ".into() }
+            )),
+            AdminRejection::BadAddress
+        );
+        assert_eq!(cluster.log.last_index(), before);
+        assert!(cluster.learners.is_empty());
+    }
+
+    #[test]
+    fn the_last_member_cannot_be_removed() {
+        let dir = TestDir::new();
+        let mut cluster = build_cluster(&dir, &[]);
+        cluster.begin_election(); // a one-node cluster elects itself
+        settle(&mut cluster);
+        assert_eq!(cluster.volatile.role, Role::Leader);
+        assert_eq!(rejected(request_change(&mut cluster, remove(1))), AdminRejection::LastMember);
+    }
+
+    #[test]
+    fn a_removal_takes_effect_on_append_and_lowers_the_bar_for_commit() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let mut receiver = request_change(&mut cluster, remove(3));
+
+        assert_eq!(members(&cluster), vec![1, 2], "in effect before it commits");
+        assert_eq!(cluster.volatile.commit_index, 1);
+        assert!(receiver.try_recv().is_err());
+
+        // Node 3 never answers. Leader + node 2 is all of the new two-node cluster.
+        ack(&mut cluster, 2, 2);
+        assert_eq!(cluster.volatile.commit_index, 2);
+        match receiver.try_recv() {
+            Ok(AdminResult::Applied { members }) => assert_eq!(members, vec![1, 2]),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_removed_peer_is_still_sent_the_entry_until_it_commits_and_then_forgotten() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        drain(&mut outputs, 3);
+
+        let _receiver = request_change(&mut cluster, remove(3));
+        let sent = drain(&mut outputs, 3);
+        assert!(
+            sent.iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))),
+            "so the removed node can learn it was removed"
+        );
+        assert!(cluster.peer_outboxes.contains_key(&3));
+
+        ack(&mut cluster, 2, 2); // commits and applies the removal
+        assert!(!cluster.peer_outboxes.contains_key(&3), "forgotten once the removal committed");
+        assert!(!cluster.leader_state.match_index.contains_key(&3));
+    }
+
+    #[test]
+    fn a_leader_that_removes_itself_steps_down_only_after_the_removal_commits() {
+        let dir = TestDir::new();
+        let mut cluster = settled_leader(&dir);
+        let mut receiver = request_change(&mut cluster, remove(1));
+
+        assert_eq!(members(&cluster), vec![2, 3]);
+        assert_eq!(cluster.volatile.role, Role::Leader, "it keeps leading until the change commits");
+
+        // The leader's own copy does not count: it is no longer a voter. One of two
+        // remaining members is not a majority of them.
+        ack(&mut cluster, 2, 2);
+        assert_eq!(cluster.volatile.commit_index, 1);
+        assert_eq!(cluster.volatile.role, Role::Leader);
+
+        ack(&mut cluster, 3, 2);
+        assert_eq!(cluster.volatile.commit_index, 2);
+        match receiver.try_recv() {
+            Ok(AdminResult::Applied { members }) => assert_eq!(members, vec![2, 3]),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert_eq!(cluster.volatile.role, Role::Follower, "handed over once committed");
+    }
+
+    #[test]
+    fn a_node_that_is_not_a_member_never_campaigns() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        // The leader tells this node that it has been removed.
+        cluster.handle_rpc(
+            2,
+            append_request(
+                1,
+                2,
+                0,
+                0,
+                vec![
+                    LogEntry {
+                        term: 1,
+                        index: 1,
+                        command: Command::RemoveNode { id: 1 }.encode().unwrap(),
+                    },
+                ],
+            ),
+        );
+        assert_eq!(members(&cluster), vec![2, 3]);
+        drain(&mut outputs, 2);
+        drain(&mut outputs, 3);
+        let term = cluster.persistent.current_term;
+
+        forget_leader_contact(&mut cluster);
+        cluster.begin_pre_vote();
+
+        assert!(drain(&mut outputs, 2).is_empty(), "no pre-vote sent");
+        assert!(drain(&mut outputs, 3).is_empty(), "no pre-vote sent");
+        assert!(cluster.pre_vote.is_none());
+        assert_eq!(cluster.persistent.current_term, term, "and no term change");
+    }
+
+    #[test]
+    fn a_follower_puts_a_configuration_entry_into_effect_on_append_and_undoes_it_on_truncation() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        let add4 = LogEntry {
+            term: 1,
+            index: 2,
+            command: Command::AddNode { id: 4, addr: "node4:7000".into() }.encode().unwrap(),
+        };
+        let noop = LogEntry { term: 1, index: 1, command: Command::NoOp.encode().unwrap() };
+        cluster.handle_rpc(2, append_request(1, 2, 0, 0, vec![noop, add4]));
+
+        assert_eq!(members(&cluster), vec![1, 2, 3, 4], "in effect though not committed");
+        assert!(cluster.peer_outboxes.contains_key(&4), "and the new member is dialled");
+        assert!(connections.lock().unwrap().contains_key(&4));
+
+        // A new leader's log disagrees from index 2 on: the change never happened.
+        let replacement = LogEntry { term: 2, index: 2, command: Command::NoOp.encode().unwrap() };
+        cluster.handle_rpc(3, append_request(2, 3, 1, 1, vec![replacement]));
+        assert_eq!(members(&cluster), vec![1, 2, 3], "a truncated change stops counting");
+    }
+
+    #[test]
+    fn the_membership_is_rebuilt_from_the_log_after_a_restart() {
+        let dir = TestDir::new();
+        {
+            let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+            let entries = vec![
+                LogEntry { term: 1, index: 1, command: Command::NoOp.encode().unwrap() },
+                LogEntry {
+                    term: 1,
+                    index: 2,
+                    command: Command::AddNode { id: 4, addr: "node4:7000".into() }
+                        .encode()
+                        .unwrap(),
+                },
+                LogEntry {
+                    term: 1,
+                    index: 3,
+                    command: Command::RemoveNode { id: 3 }.encode().unwrap(),
+                },
+            ];
+            cluster.handle_rpc(2, append_request(1, 2, 0, 0, entries));
+            assert_eq!(members(&cluster), vec![1, 2, 4]);
+        }
+
+        // Restarted with the ORIGINAL peer list: the log, not the environment, wins.
+        let (restarted, _outputs, connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        assert_eq!(members(&restarted), vec![1, 2, 4]);
+        assert!(connections.lock().unwrap().contains_key(&4), "dials the member it learned of");
+        assert!(!restarted.peer_outboxes.contains_key(&3), "and drops the one removed");
+    }
+
+    #[test]
+    fn votes_and_pre_votes_from_a_non_member_are_refused_without_side_effects() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        forget_leader_contact(&mut cluster);
+        cluster.persistent.current_term = 3;
+
+        // Node 9 is not in the cluster.
+        cluster.handle_rpc(9, vote_request(7, 9));
+        cluster.handle_rpc(9, pre_vote_request(8, 9));
+
+        assert_eq!(cluster.persistent.current_term, 3, "a stranger cannot bump our term");
+        assert_eq!(cluster.persistent.voted_for, None, "nor spend our vote");
+        let _ = &mut outputs; // replies to node 9 go nowhere: it has no connection
+    }
+
+    #[test]
+    fn a_removed_node_is_denied_a_pre_vote_it_could_otherwise_win() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        // Node 3 is removed; the entry is only appended, so we still have a
+        // connection to it and can see exactly how we answer it.
+        let removal = LogEntry {
+            term: 1,
+            index: 1,
+            command: Command::RemoveNode { id: 3 }.encode().unwrap(),
+        };
+        cluster.handle_rpc(2, append_request(1, 2, 0, 0, vec![removal]));
+        assert_eq!(members(&cluster), vec![1, 2]);
+        drain(&mut outputs, 2);
+        drain(&mut outputs, 3);
+        forget_leader_contact(&mut cluster); // no active leader: a member would win this
+
+        // Its log is as up to date as ours, so only its membership can deny it.
+        cluster.handle_rpc(
+            3,
+            RpcMessage::PreVote(PreVoteRequest {
+                term: 2,
+                candidate_id: 3,
+                last_log_index: 1,
+                last_log_term: 1,
+            }),
+        );
+        match drain(&mut outputs, 3).pop() {
+            Some(RpcMessage::PreVoteResponse(resp)) => {
+                assert!(!resp.vote_granted, "a removed node must not be granted a pre-vote")
+            }
+            other => panic!("expected a pre-vote answer, got {other:?}"),
+        }
+
+        cluster.handle_rpc(
+            3,
+            RpcMessage::RequestVote(RequestVoteRequest {
+                term: 2,
+                candidate_id: 3,
+                last_log_index: 1,
+                last_log_term: 1,
+            }),
+        );
+        assert!(!vote_reply(&mut outputs, 3).vote_granted);
+        assert_eq!(cluster.persistent.voted_for, None);
+    }
+
+    #[test]
+    fn a_vote_request_from_a_member_is_still_honoured() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.handle_rpc(2, vote_request(1, 2));
+        assert!(vote_reply(&mut outputs, 2).vote_granted);
+    }
+
+    #[test]
+    fn a_learner_that_never_catches_up_is_abandoned_and_forgotten() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.config.catch_up_timeout = Duration::ZERO;
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let before = cluster.log.last_index();
+
+        let receiver = request_change(&mut cluster, add(4));
+
+        assert_eq!(rejected(receiver), AdminRejection::CatchUpFailed);
+        assert!(cluster.learners.is_empty());
+        assert!(!cluster.peer_outboxes.contains_key(&4), "its connection is dropped");
+        assert_eq!(cluster.log.last_index(), before, "nothing was logged");
+
+        // The slot is free again.
+        cluster.config.catch_up_timeout = Duration::from_secs(60);
+        let receiver = request_change(&mut cluster, add(4));
+        drop(receiver);
+        assert!(cluster.learners.contains_key(&4));
+    }
+
+    #[test]
+    fn a_caller_that_gives_up_cancels_an_add_that_is_still_catching_up() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let receiver = request_change(&mut cluster, add(4));
+        assert!(cluster.learners.contains_key(&4));
+
+        drop(receiver); // the HTTP request timed out
+        settle(&mut cluster);
+
+        assert!(cluster.learners.is_empty());
+        assert!(cluster.pending_admin.is_none(), "the slot is free");
+    }
+
+    #[test]
+    fn losing_leadership_fails_a_change_in_progress_and_drops_its_learner() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let mut receiver = request_change(&mut cluster, add(4));
+
+        cluster.handle_rpc(2, higher_term_response(5));
+
+        assert!(matches!(receiver.try_recv(), Ok(AdminResult::LeadershipLost)));
+        assert!(cluster.learners.is_empty());
+        assert!(!cluster.peer_outboxes.contains_key(&4));
+        assert!(cluster.pending_admin.is_none());
+    }
+
+    #[test]
+    fn growing_a_single_node_cluster_needs_the_new_node_to_commit_anything() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[]);
+        cluster.begin_election();
+        settle(&mut cluster);
+        assert_eq!(cluster.volatile.role, Role::Leader);
+        assert_eq!(cluster.volatile.commit_index, 1, "a lone node commits its own no-op");
+
+        let mut receiver = request_change(&mut cluster, add(2));
+        ack(&mut cluster, 2, 1); // caught up: AddNode appended, members {1,2}, quorum 2
+        assert_eq!(members(&cluster), vec![1, 2]);
+        assert_eq!(cluster.volatile.commit_index, 1, "needs node 2's copy now");
+        assert!(receiver.try_recv().is_err());
+
+        ack(&mut cluster, 2, 2);
+        assert_eq!(cluster.volatile.commit_index, 2);
+        assert!(matches!(receiver.try_recv(), Ok(AdminResult::Applied { .. })));
+    }
+
+    #[test]
+    fn members_and_learners_are_published_in_the_snapshot() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        let snapshots = cluster.snapshot_tx.subscribe();
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        let _receiver = request_change(&mut cluster, add(4));
+        cluster.publish_snapshot();
+
+        let snapshot = snapshots.borrow().clone();
+        assert_eq!(snapshot.members, vec![1, 2, 3]);
+        assert_eq!(snapshot.learners, vec![4]);
     }
 }

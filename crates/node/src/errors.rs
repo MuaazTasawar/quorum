@@ -1,3 +1,4 @@
+use crate::cluster::AdminRejection;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -31,6 +32,10 @@ pub enum AppError {
     LeadershipLost,
     #[error("{}", timeout_message(*.may_have_applied))]
     Timeout { may_have_applied: bool },
+    /// A membership change was refused and nothing was logged, so it is safe to
+    /// retry once the reason has gone.
+    #[error("{0}")]
+    MembershipRejected(AdminRejection),
 }
 
 fn timeout_message(may_have_applied: bool) -> &'static str {
@@ -57,6 +62,16 @@ impl AppError {
             AppError::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             AppError::LeadershipLost => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            AppError::MembershipRejected(reason) => match reason {
+                // Not a conflict, just early: the new leader is still settling in.
+                AdminRejection::NotReady => StatusCode::SERVICE_UNAVAILABLE,
+                AdminRejection::BadAddress => StatusCode::BAD_REQUEST,
+                AdminRejection::ChangeInProgress
+                | AdminRejection::AlreadyMember
+                | AdminRejection::NotMember
+                | AdminRejection::LastMember
+                | AdminRejection::CatchUpFailed => StatusCode::CONFLICT,
+            },
         }
     }
 
@@ -64,7 +79,10 @@ impl AppError {
         match self {
             AppError::LeadershipLost => true,
             AppError::Timeout { may_have_applied } => *may_have_applied,
-            AppError::ChannelClosed | AppError::InvalidKey(_) | AppError::Overloaded => false,
+            AppError::ChannelClosed
+            | AppError::InvalidKey(_)
+            | AppError::Overloaded
+            | AppError::MembershipRejected(_) => false,
         }
     }
 }
@@ -72,7 +90,10 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let retry_after = matches!(self, AppError::Overloaded);
+        let retry_after = matches!(
+            self,
+            AppError::Overloaded | AppError::MembershipRejected(AdminRejection::NotReady)
+        );
         let body = ErrorBody { error: self.to_string(), outcome_unknown: self.outcome_unknown() };
         if retry_after {
             // Tells well-behaved clients to back off instead of hammering a node
@@ -144,5 +165,33 @@ mod tests {
         for error in [AppError::LeadershipLost, AppError::ChannelClosed] {
             assert!(error.into_response().headers().get(header::RETRY_AFTER).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn a_refused_membership_change_is_409_and_is_safe_to_retry() {
+        for reason in [
+            AdminRejection::ChangeInProgress,
+            AdminRejection::AlreadyMember,
+            AdminRejection::NotMember,
+            AdminRejection::LastMember,
+            AdminRejection::CatchUpFailed,
+        ] {
+            let (status, body) = render(AppError::MembershipRejected(reason)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{reason:?}");
+            assert!(body.contains("\"outcome_unknown\":false"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_leader_that_is_not_ready_yet_is_503_with_retry_after() {
+        let response = AppError::MembershipRejected(AdminRejection::NotReady).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn a_bad_address_is_400() {
+        let (status, _) = render(AppError::MembershipRejected(AdminRejection::BadAddress)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

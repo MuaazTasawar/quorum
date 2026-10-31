@@ -1,5 +1,6 @@
 pub mod election;
 pub mod log;
+pub mod membership;
 pub mod messages;
 pub mod replication;
 pub mod state;
@@ -8,6 +9,7 @@ pub use election::{
     handle_pre_vote, handle_request_vote, start_election, ElectionTimeoutConfig, VoteTally,
 };
 pub use log::{Log, LogEntry};
+pub use membership::{ConfigChange, ConfigHistory, Membership};
 pub use messages::{
     AppendEntriesRequest, AppendEntriesResponse, PreVoteRequest, PreVoteResponse,
     RequestVoteRequest, RequestVoteResponse, RpcMessage,

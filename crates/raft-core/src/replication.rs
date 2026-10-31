@@ -1,4 +1,5 @@
 use crate::log::{Log, LogEntry};
+use crate::membership::Membership;
 use crate::messages::{AppendEntriesRequest, AppendEntriesResponse};
 use crate::state::{LeaderState, NodeId, PersistentState, Role, Term, VolatileState};
 
@@ -225,19 +226,29 @@ pub fn advance_commit_index(
     leader_state: &LeaderState,
     log: &Log,
     current_term: Term,
-    cluster_size: usize,
+    self_id: NodeId,
+    membership: &Membership,
     self_match_index: u64,
 ) -> Option<u64> {
-    let majority = cluster_size / 2 + 1;
+    // Only voting members' progress counts: a learner that is still catching up
+    // (or a node that has just been removed) must not help commit anything. The
+    // leader counts its own log only if it is a member; a leader that is removing
+    // itself replicates entries but does not vote on them.
+    let mut progress: Vec<u64> = membership
+        .ids()
+        .map(|id| {
+            if id == self_id {
+                self_match_index
+            } else {
+                leader_state.match_index.get(&id).copied().unwrap_or(0)
+            }
+        })
+        .collect();
+    progress.sort_unstable_by(|a, b| b.cmp(a));
+    let majority = membership.quorum();
 
-    // Candidate commit indices: every index any node (including self) has
-    // reached, checked from highest to lowest so we find the largest N that
-    // qualifies.
-    let mut candidates: Vec<u64> = leader_state.match_index.values().copied().collect();
-    candidates.push(self_match_index);
-    candidates.sort_unstable_by(|a, b| b.cmp(a));
-
-    for &candidate in &candidates {
+    // Candidates, from highest to lowest, so we find the largest N that qualifies.
+    for &candidate in &progress {
         if candidate == 0 {
             continue;
         }
@@ -245,7 +256,7 @@ pub fn advance_commit_index(
         if log.term_at(candidate) != Some(current_term) {
             continue;
         }
-        let count = candidates.iter().filter(|&&m| m >= candidate).count();
+        let count = progress.iter().filter(|&&m| m >= candidate).count();
         if count >= majority {
             return Some(candidate);
         }
@@ -566,13 +577,13 @@ mod tests {
 
         // Even though index 1 is replicated on all 3 nodes (majority), it's from
         // term 1, not the leader's current term 2 - must NOT commit directly.
-        let result = advance_commit_index(&leader_state, &log, 2, 3, 1);
+        let result = advance_commit_index(&leader_state, &log, 2, 1, &Membership::of_ids(1..=3), 1);
         assert_eq!(result, None);
 
         // Now followers catch up to index 2 (current term) - should commit.
         leader_state.match_index.insert(2, 2);
         leader_state.match_index.insert(3, 2);
-        let result = advance_commit_index(&leader_state, &log, 2, 3, 2);
+        let result = advance_commit_index(&leader_state, &log, 2, 1, &Membership::of_ids(1..=3), 2);
         assert_eq!(result, Some(2));
     }
 
@@ -631,5 +642,79 @@ mod tests {
         let req = build_append_entries(&persistent, &log, 1, 1, 0, 123);
         assert_eq!(req.seq, 123);
         assert_eq!(req.term, 2);
+    }
+
+    // ---- membership-aware commit rule ---------------------------------------
+
+    /// A log of `n` entries, all from term 1.
+    fn log_of(n: u64) -> Log {
+        let mut log = Log::new();
+        for _ in 0..n {
+            log.append(1, b"x".to_vec());
+        }
+        log
+    }
+
+    fn progress(pairs: &[(NodeId, u64)]) -> LeaderState {
+        let mut state = LeaderState::default();
+        for &(id, matched) in pairs {
+            state.match_index.insert(id, matched);
+        }
+        state
+    }
+
+    #[test]
+    fn a_learner_that_is_caught_up_does_not_help_commit() {
+        // Members {1,2,3}; learner 9 holds the entry but followers 2 and 3 do not.
+        let log = log_of(5);
+        let state = progress(&[(2, 0), (3, 0), (9, 5)]);
+        let members = Membership::of_ids([1, 2, 3]);
+        assert_eq!(advance_commit_index(&state, &log, 1, 1, &members, 5), None);
+    }
+
+    #[test]
+    fn growing_the_cluster_raises_the_bar_the_moment_the_entry_is_appended() {
+        let log = log_of(5);
+        // Entry 5 is on the leader and node 2 only.
+        let state = progress(&[(2, 5), (3, 0), (4, 0)]);
+        assert_eq!(
+            advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 2, 3]), 5),
+            Some(5),
+            "2 of 3 is a majority"
+        );
+        assert_eq!(
+            advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 2, 3, 4]), 5),
+            None,
+            "2 of 4 is not"
+        );
+    }
+
+    #[test]
+    fn shrinking_the_cluster_lowers_the_bar() {
+        let log = log_of(5);
+        let state = progress(&[(2, 5), (3, 0)]);
+        // With {1,2,3} the entry is on 2 of 3: committed. With {1,2} it still is.
+        // With node 2 gone and the leader alone with node 3 absent from progress:
+        assert_eq!(advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 3]), 5), None);
+        assert_eq!(advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1]), 5), Some(5));
+    }
+
+    #[test]
+    fn a_leader_removing_itself_does_not_count_its_own_log() {
+        let log = log_of(5);
+        // Members {2,3,4}: the leader (1) has the entry, and so does node 2 only.
+        let members = Membership::of_ids([2, 3, 4]);
+        let state = progress(&[(2, 5), (3, 0), (4, 0)]);
+        assert_eq!(advance_commit_index(&state, &log, 1, 1, &members, 5), None);
+        let state = progress(&[(2, 5), (3, 5), (4, 0)]);
+        assert_eq!(advance_commit_index(&state, &log, 1, 1, &members, 5), Some(5));
+    }
+
+    #[test]
+    fn a_removed_nodes_old_progress_is_ignored() {
+        let log = log_of(5);
+        // Node 3 is far ahead in the map but no longer a member.
+        let state = progress(&[(2, 0), (3, 5)]);
+        assert_eq!(advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 2, 4]), 5), None);
     }
 }

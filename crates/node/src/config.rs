@@ -1,4 +1,4 @@
-use raft_core::NodeId;
+use raft_core::{Membership, NodeId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -8,6 +8,12 @@ use std::time::Duration;
 /// timeout, so a client hears a definite "timed out, outcome unknown" from the
 /// server instead of giving up on a connection it can no longer interpret.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// How long a node being added to the cluster may take to catch up on the log
+/// before the leader gives up on it and abandons the request. A node that never
+/// catches up (wrong address, crashed, far too slow) must not be able to hold the
+/// single membership-change slot forever.
+pub const DEFAULT_CATCH_UP_TIMEOUT: Duration = Duration::from_millis(20_000);
 
 /// How this node answers reads.
 ///
@@ -66,11 +72,29 @@ pub struct NodeConfig {
     pub storage_dir: PathBuf,
     pub read_mode: ReadMode,
     pub limits: Limits,
+    /// True for a node that is being ADDED to a cluster that already exists. Such
+    /// a node starts as a non-voter: it must not hold elections of its own (it
+    /// would be a one-node majority of nothing) until the cluster's log tells it
+    /// it is a member. `peers` then lists the current members, so it can answer
+    /// the leader that sends it the log.
+    pub join: bool,
+    /// How long a joining node gets to catch up before the leader abandons it.
+    pub catch_up_timeout: Duration,
 }
 
 impl NodeConfig {
-    pub fn cluster_size(&self) -> usize {
-        self.peers.len() + 1
+    /// The membership this node starts from, before any configuration entry in
+    /// its log is applied: the configured peers plus this node itself, or, for a
+    /// joining node, the peers alone. The log is the source of truth from there on;
+    /// this is only the bootstrap configuration the first entries build upon, so
+    /// it must stay the same across restarts of the same node.
+    pub fn base_membership(&self) -> Membership {
+        let mut members: Vec<(NodeId, String)> =
+            self.peers.iter().map(|(&id, addr)| (id, addr.clone())).collect();
+        if !self.join {
+            members.push((self.id, self.listen_addr.clone()));
+        }
+        Membership::new(members)
     }
 
     /// Expected vars:
@@ -83,6 +107,10 @@ impl NodeConfig {
     ///   QUORUM_LOCAL_READS=false         (optional; true = fast but possibly stale reads)
     ///   QUORUM_CHANNEL_CAPACITY=1024     (optional; size of every internal queue)
     ///   QUORUM_MAX_BATCH=128             (optional; most requests per disk sync)
+    ///   QUORUM_JOIN=true                 (optional; this node is being added to an
+    ///                                     existing cluster, PEERS lists its members)
+    ///   QUORUM_CATCH_UP_TIMEOUT_MS=20000 (optional; how long a joining node gets
+    ///                                     to catch up with the leader)
     pub fn from_env() -> anyhow::Result<Self> {
         let id: NodeId = std::env::var("QUORUM_NODE_ID")
             .map_err(|_| anyhow::anyhow!("QUORUM_NODE_ID not set"))?
@@ -107,8 +135,21 @@ impl NodeConfig {
         let read_mode = parse_read_mode(std::env::var("QUORUM_LOCAL_READS").ok().as_deref())?;
 
         let limits = limits_from_env()?;
+        let join = parse_join(std::env::var("QUORUM_JOIN").ok().as_deref())?;
+        let catch_up_timeout =
+            parse_catch_up_timeout(std::env::var("QUORUM_CATCH_UP_TIMEOUT_MS").ok().as_deref())?;
 
-        Ok(Self { id, listen_addr, metrics_addr, peers, storage_dir, read_mode, limits })
+        Ok(Self {
+            id,
+            listen_addr,
+            metrics_addr,
+            peers,
+            storage_dir,
+            read_mode,
+            limits,
+            join,
+            catch_up_timeout,
+        })
     }
 }
 
@@ -161,6 +202,35 @@ pub fn parse_read_mode(raw: Option<&str>) -> anyhow::Result<ReadMode> {
             ),
         },
     }
+}
+
+/// Parses `QUORUM_JOIN`. Unset or `false`/`0` is an ordinary node; `true`/`1`
+/// marks a node that is being added to an existing cluster. Anything else is an
+/// error: guessing wrong here would let a node that should wait to be admitted
+/// start electing itself instead.
+pub fn parse_join(raw: Option<&str>) -> anyhow::Result<bool> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        None => Ok(false),
+        Some(value) => match value.as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => anyhow::bail!("QUORUM_JOIN must be true, false, 1 or 0, got {:?}", raw.unwrap_or("")),
+        },
+    }
+}
+
+/// Parses `QUORUM_CATCH_UP_TIMEOUT_MS`, defaulting to [`DEFAULT_CATCH_UP_TIMEOUT`].
+pub fn parse_catch_up_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_CATCH_UP_TIMEOUT);
+    };
+    let millis: u64 = raw.trim().parse().map_err(|_| {
+        anyhow::anyhow!("QUORUM_CATCH_UP_TIMEOUT_MS must be a whole number, got {raw:?}")
+    })?;
+    if millis == 0 {
+        anyhow::bail!("QUORUM_CATCH_UP_TIMEOUT_MS must be greater than zero");
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 /// Reads `QUORUM_REQUEST_TIMEOUT_MS` (milliseconds), defaulting to
@@ -254,5 +324,57 @@ mod tests {
     fn a_rejected_limit_names_the_setting() {
         let message = parse_limit("QUORUM_MAX_BATCH", Some("0"), 128).unwrap_err().to_string();
         assert!(message.contains("QUORUM_MAX_BATCH"), "{message}");
+    }
+
+    #[test]
+    fn join_is_off_unless_asked_for() {
+        assert!(!parse_join(None).unwrap());
+        assert!(!parse_join(Some("false")).unwrap());
+        assert!(!parse_join(Some("0")).unwrap());
+        assert!(parse_join(Some("true")).unwrap());
+        assert!(parse_join(Some(" TRUE ")).unwrap());
+        assert!(parse_join(Some("1")).unwrap());
+    }
+
+    #[test]
+    fn a_typo_in_join_is_an_error_not_a_guess() {
+        assert!(parse_join(Some("yes")).is_err());
+        assert!(parse_join(Some("")).is_err());
+        assert!(parse_join(Some("ture")).is_err());
+    }
+
+    #[test]
+    fn catch_up_timeout_defaults_parses_and_rejects_nonsense() {
+        assert_eq!(parse_catch_up_timeout(None).unwrap(), DEFAULT_CATCH_UP_TIMEOUT);
+        assert_eq!(parse_catch_up_timeout(Some("1500")).unwrap(), Duration::from_millis(1500));
+        assert!(parse_catch_up_timeout(Some("0")).is_err());
+        assert!(parse_catch_up_timeout(Some("soon")).is_err());
+    }
+
+    fn config_with(join: bool) -> NodeConfig {
+        NodeConfig {
+            id: 4,
+            listen_addr: "node4:7000".to_string(),
+            metrics_addr: String::new(),
+            peers: [(1, "node1:7000".to_string()), (2, "node2:7000".to_string())].into(),
+            storage_dir: PathBuf::new(),
+            read_mode: ReadMode::Linearizable,
+            limits: Limits::default(),
+            join,
+            catch_up_timeout: DEFAULT_CATCH_UP_TIMEOUT,
+        }
+    }
+
+    #[test]
+    fn an_ordinary_node_starts_as_a_member_of_its_own_cluster() {
+        let members = config_with(false).base_membership();
+        assert_eq!(members.ids().collect::<Vec<_>>(), vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn a_joining_node_starts_outside_the_cluster_it_is_joining() {
+        let members = config_with(true).base_membership();
+        assert_eq!(members.ids().collect::<Vec<_>>(), vec![1, 2]);
+        assert!(!members.contains(4), "it must not vote until the log says so");
     }
 }

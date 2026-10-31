@@ -55,6 +55,8 @@ fn idle_snapshot() -> ClusterSnapshot {
         leader_hint: Some(1),
         wal_syncs: 0,
         dropped_messages: 0,
+        members: vec![1],
+        learners: Vec::new(),
     }
 }
 
@@ -65,9 +67,17 @@ async fn stuck_api(
 ) -> (SocketAddr, mpsc::Receiver<ClientCommand>, mpsc::Receiver<ClientQuery>) {
     let (command_tx, command_rx) = mpsc::channel(1);
     let (query_tx, query_rx) = mpsc::channel(1);
+    let (admin_tx, _admin_rx) = mpsc::channel(1);
     let (snapshot_tx, snapshot_rx) = watch::channel(idle_snapshot());
     std::mem::forget(snapshot_tx); // keep the snapshot channel open for the whole test
-    let state = AppState { command_tx, query_tx, snapshot_rx, request_timeout: timeout };
+    let state = AppState {
+        command_tx,
+        query_tx,
+        admin_tx,
+        snapshot_rx,
+        request_timeout: timeout,
+        admin_timeout: timeout * 10,
+    };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

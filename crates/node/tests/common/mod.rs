@@ -10,10 +10,10 @@
 #![allow(dead_code)]
 
 use node::cluster::{
-    ClientCommand, ClientCommandResult, ClientQuery, Cluster, ClusterHandle, ClusterSnapshot,
-    QueryResult,
+    AdminResult, ClientAdmin, ClientCommand, ClientCommandResult, ClientQuery, Cluster,
+    ClusterHandle, ClusterSnapshot, MembershipChange, PeerConnector, QueryResult,
 };
-use node::config::{Limits, NodeConfig, ReadMode};
+use node::config::{Limits, NodeConfig, ReadMode, DEFAULT_CATCH_UP_TIMEOUT};
 use node::metrics_api::{router, AppState};
 use raft_core::{NodeId, RpcMessage};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -86,7 +86,12 @@ struct TestNode {
 }
 
 pub struct TestCluster {
+    /// Every node ever started, members or not: the simulated network links them
+    /// all, and a removed node keeps running until a test stops it.
     ids: Vec<NodeId>,
+    /// Nodes started with `QUORUM_JOIN`: they wait to be admitted instead of voting.
+    joiners: HashSet<NodeId>,
+    catch_up_timeout: Duration,
     network: Arc<Network>,
     nodes: BTreeMap<NodeId, TestNode>,
     base_dir: PathBuf,
@@ -119,6 +124,8 @@ impl TestCluster {
 
         let mut cluster = Self {
             ids: ids.to_vec(),
+            joiners: HashSet::new(),
+            catch_up_timeout: DEFAULT_CATCH_UP_TIMEOUT,
             network: Arc::new(Network::default()),
             nodes: BTreeMap::new(),
             base_dir,
@@ -164,12 +171,65 @@ impl TestCluster {
             storage_dir: self.node_dir(id),
             read_mode: self.read_mode,
             limits: self.limits,
+            join: self.joiners.contains(&id),
+            catch_up_timeout: self.catch_up_timeout,
+        };
+
+        // How this node dials a member it learns about from the log (a node that
+        // was added after it started): a link into the simulated network.
+        let connector: PeerConnector = {
+            let network = self.network.clone();
+            let capacity = self.limits.channel_capacity;
+            Box::new(move |peer, _addr| spawn_link(network.clone(), id, peer, capacity))
         };
 
         let recovered = Persistence::open(self.node_dir(id)).expect("storage should open");
-        let (cluster, handle) = Cluster::new(config, recovered, peer_outboxes, inbox_rx);
+        let (cluster, handle) = Cluster::new(config, recovered, peer_outboxes, inbox_rx, connector);
         let join = tokio::spawn(cluster.run());
         self.nodes.insert(id, TestNode { handle, join });
+    }
+
+    // ---- membership ---------------------------------------------------------
+
+    /// How long a node being added gets to catch up before the leader abandons it.
+    /// Applies to nodes launched (or restarted) afterwards.
+    pub fn set_catch_up_timeout(&mut self, timeout: Duration) {
+        self.catch_up_timeout = timeout;
+    }
+
+    /// Starts a brand-new node that is NOT yet a member: it knows the current
+    /// nodes as peers (so it can answer the leader) but waits to be admitted.
+    pub fn start_joiner(&mut self, id: NodeId) {
+        assert!(!self.ids.contains(&id), "node {id} already exists");
+        self.joiners.insert(id);
+        self.launch(id);
+        self.ids.push(id);
+    }
+
+    /// Asks node `id` to make a membership change and waits for the answer.
+    pub async fn change_membership(&self, id: NodeId, change: MembershipChange) -> AdminResult {
+        let (respond_to, receiver) = oneshot::channel();
+        self.nodes[&id]
+            .handle
+            .admin_tx
+            .send(ClientAdmin { change, respond_to })
+            .await
+            .expect("admin channel should be open");
+        receiver.await.expect("cluster should respond")
+    }
+
+    pub async fn add_member(&self, via: NodeId, new_id: NodeId) -> AdminResult {
+        let change = MembershipChange::Add { id: new_id, addr: format!("node{new_id}:7000") };
+        self.change_membership(via, change).await
+    }
+
+    pub async fn remove_member(&self, via: NodeId, id: NodeId) -> AdminResult {
+        self.change_membership(via, MembershipChange::Remove { id }).await
+    }
+
+    /// The voting members node `id` currently believes in.
+    pub fn members_of(&self, id: NodeId) -> Vec<NodeId> {
+        self.snapshot(id).members
     }
 
     // ---- failures -----------------------------------------------------------
@@ -293,8 +353,10 @@ impl TestCluster {
         let state = AppState {
             command_tx: handle.command_tx.clone(),
             query_tx: handle.query_tx.clone(),
+            admin_tx: handle.admin_tx.clone(),
             snapshot_rx: handle.snapshot_rx.clone(),
             request_timeout,
+            admin_timeout: request_timeout * 10,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

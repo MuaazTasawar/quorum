@@ -1,5 +1,5 @@
 use node::{
-    cluster::Cluster,
+    cluster::{Cluster, PeerConnector},
     config::{request_timeout_from_env, NodeConfig},
     metrics_api, network,
 };
@@ -16,7 +16,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = NodeConfig::from_env()?;
-    tracing::info!(node_id = config.id, read_mode = ?config.read_mode, "starting quorum node");
+    tracing::info!(
+        node_id = config.id,
+        read_mode = ?config.read_mode,
+        join = config.join,
+        "starting quorum node"
+    );
 
     // Recovers the log AND the hard state (current_term / voted_for) from disk.
     // A node that restarts without its vote could vote twice in one term, so a
@@ -44,16 +49,20 @@ async fn main() -> anyhow::Result<()> {
     );
     let (inbox_tx, inbox_rx) = mpsc::channel(config.limits.channel_capacity);
 
+    // How this node dials a peer. Used now for the configured peers, and by the
+    // cluster later for any member it learns about from the log.
+    let connector: PeerConnector = {
+        let self_id = config.id;
+        let inbox_tx = inbox_tx.clone();
+        let capacity = config.limits.channel_capacity;
+        Box::new(move |peer_id, addr| {
+            network::spawn_outbound(self_id, peer_id, addr.to_string(), inbox_tx.clone(), capacity)
+        })
+    };
+
     let mut peer_outboxes = HashMap::new();
     for (&peer_id, addr) in &config.peers {
-        let tx = network::spawn_outbound(
-            config.id,
-            peer_id,
-            addr.clone(),
-            inbox_tx.clone(),
-            config.limits.channel_capacity,
-        );
-        peer_outboxes.insert(peer_id, tx);
+        peer_outboxes.insert(peer_id, connector(peer_id, addr));
     }
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
@@ -62,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let metrics_addr = config.metrics_addr.clone();
     let request_timeout = request_timeout_from_env()?;
     tracing::info!(timeout_ms = request_timeout.as_millis() as u64, "request timeout");
-    let (cluster, handle) = Cluster::new(config, recovered, peer_outboxes, inbox_rx);
+    let (cluster, handle) = Cluster::new(config, recovered, peer_outboxes, inbox_rx, connector);
 
     let app_state = metrics_api::AppState::from_handle(handle, request_timeout);
     let router = metrics_api::router(app_state);
