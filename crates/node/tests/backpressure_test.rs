@@ -57,6 +57,9 @@ fn idle_snapshot() -> ClusterSnapshot {
         dropped_messages: 0,
         members: vec![1],
         learners: Vec::new(),
+        snapshot_index: 0,
+        log_base: 0,
+        snapshots_taken: 0,
     }
 }
 

@@ -110,6 +110,10 @@ pub enum AdminRejection {
     LastMember,
     /// A node to add needs an address the others can dial.
     BadAddress,
+    /// This leader's log no longer starts at the beginning, so a new node cannot be
+    /// brought up to date by replication alone and would need the snapshot sent to
+    /// it, which is not supported yet. Refused up front rather than left to time out.
+    LogCompacted,
     /// The joining node did not catch up with the log in time, or the caller gave
     /// up waiting. It was not added.
     CatchUpFailed,
@@ -128,6 +132,10 @@ impl std::fmt::Display for AdminRejection {
             AdminRejection::NotMember => "that node is not a member of the cluster",
             AdminRejection::LastMember => "the last remaining member cannot be removed",
             AdminRejection::BadAddress => "a node to add needs a non-empty address (host:port)",
+            AdminRejection::LogCompacted => {
+                "this cluster's log has been compacted into a snapshot, and a new node cannot \
+                 be brought up to date from a compacted log yet"
+            }
             AdminRejection::CatchUpFailed => {
                 "the new node did not catch up with the log in time and was not added"
             }
@@ -157,6 +165,12 @@ pub struct ClusterSnapshot {
     /// Nodes the leader is bringing up to date before admitting them as voters.
     /// Only ever non-empty on a leader with an add in progress.
     pub learners: Vec<NodeId>,
+    /// Index the newest snapshot on disk reaches (0 if none has been taken).
+    pub snapshot_index: u64,
+    /// Index of the last log entry that has been discarded; the log starts after it.
+    pub log_base: u64,
+    /// Snapshots this process has taken since it started.
+    pub snapshots_taken: u64,
 }
 
 pub struct ClusterHandle {
@@ -274,6 +288,11 @@ pub struct Cluster {
     /// The membership change this leader is working through, if any.
     pending_admin: Option<PendingAdmin>,
     connector: PeerConnector,
+    /// Snapshots taken since this process started.
+    snapshots_taken: u64,
+    /// After a failed snapshot, do not try again until this many entries are applied,
+    /// so a full disk is not retried (and logged) on every event.
+    snapshot_retry_after: u64,
     /// Outbound messages discarded because a peer's queue was full.
     dropped_messages: u64,
     pending_commands: HashMap<u64, oneshot::Sender<ClientCommandResult>>,
@@ -349,6 +368,9 @@ impl Cluster {
             dropped_messages: 0,
             members: membership.ids().collect(),
             learners: Vec::new(),
+            snapshot_index: base_index,
+            log_base: base_index,
+            snapshots_taken: 0,
         });
 
         let mut cluster = Self {
@@ -374,6 +396,8 @@ impl Cluster {
             learners: BTreeMap::new(),
             pending_admin: None,
             connector,
+            snapshots_taken: 0,
+            snapshot_retry_after: 0,
             dropped_messages: 0,
             pending_commands: HashMap::new(),
             pending_reads: Vec::new(),
@@ -431,6 +455,7 @@ impl Cluster {
             }
 
             self.apply_committed_entries();
+            self.maybe_snapshot();
             self.drive_admin();
             self.complete_ready_reads();
             self.publish_snapshot();
@@ -1064,6 +1089,93 @@ impl Cluster {
         self.pending_reads = still_waiting;
     }
 
+    // ---- snapshots and log compaction ----------------------------------------
+
+    /// Takes a snapshot once enough entries have been applied since the last one,
+    /// then trims whatever part of the log is safe to discard.
+    ///
+    /// A snapshot is optional: it only saves disk and replay time. So a failure to
+    /// write one is logged and retried later, never fatal, unlike a failed write of
+    /// the log itself.
+    fn maybe_snapshot(&mut self) {
+        let threshold = self.config.snapshot_threshold;
+        if threshold == 0 {
+            return;
+        }
+        let applied = self.volatile.last_applied;
+        let last_snapshot = self.persistence.snapshot_base();
+        if applied >= last_snapshot + threshold && applied >= self.snapshot_retry_after {
+            self.take_snapshot(applied);
+        }
+        self.compact_log();
+    }
+
+    /// Snapshots the state machine as of `index`, which must be what it has applied.
+    fn take_snapshot(&mut self, index: u64) {
+        let Some(term) = self.log.term_at(index) else {
+            return;
+        };
+        let metadata = storage::SnapshotMetadata {
+            last_included_index: index,
+            last_included_term: term,
+            membership: self.history.membership_at(index),
+        };
+        let started = Instant::now();
+        match self.persistence.save_snapshot_only(metadata, &self.kv_store) {
+            Ok(()) => {
+                self.snapshots_taken += 1;
+                info!(index, keys = self.kv_store.len(), took_ms = started.elapsed().as_millis() as u64, "snapshot taken");
+            }
+            Err(e) => {
+                error!(error = %e, index, "could not write a snapshot - carrying on without one");
+                self.snapshot_retry_after = index + self.config.snapshot_threshold;
+            }
+        }
+    }
+
+    /// Discards the part of the log that the newest snapshot covers and nobody
+    /// needs, keeping `snapshot_retain` entries behind the snapshot.
+    ///
+    /// A leader additionally keeps everything its slowest peer, learners included,
+    /// has not yet confirmed: that peer is caught up by sending it log entries, and
+    /// entries thrown away cannot be sent.
+    fn compact_log(&mut self) {
+        let snapshot_index = self.persistence.snapshot_base();
+        if snapshot_index <= self.log.base_index() {
+            return;
+        }
+        let mut upto = snapshot_index.saturating_sub(self.config.snapshot_retain);
+        if self.volatile.role == Role::Leader {
+            upto = upto.min(self.slowest_peer_match());
+        }
+        if upto <= self.log.base_index() {
+            return;
+        }
+        match self.persistence.compact_log_through(upto) {
+            Ok(()) => {
+                self.log.compact_through(upto).expect("only entries that exist are compacted");
+                self.history.compact_through(upto);
+                debug!(upto, "log compacted");
+            }
+            Err(e) => {
+                error!(error = %e, upto, "could not trim the log - it will be retried");
+            }
+        }
+    }
+
+    /// The lowest index any other node (voter or learner) is known to hold; entries
+    /// at or below it have been replicated everywhere. `u64::MAX` if there are no
+    /// other nodes.
+    fn slowest_peer_match(&self) -> u64 {
+        self.membership
+            .ids()
+            .chain(self.learners.keys().copied())
+            .filter(|&id| id != self.config.id)
+            .map(|id| self.leader_state.match_index.get(&id).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
     // ---- membership ---------------------------------------------------------
 
     /// Why a membership change cannot be started right now, if it cannot.
@@ -1090,6 +1202,8 @@ impl Cluster {
                     Some(AdminRejection::BadAddress)
                 } else if self.membership.contains(*id) {
                     Some(AdminRejection::AlreadyMember)
+                } else if self.log.base_index() > 0 {
+                    Some(AdminRejection::LogCompacted)
                 } else {
                     None
                 }
@@ -1382,6 +1496,9 @@ impl Cluster {
             dropped_messages: self.dropped_messages,
             members: self.membership.ids().collect(),
             learners: self.learners.keys().copied().collect(),
+            snapshot_index: self.persistence.snapshot_base(),
+            log_base: self.log.base_index(),
+            snapshots_taken: self.snapshots_taken,
         });
     }
 }
@@ -1480,6 +1597,8 @@ mod tests {
             limits,
             join: false,
             catch_up_timeout: crate::config::DEFAULT_CATCH_UP_TIMEOUT,
+            snapshot_threshold: 0,
+            snapshot_retain: 0,
         };
         let mut outboxes = HashMap::new();
         let mut outputs = HashMap::new();
@@ -2833,6 +2952,7 @@ mod tests {
     /// What the event loop does after every event.
     fn settle(cluster: &mut Cluster) {
         cluster.apply_committed_entries();
+        cluster.maybe_snapshot();
         cluster.drive_admin();
     }
 
@@ -3582,5 +3702,259 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(ClientCommandResult::Applied(_))));
         assert_eq!(value_of(&cluster, "new"), Some(b"value".to_vec()));
         assert_eq!(value_of(&cluster, "k3"), Some(b"v3".to_vec()), "snapshot state is intact");
+    }
+
+    // ---- taking snapshots and trimming the log ---------------------------------
+
+    fn put_log_entry(index: u64, term: Term) -> LogEntry {
+        let command = Command::Put { key: format!("k{index}"), value: format!("v{index}").into_bytes() };
+        LogEntry { term, index, command: command.encode().unwrap() }
+    }
+
+    /// A follower (leader is node 2, term 1) that has been told entries `from..=to`
+    /// are all committed, and has applied them.
+    fn follower_applies(cluster: &mut Cluster, from: u64, to: u64) {
+        let entries: Vec<LogEntry> = (from..=to).map(|i| put_log_entry(i, 1)).collect();
+        let prev_term = if from > 1 { 1 } else { 0 };
+        cluster.handle_rpc(2, append_request_committing(1, 2, from - 1, prev_term, entries, to));
+        settle(cluster);
+    }
+
+    fn wal_indices(dir: &Path) -> Vec<u64> {
+        storage::Wal::replay(dir.join(storage::WAL_FILE)).unwrap().iter().map(|e| e.index).collect()
+    }
+
+    fn snapshots_on(cluster: &Cluster) -> ClusterSnapshot {
+        let rx = cluster.snapshot_tx.subscribe();
+        cluster.publish_snapshot();
+        let snapshot = rx.borrow().clone();
+        snapshot
+    }
+
+    #[test]
+    fn snapshots_are_off_by_default_and_the_log_is_never_trimmed() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        follower_applies(&mut cluster, 1, 12);
+        assert_eq!(cluster.persistence.snapshot_base(), 0);
+        assert_eq!(cluster.log.base_index(), 0);
+        assert_eq!(wal_indices(dir.path()).len(), 12);
+        assert_eq!(snapshots_on(&cluster).snapshots_taken, 0);
+    }
+
+    #[test]
+    fn nothing_happens_below_the_threshold() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.config.snapshot_threshold = 10;
+        follower_applies(&mut cluster, 1, 9);
+        assert_eq!(cluster.persistence.snapshot_base(), 0);
+        follower_applies(&mut cluster, 10, 10);
+        assert_eq!(cluster.persistence.snapshot_base(), 10, "now it is due");
+    }
+
+    #[test]
+    fn a_snapshot_is_taken_when_enough_has_been_applied_and_the_log_is_trimmed() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.config.snapshot_threshold = 3;
+        follower_applies(&mut cluster, 1, 5);
+
+        assert_eq!(cluster.persistence.snapshot_base(), 5);
+        assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 5));
+        assert!(wal_indices(dir.path()).is_empty(), "the file shrank to nothing");
+        let published = snapshots_on(&cluster);
+        assert_eq!((published.snapshot_index, published.log_base, published.snapshots_taken), (5, 5, 1));
+
+        let (metadata, state) = storage::load_snapshot(dir.path().join(storage::SNAPSHOT_FILE))
+            .unwrap()
+            .expect("the snapshot is on disk");
+        assert_eq!((metadata.last_included_index, metadata.last_included_term), (5, 1));
+        assert_eq!(state.get("k5"), Some(&b"v5".to_vec()));
+        assert_eq!(state.len(), 5);
+        assert_eq!(metadata.membership.ids().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn entries_just_behind_the_snapshot_are_retained_for_followers_that_lag() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.config.snapshot_threshold = 3;
+        cluster.config.snapshot_retain = 2;
+        follower_applies(&mut cluster, 1, 5);
+
+        assert_eq!(cluster.persistence.snapshot_base(), 5);
+        assert_eq!(cluster.log.base_index(), 3, "5 minus the 2 retained");
+        assert_eq!(wal_indices(dir.path()), vec![4, 5]);
+    }
+
+    #[test]
+    fn a_node_restarts_from_the_snapshot_it_took_and_carries_on() {
+        let dir = TestDir::new();
+        {
+            let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+            cluster.config.snapshot_threshold = 4;
+            cluster.config.snapshot_retain = 1;
+            follower_applies(&mut cluster, 1, 6);
+            follower_applies(&mut cluster, 7, 8);
+        }
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        assert_eq!(cluster.persistence.snapshot_base(), 6, "the snapshot taken at 6");
+        assert_eq!((cluster.volatile.last_applied, cluster.log.last_index()), (6, 8));
+        for key in ["k1", "k6"] {
+            assert!(cluster.kv_store.get(key).is_some(), "{key} came from the snapshot");
+        }
+        assert!(cluster.kv_store.get("k7").is_none(), "7 and 8 are replayed once committed");
+
+        cluster.handle_rpc(2, append_request_committing(1, 2, 8, 1, vec![], 8));
+        settle(&mut cluster);
+        assert_eq!(cluster.kv_store.get("k8"), Some(&b"v8".to_vec()));
+        assert_eq!(cluster.kv_store.len(), 8, "every write, none lost, none doubled");
+    }
+
+    #[test]
+    fn the_membership_at_the_snapshot_is_what_the_snapshot_records() {
+        let dir = TestDir::new();
+        {
+            let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+            cluster.config.snapshot_threshold = 3;
+            let add4 = LogEntry {
+                term: 1,
+                index: 2,
+                command: Command::AddNode { id: 4, addr: "node4:7000".into() }.encode().unwrap(),
+            };
+            let entries = vec![put_log_entry(1, 1), add4, put_log_entry(3, 1), put_log_entry(4, 1)];
+            cluster.handle_rpc(2, append_request_committing(1, 2, 0, 0, entries, 4));
+            settle(&mut cluster);
+            assert_eq!(cluster.persistence.snapshot_base(), 4);
+            assert_eq!(members(&cluster), vec![1, 2, 3, 4], "unchanged by trimming the log");
+        }
+        // The entry that added node 4 is gone from the log; only the snapshot knows.
+        assert!(wal_indices(dir.path()).is_empty());
+        let (restarted, _outputs, connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        assert_eq!(members(&restarted), vec![1, 2, 3, 4]);
+        assert!(connections.lock().unwrap().contains_key(&4));
+    }
+
+    #[test]
+    fn a_leader_keeps_the_log_its_slowest_peer_still_needs() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.config.snapshot_threshold = 2;
+        cluster.persistent.current_term = 1;
+        cluster.become_leader(); // no-op at index 1
+        ack(&mut cluster, 2, 1);
+        for _ in 0..2 {
+            let (put, _rx) = put_command_with_receiver("k", "v");
+            cluster.handle_client_command(put);
+        }
+        ack(&mut cluster, 2, 3); // 1 and 2 are a majority: committed and applied through 3
+
+        assert_eq!(cluster.persistence.snapshot_base(), 3, "a snapshot is taken regardless");
+        assert_eq!(cluster.log.base_index(), 0, "but node 3 has confirmed nothing: keep it all");
+        assert_eq!(wal_indices(dir.path()).len(), 3);
+
+        ack(&mut cluster, 3, 2); // node 3 catches up part of the way
+        assert_eq!(cluster.log.base_index(), 2, "trimmed exactly as far as the slowest peer");
+
+        ack(&mut cluster, 3, 3);
+        assert_eq!(cluster.log.base_index(), 3);
+    }
+
+    #[test]
+    fn a_learner_that_is_still_catching_up_also_holds_the_log_back() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        cluster.config.snapshot_threshold = 2;
+        cluster.persistent.current_term = 1;
+        cluster.become_leader();
+        ack(&mut cluster, 2, 1);
+        ack(&mut cluster, 3, 1);
+        let _add = request_change(&mut cluster, add(4)); // learner 4 starts at match 0
+        for _ in 0..2 {
+            let (put, _rx) = put_command_with_receiver("k", "v");
+            cluster.handle_client_command(put);
+        }
+        ack(&mut cluster, 2, 3);
+        ack(&mut cluster, 3, 3);
+        assert_eq!(cluster.persistence.snapshot_base(), 3);
+        assert_eq!(cluster.log.base_index(), 0, "the learner could not be sent trimmed entries");
+    }
+
+    #[test]
+    fn a_failed_snapshot_is_logged_and_retried_later_not_fatal() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.config.snapshot_threshold = 2;
+        // Something is in the way of the snapshot file: the write cannot succeed.
+        std::fs::create_dir(dir.path().join(storage::SNAPSHOT_FILE)).unwrap();
+
+        follower_applies(&mut cluster, 1, 4);
+        assert_eq!(cluster.volatile.last_applied, 4, "the node carries on");
+        assert_eq!(cluster.snapshots_taken, 0);
+        assert_eq!(cluster.persistence.snapshot_base(), 0);
+        assert_eq!(cluster.log.base_index(), 0, "and the log is untouched");
+        assert_eq!(cluster.kv_store.len(), 4);
+
+        // Not retried on every event, only once another threshold's worth is applied.
+        assert_eq!(cluster.snapshot_retry_after, 6, "backs off for another threshold's worth");
+        follower_applies(&mut cluster, 5, 5);
+        assert_eq!(cluster.snapshots_taken, 0);
+
+        std::fs::remove_dir(dir.path().join(storage::SNAPSHOT_FILE)).unwrap();
+        follower_applies(&mut cluster, 6, 6);
+        assert_eq!(cluster.snapshots_taken, 1, "the obstacle is gone: it works");
+        assert_eq!(cluster.persistence.snapshot_base(), 6);
+    }
+
+    #[test]
+    fn a_node_cannot_be_added_once_the_log_has_been_compacted() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[]);
+        cluster.config.snapshot_threshold = 2;
+        cluster.begin_election();
+        settle(&mut cluster);
+        for _ in 0..3 {
+            let (put, _rx) = put_command_with_receiver("k", "v");
+            cluster.handle_client_command(put);
+            settle(&mut cluster);
+        }
+        assert!(cluster.log.base_index() > 0, "a lone node trims as soon as it has a snapshot");
+
+        assert_eq!(rejected(request_change(&mut cluster, add(2))), AdminRejection::LogCompacted);
+        assert!(cluster.learners.is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_does_not_include_a_configuration_change_that_is_not_applied_yet() {
+        let dir = TestDir::new();
+        {
+            let (mut cluster, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+            cluster.config.snapshot_threshold = 3;
+            let add4 = LogEntry {
+                term: 1,
+                index: 5,
+                command: Command::AddNode { id: 4, addr: "node4:7000".into() }.encode().unwrap(),
+            };
+            let mut entries: Vec<LogEntry> = (1..=4).map(|i| put_log_entry(i, 1)).collect();
+            entries.push(add4);
+            // Entry 5 (the change) is in the log, so it is already in effect here, but
+            // only 1..=4 are committed and applied.
+            cluster.handle_rpc(2, append_request_committing(1, 2, 0, 0, entries, 4));
+            settle(&mut cluster);
+            assert_eq!(cluster.persistence.snapshot_base(), 4);
+            assert_eq!(members(&cluster), vec![1, 2, 3, 4]);
+        }
+        let (metadata, _) = storage::load_snapshot(dir.path().join(storage::SNAPSHOT_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            metadata.membership.ids().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the snapshot describes the cluster as of index 4, before the change"
+        );
+        // The change is still in the log tail, so a restart puts it back into effect.
+        let (restarted, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        assert_eq!(members(&restarted), vec![1, 2, 3, 4]);
     }
 }

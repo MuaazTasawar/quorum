@@ -29,6 +29,10 @@ pub enum PersistenceError {
     /// backwards and could resurrect entries already discarded.
     #[error("refusing a snapshot at index {requested}: one at index {current} is already stored")]
     StaleSnapshot { requested: u64, current: u64 },
+    /// Asked to discard log entries the snapshot on disk does not cover. They would
+    /// exist nowhere afterwards.
+    #[error("cannot discard the log through {requested}: the snapshot only reaches {snapshot}")]
+    CompactBeyondSnapshot { requested: u64, snapshot: u64 },
 }
 
 /// A snapshot found on disk at startup.
@@ -152,6 +156,20 @@ impl Persistence {
         state: &KvStore,
     ) -> Result<(), PersistenceError> {
         let index = metadata.last_included_index;
+        self.save_snapshot_only(metadata, state)?;
+        self.compact_log_through(index)
+    }
+
+    /// Makes a snapshot durable and leaves the log alone. Taking a snapshot and
+    /// trimming the log are separate steps because a leader may have to keep log
+    /// entries a slow follower still needs even though a snapshot already covers
+    /// them; the trimming then waits (`compact_log_through`).
+    pub fn save_snapshot_only(
+        &mut self,
+        metadata: SnapshotMetadata,
+        state: &KvStore,
+    ) -> Result<(), PersistenceError> {
+        let index = metadata.last_included_index;
         if index < self.snapshot_base {
             return Err(PersistenceError::StaleSnapshot {
                 requested: index,
@@ -159,8 +177,24 @@ impl Persistence {
             });
         }
         save_snapshot(&self.snapshot_path, metadata, state)?;
-        self.wal.compact_through(index)?;
         self.snapshot_base = index;
+        Ok(())
+    }
+
+    /// Discards log entries up to and including `index`. Only entries the snapshot
+    /// on disk already covers may go, so that every entry removed is still
+    /// recoverable. A crash at any point is safe: the WAL is rewritten atomically,
+    /// and `open` finishes or ignores whatever was in flight. Entries between the
+    /// point trimmed here and the snapshot's own index are dropped the next time
+    /// the node starts, since the snapshot makes them redundant.
+    pub fn compact_log_through(&mut self, index: u64) -> Result<(), PersistenceError> {
+        if index > self.snapshot_base {
+            return Err(PersistenceError::CompactBeyondSnapshot {
+                requested: index,
+                snapshot: self.snapshot_base,
+            });
+        }
+        self.wal.compact_through(index)?;
         Ok(())
     }
 
@@ -544,5 +578,43 @@ mod tests {
             p.truncate_from(6).unwrap();
         }
         assert_eq!(indices(&Persistence::open(&dir.0).unwrap()), vec![4, 5]);
+    }
+
+    #[test]
+    fn a_snapshot_can_be_saved_without_trimming_the_log_and_trimmed_later() {
+        let dir = TestDir::new();
+        let mut p = Persistence::open(&dir.0).unwrap().persistence;
+        p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+        p.save_snapshot_only(meta(6, 1), &store_with("k", "v")).unwrap();
+        assert_eq!(p.snapshot_base(), 6);
+        assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 8, "the log is untouched");
+
+        p.compact_log_through(4).unwrap(); // a slow follower still needs 5 onward
+        let kept: Vec<u64> =
+            Wal::replay(dir.0.join(WAL_FILE)).unwrap().iter().map(|e| e.index).collect();
+        assert_eq!(kept, vec![5, 6, 7, 8]);
+        drop(p);
+
+        // On restart the snapshot makes 5 and 6 redundant: the log continues after it.
+        let recovered = Persistence::open(&dir.0).unwrap();
+        assert_eq!(indices(&recovered), vec![7, 8]);
+        assert_eq!(recovered.snapshot.unwrap().metadata.last_included_index, 6);
+    }
+
+    #[test]
+    fn the_log_cannot_be_trimmed_past_what_a_snapshot_covers() {
+        let dir = TestDir::new();
+        let mut p = Persistence::open(&dir.0).unwrap().persistence;
+        p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+        assert!(matches!(
+            p.compact_log_through(1),
+            Err(PersistenceError::CompactBeyondSnapshot { requested: 1, snapshot: 0 })
+        ));
+        p.save_snapshot_only(meta(5, 1), &KvStore::new()).unwrap();
+        assert!(matches!(
+            p.compact_log_through(6),
+            Err(PersistenceError::CompactBeyondSnapshot { requested: 6, snapshot: 5 })
+        ));
+        assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 8, "nothing was lost");
     }
 }

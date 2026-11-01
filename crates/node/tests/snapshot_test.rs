@@ -9,7 +9,7 @@
 mod common;
 
 use common::TestCluster;
-use node::cluster::{AdminResult, ClientCommandResult, QueryResult};
+use node::cluster::{AdminRejection, AdminResult, ClientCommandResult, QueryResult};
 use raft_core::{Membership, NodeId};
 use std::time::Duration;
 use storage::{Command, KvStore, Persistence, SnapshotMetadata, Wal, WAL_FILE};
@@ -182,4 +182,130 @@ async fn the_snapshot_not_a_stale_environment_decides_who_the_members_are() {
         assert_eq!(read(&cluster, &alive, key).await, Some(value.as_bytes().to_vec()));
     }
     assert_eq!(cluster.members_of(follower), vec![1, 2, 3, 4]);
+}
+
+// ---- snapshots taken by the nodes themselves ------------------------------------
+
+#[tokio::test]
+async fn a_running_cluster_snapshots_trims_its_logs_and_restarts_from_them() {
+    let mut cluster = TestCluster::start_with_snapshots(&[1, 2, 3], 10, 0);
+    let all = [1, 2, 3];
+    cluster.wait_for_leader(SETTLE).await;
+    for i in 0..60 {
+        write(&cluster, &all, &format!("key-{i}"), &format!("value-{i}")).await;
+    }
+
+    // Every node takes snapshots as it applies, and trims its log once it is safe.
+    cluster
+        .wait_until(SETTLE, "every node to snapshot and trim its log", |c| {
+            all.iter().all(|&id| {
+                let s = c.snapshot(id);
+                s.snapshot_index >= 50 && s.log_base >= 50 && s.snapshots_taken >= 1
+            })
+        })
+        .await;
+    for id in all {
+        let held = cluster.snapshot(id).log_len - cluster.snapshot(id).log_base;
+        assert!(held < 15, "node {id} still holds {held} log entries");
+    }
+
+    // Stop everything and start it again: each node now comes back from a snapshot
+    // plus the short tail of its log.
+    for id in all {
+        cluster.crash(id).await;
+    }
+    for id in all {
+        cluster.restart(id).await;
+    }
+    for id in all {
+        assert!(cluster.snapshot(id).snapshot_index >= 50, "node {id} restarts from its snapshot");
+    }
+    for i in 0..60 {
+        assert_eq!(
+            read(&cluster, &all, &format!("key-{i}")).await,
+            Some(format!("value-{i}").into_bytes()),
+            "key-{i} must survive compaction and a full restart"
+        );
+    }
+    write(&cluster, &all, "after-restart", "ok").await;
+    assert_eq!(read(&cluster, &all, "after-restart").await, Some(b"ok".to_vec()));
+}
+
+#[tokio::test]
+async fn a_leader_never_discards_log_a_lagging_follower_still_needs() {
+    let cluster = TestCluster::start_with_snapshots(&[1, 2, 3], 10, 0);
+    let all = [1, 2, 3];
+    let leader = cluster.wait_for_leader(SETTLE).await;
+    let lagging = all.into_iter().find(|&id| id != leader).unwrap();
+    let others: Vec<NodeId> = all.into_iter().filter(|&id| id != lagging).collect();
+    write(&cluster, &all, "warmup", "1").await;
+    cluster
+        .wait_until(SETTLE, "the follower to be level", |c| {
+            c.snapshot(lagging).last_applied == c.snapshot(leader).last_applied
+        })
+        .await;
+
+    // The follower drops out while the others carry on and snapshot repeatedly.
+    cluster.isolate(lagging);
+    for i in 0..50 {
+        write(&cluster, &others, &format!("key-{i}"), &format!("value-{i}")).await;
+    }
+    cluster
+        .wait_until(SETTLE, "the leader to snapshot", |c| c.snapshot(leader).snapshot_index >= 40)
+        .await;
+    let behind = cluster.snapshot(lagging).last_applied;
+    let leader_view = cluster.snapshot(leader);
+    assert!(
+        leader_view.log_base <= behind,
+        "the leader trimmed to {} but the follower only has {behind}: it could never catch up",
+        leader_view.log_base
+    );
+    assert!(leader_view.snapshot_index > behind, "the snapshot itself is well ahead of it");
+
+    // It comes back and catches up through ordinary replication, then the leader
+    // is free to trim.
+    cluster.heal();
+    cluster
+        .wait_until(SETTLE, "the follower to catch up", |c| {
+            c.snapshot(lagging).last_applied == c.snapshot(leader).last_applied
+                && c.snapshot(lagging).last_applied >= 50
+        })
+        .await;
+    cluster
+        .wait_until(SETTLE, "the leader to trim now that nobody needs the log", |c| {
+            c.snapshot(leader).log_base >= 40
+        })
+        .await;
+    for i in 0..50 {
+        assert_eq!(
+            read(&cluster, &all, &format!("key-{i}")).await,
+            Some(format!("value-{i}").into_bytes())
+        );
+    }
+}
+
+#[tokio::test]
+async fn adding_a_node_after_the_log_was_compacted_is_refused_clearly() {
+    let mut cluster = TestCluster::start_with_snapshots(&[1, 2, 3], 5, 0);
+    let all = [1, 2, 3];
+    cluster.wait_for_leader(SETTLE).await;
+    for i in 0..30 {
+        write(&cluster, &all, &format!("key-{i}"), "v").await;
+    }
+    cluster
+        .wait_until(SETTLE, "the leader's log to be compacted", |c| {
+            all.iter().any(|&id| c.snapshot(id).log_base > 0 && c.leaders().contains(&id))
+        })
+        .await;
+
+    cluster.start_joiner(4);
+    let leader = cluster.wait_for_leader_among(&all, SETTLE).await;
+    let result = cluster.add_member(leader, 4).await;
+    assert!(
+        matches!(result, AdminResult::Rejected(AdminRejection::LogCompacted)),
+        "expected a clear refusal, got {result:?}"
+    );
+    assert!(cluster.snapshot(leader).learners.is_empty());
+    assert_eq!(cluster.members_of(leader), vec![1, 2, 3]);
+    write(&cluster, &all, "still", "working").await;
 }

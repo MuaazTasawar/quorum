@@ -92,6 +92,10 @@ pub struct TestCluster {
     /// Nodes started with `QUORUM_JOIN`: they wait to be admitted instead of voting.
     joiners: HashSet<NodeId>,
     catch_up_timeout: Duration,
+    /// Snapshot after this many applied entries (0 = never) and keep this many
+    /// entries behind it. Applies to nodes launched afterwards.
+    snapshot_threshold: u64,
+    snapshot_retain: u64,
     network: Arc<Network>,
     nodes: BTreeMap<NodeId, TestNode>,
     base_dir: PathBuf,
@@ -116,7 +120,23 @@ impl TestCluster {
         Self::start_full(ids, ReadMode::Linearizable, limits)
     }
 
+    /// Like `start`, but every node snapshots after `threshold` applied entries,
+    /// keeping `retain` entries behind each snapshot.
+    pub fn start_with_snapshots(ids: &[NodeId], threshold: u64, retain: u64) -> Self {
+        Self::start_full_with(ids, ReadMode::Linearizable, Limits::default(), threshold, retain)
+    }
+
     fn start_full(ids: &[NodeId], read_mode: ReadMode, limits: Limits) -> Self {
+        Self::start_full_with(ids, read_mode, limits, 0, 0)
+    }
+
+    fn start_full_with(
+        ids: &[NodeId],
+        read_mode: ReadMode,
+        limits: Limits,
+        snapshot_threshold: u64,
+        snapshot_retain: u64,
+    ) -> Self {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         let base_dir = std::env::temp_dir().join(format!("quorum-itest-{nanos}-{n}"));
@@ -126,6 +146,8 @@ impl TestCluster {
             ids: ids.to_vec(),
             joiners: HashSet::new(),
             catch_up_timeout: DEFAULT_CATCH_UP_TIMEOUT,
+            snapshot_threshold,
+            snapshot_retain,
             network: Arc::new(Network::default()),
             nodes: BTreeMap::new(),
             base_dir,
@@ -182,6 +204,8 @@ impl TestCluster {
             limits: self.limits,
             join: self.joiners.contains(&id),
             catch_up_timeout: self.catch_up_timeout,
+            snapshot_threshold: self.snapshot_threshold,
+            snapshot_retain: self.snapshot_retain,
         };
 
         // How this node dials a member it learns about from the log (a node that
@@ -199,6 +223,13 @@ impl TestCluster {
     }
 
     // ---- membership ---------------------------------------------------------
+
+    /// Makes nodes launched from now on snapshot every `threshold` applied entries,
+    /// keeping `retain` entries behind the snapshot.
+    pub fn set_snapshots(&mut self, threshold: u64, retain: u64) {
+        self.snapshot_threshold = threshold;
+        self.snapshot_retain = retain;
+    }
 
     /// How long a node being added gets to catch up before the leader abandons it.
     /// Applies to nodes launched (or restarted) afterwards.

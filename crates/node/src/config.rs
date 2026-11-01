@@ -15,6 +15,10 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(3000);
 /// single membership-change slot forever.
 pub const DEFAULT_CATCH_UP_TIMEOUT: Duration = Duration::from_millis(20_000);
 
+/// How many log entries are kept behind a snapshot, by default, so that a follower
+/// that is only slightly behind can still be sent entries rather than a snapshot.
+pub const DEFAULT_SNAPSHOT_RETAIN: u64 = 1000;
+
 /// How this node answers reads.
 ///
 /// `Linearizable` (the default) confirms with a majority that this node is still
@@ -80,6 +84,13 @@ pub struct NodeConfig {
     pub join: bool,
     /// How long a joining node gets to catch up before the leader abandons it.
     pub catch_up_timeout: Duration,
+    /// Take a snapshot once this many entries have been applied since the last one.
+    /// 0 turns snapshots, and with them log compaction, off. Off by default: a node
+    /// that falls behind the compacted part of a leader's log can only be caught up
+    /// by sending it a snapshot, which a later phase adds.
+    pub snapshot_threshold: u64,
+    /// How many entries to keep in the log behind the newest snapshot.
+    pub snapshot_retain: u64,
 }
 
 impl NodeConfig {
@@ -111,6 +122,9 @@ impl NodeConfig {
     ///                                     existing cluster, PEERS lists its members)
     ///   QUORUM_CATCH_UP_TIMEOUT_MS=20000 (optional; how long a joining node gets
     ///                                     to catch up with the leader)
+    ///   QUORUM_SNAPSHOT_THRESHOLD=0      (optional; snapshot after this many applied
+    ///                                     entries; 0 = never, the default)
+    ///   QUORUM_SNAPSHOT_RETAIN=1000      (optional; log entries kept behind a snapshot)
     pub fn from_env() -> anyhow::Result<Self> {
         let id: NodeId = std::env::var("QUORUM_NODE_ID")
             .map_err(|_| anyhow::anyhow!("QUORUM_NODE_ID not set"))?
@@ -139,6 +153,17 @@ impl NodeConfig {
         let catch_up_timeout =
             parse_catch_up_timeout(std::env::var("QUORUM_CATCH_UP_TIMEOUT_MS").ok().as_deref())?;
 
+        let snapshot_threshold = parse_count(
+            "QUORUM_SNAPSHOT_THRESHOLD",
+            std::env::var("QUORUM_SNAPSHOT_THRESHOLD").ok().as_deref(),
+            0,
+        )?;
+        let snapshot_retain = parse_count(
+            "QUORUM_SNAPSHOT_RETAIN",
+            std::env::var("QUORUM_SNAPSHOT_RETAIN").ok().as_deref(),
+            DEFAULT_SNAPSHOT_RETAIN,
+        )?;
+
         Ok(Self {
             id,
             listen_addr,
@@ -149,6 +174,8 @@ impl NodeConfig {
             limits,
             join,
             catch_up_timeout,
+            snapshot_threshold,
+            snapshot_retain,
         })
     }
 }
@@ -216,6 +243,18 @@ pub fn parse_join(raw: Option<&str>) -> anyhow::Result<bool> {
             "false" | "0" => Ok(false),
             _ => anyhow::bail!("QUORUM_JOIN must be true, false, 1 or 0, got {:?}", raw.unwrap_or("")),
         },
+    }
+}
+
+/// Parses a setting that is a whole number of entries (zero is allowed), falling
+/// back to `default` when unset. A typo is an error, not a silent default.
+pub fn parse_count(name: &str, raw: Option<&str>, default: u64) -> anyhow::Result<u64> {
+    match raw {
+        None => Ok(default),
+        Some(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{name} must be a whole number, got {raw:?}")),
     }
 }
 
@@ -362,6 +401,8 @@ mod tests {
             limits: Limits::default(),
             join,
             catch_up_timeout: DEFAULT_CATCH_UP_TIMEOUT,
+            snapshot_threshold: 0,
+            snapshot_retain: DEFAULT_SNAPSHOT_RETAIN,
         }
     }
 
@@ -376,5 +417,20 @@ mod tests {
         let members = config_with(true).base_membership();
         assert_eq!(members.ids().collect::<Vec<_>>(), vec![1, 2]);
         assert!(!members.contains(4), "it must not vote until the log says so");
+    }
+
+    #[test]
+    fn snapshots_are_off_unless_asked_for() {
+        assert_eq!(parse_count("X", None, 0).unwrap(), 0);
+        assert_eq!(parse_count("X", Some("500"), 0).unwrap(), 500);
+        assert_eq!(parse_count("X", Some(" 0 "), 7).unwrap(), 0, "zero is a real setting");
+        assert_eq!(parse_count("X", None, DEFAULT_SNAPSHOT_RETAIN).unwrap(), 1000);
+    }
+
+    #[test]
+    fn a_typo_in_a_snapshot_setting_names_the_setting() {
+        let error = parse_count("QUORUM_SNAPSHOT_THRESHOLD", Some("lots"), 0).unwrap_err();
+        assert!(error.to_string().contains("QUORUM_SNAPSHOT_THRESHOLD"), "{error}");
+        assert!(parse_count("X", Some("-3"), 0).is_err());
     }
 }

@@ -16,7 +16,7 @@ Repo: github.com/MuaazTasawar/quorum. Windows + PowerShell workflow. Rust worksp
 15 request lifecycle: 503/504 + outcome_unknown (ed57b76) | 16 pre-vote + check-quorum (2615889) + fix 5232505
 17 linearizable reads / ReadIndex (138eae5) | 18 backpressure + group commit + torn-WAL recovery (7a0af30)
 State at 7a0af30: 189 tests, 0 warnings (259 after Phase 19). HTTP: PUT/GET/DELETE /kv/{key}, GET /health, GET /ws.
-Settings: QUORUM_NODE_ID, LISTEN_ADDR, METRICS_ADDR, PEERS, STORAGE_DIR, REQUEST_TIMEOUT_MS, LOCAL_READS, CHANNEL_CAPACITY, MAX_BATCH.
+Settings: QUORUM_NODE_ID, LISTEN_ADDR, METRICS_ADDR, PEERS, STORAGE_DIR, REQUEST_TIMEOUT_MS, LOCAL_READS, CHANNEL_CAPACITY, MAX_BATCH, JOIN, CATCH_UP_TIMEOUT_MS, SNAPSHOT_THRESHOLD, SNAPSHOT_RETAIN.
 
 ## Phase 19 (done): membership changes
 Single-server changes through the log. Effective on APPEND, undone if truncated. One change in flight at a time. A new
@@ -50,9 +50,23 @@ Library + startup loading only. The node does NOT yet take snapshots or compact 
 Verification: raft-core 88, storage 58, node unit 120, integration incl. snapshot_test 2 (315 total), 0 warnings; 15 mutation checks
 all caught; full suite twice and snapshot_test five times stable.
 
+## Phase 21 (done): snapshot lifecycle
+Nodes now take snapshots and trim their logs, OFF BY DEFAULT (QUORUM_SNAPSHOT_THRESHOLD=0) until InstallSnapshot (Phase 22) exists.
+- QUORUM_SNAPSHOT_THRESHOLD=N: after N applied entries since the last snapshot, snapshot the state machine at last_applied
+  (membership_at(index), term_at(index)). QUORUM_SNAPSHOT_RETAIN=M (default 1000): keep M log entries behind the snapshot.
+- Taking a snapshot and trimming the log are separate steps (Persistence::save_snapshot_only / compact_log_through; trimming past
+  the snapshot is refused). A LEADER never trims past its slowest peer's match_index, learners included; followers only keep the
+  retain margin. After a restart the snapshot makes the margin redundant (log continues at snapshot+1).
+- A failed snapshot write is logged and retried after another threshold's worth of entries; it is never fatal (unlike log writes).
+- Adding a node when the leader's log is compacted (base_index > 0) is refused up front: 409 LogCompacted (needs Phase 22).
+- /health and /ws gain snapshot_index, log_base, snapshots_taken.
+Verification: raft-core 88, storage 60, node unit 133 + integration incl. snapshot_test 5 (333 total), 0 warnings; 9 mutation checks all
+caught; full suite twice and snapshot_test five times stable; real 3-process run (100 writes, files shrink to a snapshot + 1 WAL entry,
+kill -9 all, restart, 0 keys lost); 8 slow-fsync (80-200 ms) runs: 0 acknowledged writes lost, availability the same with
+snapshots on or off (leadership flaps either way at that disk speed: pre-existing).
+
 ## Remaining plan
-21 snapshot lifecycle (take snapshots, triggers, compact live; MUST NOT compact past a lagging follower until 22 lands, or ship together)
-22 InstallSnapshot (chunked) | 23 API + SDK hardening (binary-safe values, key validation, SDK handles 503/504/409)
+22 InstallSnapshot (chunked; then flip the snapshot default on, remove the LogCompacted refusal) | 23 API + SDK hardening (binary-safe values, key validation, SDK handles 503/504/409)
 24 observability (Prometheus /metrics, dashboard) | 25 security (TLS, auth, certgen) | 26 chaos CLI v2 + Docker volumes
 27 deterministic simulation + linearizability checker | then regenerate the README.
 
@@ -74,8 +88,9 @@ all caught; full suite twice and snapshot_test five times stable.
 - Persistence::open now errors on a log that does not start at 1 (or at snapshot+1) or has gaps; a damaged snapshot stops startup.
 - A removed node that was partitioned at removal time never learns it was removed (the leader stops sending once the removal
   commits); it is harmless (non-member votes are refused) but stays stale.
+- Shell checks of acknowledgements must require "applied":true: a not-leader redirect is HTTP 200 with is_leader:false, and a dead connection is an empty body.
 - Wire format changes (new RPC fields) need all nodes rebuilt together; WAL/command encodings only append variants.
 
 ## Known limitations (roadmap)
-Compaction primitives exist but the node never takes snapshots yet; no InstallSnapshot; WAL has no per-record checksums; no TLS/auth;
+Snapshots/compaction exist but are off by default; no InstallSnapshot, so a follower behind the leader's compacted log (or a new node after compaction) cannot catch up; a dead member pins the leader's log; the snapshot write runs inside the event loop (stalls it in proportion to state size + fsync); WAL has no per-record checksums; no TLS/auth;
 values are lossy UTF-8 over HTTP; chaos CLI is Windows and 3-node only; a new node is copied the whole log (no InstallSnapshot yet).
