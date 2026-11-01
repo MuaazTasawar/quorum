@@ -72,15 +72,26 @@ pub fn handle_append_entries(
         return (resp, effect);
     }
 
+    // Entries at or below our snapshot point are committed and already folded into
+    // the snapshot, so they cannot disagree with the leader and we no longer hold
+    // them to compare. Skip past them and continue from the snapshot point itself.
+    let base = log.base_index();
+    let (prev_log_index, prev_log_term, entries) = if req.prev_log_index < base {
+        let skip = ((base - req.prev_log_index) as usize).min(req.entries.len());
+        (base, log.base_term(), &req.entries[skip..])
+    } else {
+        (req.prev_log_index, req.prev_log_term, &req.entries[..])
+    };
+
     // Log-matching check: does our log agree with the leader on the entry
     // immediately preceding what it's sending? If not, reject so the leader
     // backs up next_index and retries with an earlier prev_log_index.
-    if !log.matches(req.prev_log_index, req.prev_log_term) {
+    if !log.matches(prev_log_index, prev_log_term) {
         // Conflict-index optimization (paper §5.3 / extended Raft): instead of
         // the leader decrementing next_index by 1 per rejected RPC (slow when
         // a follower is far behind), tell it the last index we actually have,
         // so it can jump back in one round-trip instead of many.
-        let conflict_index = log.last_index().min(req.prev_log_index.saturating_sub(1));
+        let conflict_index = log.last_index().min(prev_log_index.saturating_sub(1));
         let resp = AppendEntriesResponse {
             term: persistent.current_term,
             success: false,
@@ -98,7 +109,7 @@ pub fn handle_append_entries(
     // AppendEntries carrying an older, shorter batch must not be able to delete
     // entries we have already accepted.
     let mut first_new_offset: Option<usize> = None;
-    for (offset, entry) in req.entries.iter().enumerate() {
+    for (offset, entry) in entries.iter().enumerate() {
         match log.term_at(entry.index) {
             Some(existing_term) if existing_term == entry.term => continue,
             Some(_) => {
@@ -120,7 +131,7 @@ pub fn handle_append_entries(
     }
 
     if let Some(offset) = first_new_offset {
-        let new_entries = req.entries[offset..].to_vec();
+        let new_entries = entries[offset..].to_vec();
         let from_index = new_entries[0].index;
         log.truncate_and_append(from_index, new_entries.clone());
         effect.appended = new_entries;
@@ -716,5 +727,109 @@ mod tests {
         // Node 3 is far ahead in the map but no longer a member.
         let state = progress(&[(2, 0), (3, 5)]);
         assert_eq!(advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 2, 4]), 5), None);
+    }
+
+    // ---- a follower with a snapshot -----------------------------------------
+
+    /// A follower whose log was compacted through index 5 (term 1) and holds 6..=7.
+    fn follower_with_snapshot_at_five() -> (PersistentState, VolatileState, Log) {
+        let mut log = Log::new();
+        for i in 1..=7 {
+            log.append(1, format!("c{i}").into_bytes());
+        }
+        log.compact_through(5).unwrap();
+        let mut persistent = PersistentState::default();
+        persistent.current_term = 1;
+        let mut volatile = VolatileState::new();
+        volatile.commit_index = 5;
+        volatile.last_applied = 5;
+        (persistent, volatile, log)
+    }
+
+    #[test]
+    fn entries_inside_the_snapshot_are_skipped_not_compared_or_rejected() {
+        let (mut persistent, mut volatile, mut log) = follower_with_snapshot_at_five();
+        // The leader still thinks we are at index 2 and sends 3..=8.
+        let entries: Vec<LogEntry> =
+            (3..=8).map(|i| entry(1, i, &format!("c{i}"))).collect();
+        let (resp, effect) = handle_append_entries(
+            &mut persistent,
+            &mut volatile,
+            &mut log,
+            &request(1, 2, 1, entries, 8),
+        );
+        assert!(resp.success);
+        assert_eq!(resp.match_index, 8, "it now has everything the leader sent");
+        assert_eq!(
+            effect.appended.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![8],
+            "only the genuinely new entry is stored; 6 and 7 were already held"
+        );
+        assert_eq!((log.base_index(), log.last_index()), (5, 8));
+        assert_eq!(volatile.commit_index, 8);
+    }
+
+    #[test]
+    fn a_request_entirely_inside_the_snapshot_succeeds_and_changes_nothing() {
+        let (mut persistent, mut volatile, mut log) = follower_with_snapshot_at_five();
+        let entries: Vec<LogEntry> =
+            (2..=4).map(|i| entry(1, i, &format!("c{i}"))).collect();
+        let (resp, effect) = handle_append_entries(
+            &mut persistent,
+            &mut volatile,
+            &mut log,
+            &request(1, 1, 1, entries, 4),
+        );
+        assert!(resp.success);
+        assert_eq!(resp.match_index, 4);
+        assert!(effect.appended.is_empty());
+        assert_eq!(effect.truncated_from, None);
+        assert_eq!(log.last_index(), 7, "untouched");
+        assert_eq!(volatile.commit_index, 5, "never moves backwards");
+    }
+
+    #[test]
+    fn a_heartbeat_from_before_the_snapshot_point_is_accepted() {
+        let (mut persistent, mut volatile, mut log) = follower_with_snapshot_at_five();
+        let (resp, _) = handle_append_entries(
+            &mut persistent,
+            &mut volatile,
+            &mut log,
+            &request(1, 2, 1, vec![], 5),
+        );
+        assert!(resp.success);
+    }
+
+    #[test]
+    fn a_conflict_after_the_snapshot_still_truncates_only_the_suffix() {
+        let (mut persistent, mut volatile, mut log) = follower_with_snapshot_at_five();
+        volatile.commit_index = 5;
+        // The leader's entry 7 is from term 2: ours (term 1) conflicts.
+        let entries = vec![entry(1, 6, "c6"), entry(2, 7, "other")];
+        let (resp, effect) = handle_append_entries(
+            &mut persistent,
+            &mut volatile,
+            &mut log,
+            &request(2, 5, 1, entries, 5),
+        );
+        assert!(resp.success);
+        assert_eq!(effect.truncated_from, Some(7));
+        assert_eq!(log.base_index(), 5);
+        assert_eq!(log.get(7).unwrap().term, 2);
+        assert_eq!(log.get(6).unwrap().command, b"c6".to_vec());
+    }
+
+    #[test]
+    fn a_mismatch_at_the_snapshot_point_is_reported_not_trusted() {
+        let (mut persistent, mut volatile, mut log) = follower_with_snapshot_at_five();
+        // prev_log_index == base with the wrong term cannot be a committed entry.
+        let (resp, _) = handle_append_entries(
+            &mut persistent,
+            &mut volatile,
+            &mut log,
+            &request(1, 5, 9, vec![entry(1, 6, "c6")], 0),
+        );
+        assert!(!resp.success);
+        assert!(resp.conflict_index.is_some());
     }
 }

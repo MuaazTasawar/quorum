@@ -138,7 +138,8 @@ impl TestCluster {
         cluster
     }
 
-    fn node_dir(&self, id: NodeId) -> PathBuf {
+    /// Where node `id` keeps its storage (log, hard state, snapshot).
+    pub fn node_dir(&self, id: NodeId) -> PathBuf {
         self.base_dir.join(format!("node{id}"))
     }
 
@@ -150,11 +151,19 @@ impl TestCluster {
     /// Brings node `id` up over its storage directory, recovering whatever is
     /// already there. Used for both first start and restart.
     fn launch(&mut self, id: NodeId) {
+        let peers: Vec<NodeId> = self.ids.iter().copied().filter(|&p| p != id).collect();
+        self.launch_with_peers(id, &peers);
+    }
+
+    /// Like `launch`, but the node is told only about `peers`, as if its
+    /// `QUORUM_PEERS` were out of date. Whatever its log or snapshot says about the
+    /// real membership must win.
+    fn launch_with_peers(&mut self, id: NodeId, peers: &[NodeId]) {
         let (inbox_tx, inbox_rx) = mpsc::channel(self.limits.channel_capacity);
         self.network.register(id, inbox_tx);
 
         let mut peer_outboxes = HashMap::new();
-        for &peer in &self.ids {
+        for &peer in peers {
             if peer != id {
                 peer_outboxes.insert(
                     peer,
@@ -247,6 +256,12 @@ impl TestCluster {
     pub async fn restart(&mut self, id: NodeId) {
         assert!(!self.nodes.contains_key(&id), "node {id} is still running");
         self.launch(id);
+    }
+
+    /// Restarts a crashed node telling it only about `peers`.
+    pub async fn restart_with_peers(&mut self, id: NodeId, peers: &[NodeId]) {
+        assert!(!self.nodes.contains_key(&id), "node {id} is still running");
+        self.launch_with_peers(id, peers);
     }
 
     /// Cuts every link between `id` and every other node, in both directions.

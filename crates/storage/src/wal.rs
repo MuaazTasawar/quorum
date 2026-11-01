@@ -172,10 +172,21 @@ impl Wal {
     /// mid-rewrite leaves either the old file or the new one intact - never a
     /// half-written, corrupt WAL.
     pub fn truncate_from(&mut self, from_index: u64) -> Result<(), WalError> {
-        let kept: Vec<LogEntry> = Self::replay(&self.path)?
-            .into_iter()
-            .filter(|e| e.index < from_index)
-            .collect();
+        self.rewrite_keeping(|entry| entry.index < from_index)
+    }
+
+    /// Log compaction: durably discards every entry with index <= `index`, which a
+    /// snapshot has already captured. The caller MUST have made that snapshot
+    /// durable first; once this returns the entries exist nowhere on disk. The
+    /// file then starts at `index + 1` (or is empty). Safe to repeat, and safe to
+    /// crash in the middle of, for the same atomic-rename reason as `truncate_from`.
+    pub fn compact_through(&mut self, index: u64) -> Result<(), WalError> {
+        self.rewrite_keeping(|entry| entry.index > index)
+    }
+
+    fn rewrite_keeping(&mut self, keep: impl Fn(&LogEntry) -> bool) -> Result<(), WalError> {
+        let kept: Vec<LogEntry> =
+            Self::replay(&self.path)?.into_iter().filter(|e| keep(e)).collect();
 
         let tmp_path = self.path.with_extension("wal.tmp");
         {
@@ -413,5 +424,79 @@ mod tests {
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[1].index, 2);
         assert_eq!(wal.sync_count(), 2, "one for the batch, one for the rewritten file");
+    }
+
+    // ---- compaction ---------------------------------------------------------
+
+    #[test]
+    fn compaction_drops_the_prefix_and_keeps_the_rest_in_order() {
+        let dir = TestDir::new();
+        let mut wal = Wal::open(dir.wal()).unwrap();
+        wal.append_batch(&entries(10)).unwrap();
+        wal.compact_through(6).unwrap();
+
+        let replayed = Wal::replay(dir.wal()).unwrap();
+        assert_eq!(replayed.iter().map(|e| e.index).collect::<Vec<_>>(), vec![7, 8, 9, 10]);
+        assert_eq!(replayed[0].command, b"cmd-7".to_vec());
+    }
+
+    #[test]
+    fn compacting_everything_leaves_an_empty_file_that_can_be_appended_to() {
+        let dir = TestDir::new();
+        let mut wal = Wal::open(dir.wal()).unwrap();
+        wal.append_batch(&entries(4)).unwrap();
+        wal.compact_through(4).unwrap();
+        assert!(Wal::replay(dir.wal()).unwrap().is_empty());
+
+        wal.append(&entry(2, 5, "after")).unwrap();
+        let replayed = Wal::replay(dir.wal()).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].index, 5);
+    }
+
+    #[test]
+    fn compaction_survives_a_reopen_and_costs_one_sync() {
+        let dir = TestDir::new();
+        let mut wal = Wal::open(dir.wal()).unwrap();
+        wal.append_batch(&entries(5)).unwrap();
+        let before = wal.sync_count();
+        wal.compact_through(3).unwrap();
+        assert_eq!(wal.sync_count(), before + 1);
+        drop(wal);
+
+        let recovery = Wal::recover(dir.wal()).unwrap();
+        assert_eq!(recovery.entries.iter().map(|e| e.index).collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(recovery.discarded_bytes, 0);
+    }
+
+    #[test]
+    fn compacting_twice_or_less_than_before_changes_nothing_more() {
+        let dir = TestDir::new();
+        let mut wal = Wal::open(dir.wal()).unwrap();
+        wal.append_batch(&entries(6)).unwrap();
+        wal.compact_through(4).unwrap();
+        wal.compact_through(4).unwrap();
+        wal.compact_through(2).unwrap();
+        assert_eq!(Wal::replay(dir.wal()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn truncation_still_works_on_a_compacted_log() {
+        let dir = TestDir::new();
+        let mut wal = Wal::open(dir.wal()).unwrap();
+        wal.append_batch(&entries(8)).unwrap();
+        wal.compact_through(3).unwrap();
+        wal.truncate_from(6).unwrap();
+        let replayed = Wal::replay(dir.wal()).unwrap();
+        assert_eq!(replayed.iter().map(|e| e.index).collect::<Vec<_>>(), vec![4, 5]);
+    }
+
+    #[test]
+    fn no_temp_file_is_left_behind_by_compaction() {
+        let dir = TestDir::new();
+        let mut wal = Wal::open(dir.wal()).unwrap();
+        wal.append_batch(&entries(3)).unwrap();
+        wal.compact_through(2).unwrap();
+        assert!(!dir.wal().with_extension("wal.tmp").exists());
     }
 }

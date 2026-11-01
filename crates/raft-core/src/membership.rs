@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 /// nodes this process happens to know about". A learner that is still catching up
 /// is deliberately not in it: it receives the log but its acknowledgements count
 /// for nothing, so a new node that is slow or broken cannot stall the cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Membership {
     members: BTreeMap<NodeId, String>,
 }
@@ -144,6 +144,26 @@ impl ConfigHistory {
         membership
     }
 
+    /// The membership as it stood once the log entry at `index` had been appended:
+    /// the base with every recorded change up to and including `index`. This is what a
+    /// snapshot taken at `index` must carry, because the entries that produced it are
+    /// about to be discarded.
+    pub fn membership_at(&self, index: u64) -> Membership {
+        let mut membership = self.base.clone();
+        for (_, change) in self.changes.iter().filter(|(i, _)| *i <= index) {
+            membership.apply(change);
+        }
+        membership
+    }
+
+    /// Folds every change up to `index` into the base and forgets those entries,
+    /// mirroring a log compaction. From here the base is no longer the bootstrap
+    /// configuration from the environment but whatever the snapshot recorded.
+    pub fn compact_through(&mut self, index: u64) {
+        self.base = self.membership_at(index);
+        self.changes.retain(|(i, _)| *i > index);
+    }
+
     /// Index of the newest configuration entry in the log, if there is one.
     pub fn last_change_index(&self) -> Option<u64> {
         self.changes.last().map(|(index, _)| *index)
@@ -267,6 +287,31 @@ mod tests {
         let mut history = ConfigHistory::new(Membership::of_ids([1, 2, 3]));
         history.record(5, add(4));
         history.truncate_from(6);
+        assert_eq!(ids(&history.current()), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn membership_at_replays_only_the_changes_up_to_that_index() {
+        let mut history = ConfigHistory::new(Membership::of_ids([1, 2, 3]));
+        history.record(5, add(4));
+        history.record(9, remove(1));
+        assert_eq!(ids(&history.membership_at(4)), vec![1, 2, 3]);
+        assert_eq!(ids(&history.membership_at(5)), vec![1, 2, 3, 4]);
+        assert_eq!(ids(&history.membership_at(8)), vec![1, 2, 3, 4]);
+        assert_eq!(ids(&history.membership_at(9)), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn compacting_folds_the_old_changes_into_the_base() {
+        let mut history = ConfigHistory::new(Membership::of_ids([1, 2, 3]));
+        history.record(5, add(4));
+        history.record(9, remove(1));
+        history.compact_through(5);
+        assert_eq!(history.len(), 1, "only the change after the snapshot remains");
+        assert_eq!(ids(&history.current()), vec![2, 3, 4], "the answer does not change");
+        assert_eq!(ids(&history.membership_at(5)), vec![1, 2, 3, 4]);
+        // A truncation of the surviving entry now reverts to the SNAPSHOT's membership.
+        history.truncate_from(9);
         assert_eq!(ids(&history.current()), vec![1, 2, 3, 4]);
     }
 }

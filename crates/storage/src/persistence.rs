@@ -1,4 +1,8 @@
 use crate::hard_state::{load_hard_state, save_hard_state, HardStateError};
+use crate::kv_store::KvStore;
+use crate::snapshot::{
+    load_snapshot, save_snapshot, SnapshotError, SnapshotMetadata, SNAPSHOT_FILE,
+};
 use crate::wal::{Wal, WalError, WalRecovery};
 use raft_core::{LogEntry, NodeId, PersistentState, Term};
 use std::path::{Path, PathBuf};
@@ -13,8 +17,24 @@ pub enum PersistenceError {
     Wal(#[from] WalError),
     #[error(transparent)]
     HardState(#[from] HardStateError),
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The log on disk is missing entries: it should continue at `expected` but
+    /// continues at `found`. Carrying on would silently skip committed history.
+    #[error("the log on disk has a gap: expected entry {expected}, found {found}")]
+    LogGap { expected: u64, found: u64 },
+    /// A snapshot older than the one already on disk. Taking it would move the node
+    /// backwards and could resurrect entries already discarded.
+    #[error("refusing a snapshot at index {requested}: one at index {current} is already stored")]
+    StaleSnapshot { requested: u64, current: u64 },
+}
+
+/// A snapshot found on disk at startup.
+pub struct RecoveredSnapshot {
+    pub metadata: SnapshotMetadata,
+    pub state: KvStore,
 }
 
 /// Everything a node needs to resume after a restart: the open storage handle
@@ -22,6 +42,9 @@ pub enum PersistenceError {
 pub struct Recovered {
     pub persistence: Persistence,
     pub hard_state: PersistentState,
+    /// The snapshot the node starts from, if it has one. `entries` then holds only
+    /// the entries AFTER it (index > `last_included_index`).
+    pub snapshot: Option<RecoveredSnapshot>,
     pub entries: Vec<LogEntry>,
     /// Bytes of an unfinished write cut off the end of the WAL during recovery.
     /// Non-zero means the previous run died mid-append; nothing that write held
@@ -39,21 +62,50 @@ pub struct Persistence {
     dir: PathBuf,
     wal: Wal,
     hard_state_path: PathBuf,
+    snapshot_path: PathBuf,
+    /// Index the on-disk snapshot reaches (0 if there is none).
+    snapshot_base: u64,
     /// What is currently on disk, so unchanged state never costs an fsync.
     last_saved: (Term, Option<NodeId>),
 }
 
 impl Persistence {
     /// Opens (creating if needed) the storage directory and recovers its contents.
+    ///
+    /// Recovery order: the snapshot first (it is the oldest state), then the WAL on
+    /// top of it. WAL entries the snapshot already covers are dropped, and if there
+    /// were any the WAL file is rewritten without them: that finishes a compaction
+    /// the previous run was interrupted in (snapshot saved, WAL not yet trimmed).
+    /// The entries that remain must continue exactly where the snapshot ends.
     pub fn open(dir: impl AsRef<Path>) -> Result<Recovered, PersistenceError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
         let wal_path = dir.join(WAL_FILE);
         let hard_state_path = dir.join(HARD_STATE_FILE);
+        let snapshot_path = dir.join(SNAPSHOT_FILE);
 
-        let WalRecovery { entries, discarded_bytes } = Wal::recover(&wal_path)?;
-        let wal = Wal::open(&wal_path)?;
+        let snapshot = load_snapshot(&snapshot_path)?
+            .map(|(metadata, state)| RecoveredSnapshot { metadata, state });
+        let (base_index, base_term) = snapshot
+            .as_ref()
+            .map_or((0, 0), |s| (s.metadata.last_included_index, s.metadata.last_included_term));
+
+        let WalRecovery { mut entries, discarded_bytes } = Wal::recover(&wal_path)?;
+        let mut wal = Wal::open(&wal_path)?;
+        let before = entries.len();
+        entries.retain(|e| e.index > base_index);
+        if entries.len() != before {
+            wal.compact_through(base_index)?;
+        }
+        let mut expected = base_index + 1;
+        for entry in &entries {
+            if entry.index != expected {
+                return Err(PersistenceError::LogGap { expected, found: entry.index });
+            }
+            expected += 1;
+        }
+
         let mut hard_state = load_hard_state(&hard_state_path)?;
         let last_saved = (hard_state.current_term, hard_state.voted_for);
 
@@ -63,19 +115,58 @@ impl Persistence {
         // Raise the term to match so the node never operates below its own log.
         // (The vote for that term is unknowable, so it is cleared; this only
         // matters for that one-time upgrade. The corrected state is written on
-        // the node's next save, since it differs from `last_saved`.)
-        let log_term = entries.last().map(|e| e.term).unwrap_or(0);
+        // the node's next save, since it differs from `last_saved`.) The same holds
+        // for the last entry a snapshot covers.
+        let log_term = entries.last().map(|e| e.term).unwrap_or(base_term);
         if log_term > hard_state.current_term {
             hard_state.current_term = log_term;
             hard_state.voted_for = None;
         }
 
         Ok(Recovered {
-            persistence: Persistence { dir, wal, hard_state_path, last_saved },
+            persistence: Persistence {
+                dir,
+                wal,
+                hard_state_path,
+                snapshot_path,
+                snapshot_base: base_index,
+                last_saved,
+            },
             hard_state,
+            snapshot,
             entries,
             discarded_wal_bytes: discarded_bytes,
         })
+    }
+
+    /// Makes a snapshot durable, THEN discards the log entries it covers.
+    ///
+    /// The order is the whole point. If the process dies after the snapshot is
+    /// saved but before the WAL is trimmed, the next start finds redundant entries
+    /// and drops them (see `open`); nothing is lost. Trimming first would, on a
+    /// crash in between, lose entries that exist nowhere else. A snapshot older
+    /// than the one already stored is refused.
+    pub fn save_snapshot_and_compact(
+        &mut self,
+        metadata: SnapshotMetadata,
+        state: &KvStore,
+    ) -> Result<(), PersistenceError> {
+        let index = metadata.last_included_index;
+        if index < self.snapshot_base {
+            return Err(PersistenceError::StaleSnapshot {
+                requested: index,
+                current: self.snapshot_base,
+            });
+        }
+        save_snapshot(&self.snapshot_path, metadata, state)?;
+        self.wal.compact_through(index)?;
+        self.snapshot_base = index;
+        Ok(())
+    }
+
+    /// Index the snapshot on disk reaches (0 if there is none).
+    pub fn snapshot_base(&self) -> u64 {
+        self.snapshot_base
     }
 
     /// Appends one log entry and fsyncs it before returning.
@@ -278,5 +369,180 @@ mod tests {
         p.append(&entry(1, 3, "c")).unwrap();
         drop(p);
         assert_eq!(Persistence::open(&dir.0).unwrap().entries.len(), 3);
+    }
+
+    // ---- snapshots and compaction -------------------------------------------
+
+    use crate::kv_store::Command;
+    use raft_core::Membership;
+
+    fn meta(index: u64, term: Term) -> SnapshotMetadata {
+        SnapshotMetadata {
+            last_included_index: index,
+            last_included_term: term,
+            membership: Membership::new([(1, String::new()), (2, "node2:7000".to_string())]),
+        }
+    }
+
+    fn store_with(key: &str, value: &str) -> KvStore {
+        let mut store = KvStore::new();
+        store.apply(&Command::Put { key: key.into(), value: value.as_bytes().to_vec() });
+        store
+    }
+
+    fn indices(recovered: &Recovered) -> Vec<u64> {
+        recovered.entries.iter().map(|e| e.index).collect()
+    }
+
+    #[test]
+    fn a_node_with_no_snapshot_recovers_none() {
+        let dir = TestDir::new();
+        assert!(Persistence::open(&dir.0).unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn saving_a_snapshot_compacts_the_log_and_recovery_starts_from_it() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            for i in 1..=8 {
+                p.append(&entry(2, i, &format!("c{i}"))).unwrap();
+            }
+            p.save_snapshot_and_compact(meta(5, 2), &store_with("k", "v5")).unwrap();
+            assert_eq!(p.snapshot_base(), 5);
+        }
+        let recovered = Persistence::open(&dir.0).unwrap();
+        let snapshot = recovered.snapshot.as_ref().expect("snapshot recovered");
+        assert_eq!(snapshot.metadata.last_included_index, 5);
+        assert_eq!(snapshot.state.get("k"), Some(&b"v5".to_vec()));
+        assert_eq!(indices(&recovered), vec![6, 7, 8], "only what the snapshot does not cover");
+        assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 3, "and the file shrank");
+    }
+
+    #[test]
+    fn new_entries_continue_after_a_compacted_log() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            p.append_batch(&(1..=4).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+            p.save_snapshot_and_compact(meta(4, 1), &KvStore::new()).unwrap();
+            p.append(&entry(1, 5, "y")).unwrap();
+        }
+        assert_eq!(indices(&Persistence::open(&dir.0).unwrap()), vec![5]);
+    }
+
+    #[test]
+    fn a_crash_between_saving_the_snapshot_and_trimming_the_log_loses_nothing() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            for i in 1..=6 {
+                p.append(&entry(1, i, "x")).unwrap();
+            }
+        }
+        // The snapshot reached the disk; the process died before the WAL was trimmed.
+        save_snapshot(dir.0.join(SNAPSHOT_FILE), meta(4, 1), &store_with("a", "b")).unwrap();
+        assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 6);
+
+        let recovered = Persistence::open(&dir.0).unwrap();
+        assert_eq!(indices(&recovered), vec![5, 6], "redundant entries are dropped");
+        assert!(recovered.snapshot.is_some());
+        assert_eq!(
+            Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(),
+            2,
+            "and the interrupted compaction is finished on disk"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_ahead_of_the_whole_log_leaves_an_empty_log() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            p.append(&entry(1, 1, "x")).unwrap();
+        }
+        save_snapshot(dir.0.join(SNAPSHOT_FILE), meta(10, 3), &KvStore::new()).unwrap();
+        let recovered = Persistence::open(&dir.0).unwrap();
+        assert!(recovered.entries.is_empty());
+        assert_eq!(recovered.snapshot.unwrap().metadata.last_included_index, 10);
+    }
+
+    #[test]
+    fn a_log_that_does_not_continue_from_the_snapshot_is_refused() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            p.append(&entry(1, 8, "x")).unwrap(); // 6 and 7 are missing
+        }
+        save_snapshot(dir.0.join(SNAPSHOT_FILE), meta(5, 1), &KvStore::new()).unwrap();
+        match Persistence::open(&dir.0) {
+            Err(PersistenceError::LogGap { expected: 6, found: 8 }) => {}
+            other => panic!("expected a gap error, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn a_log_that_does_not_start_at_one_without_a_snapshot_is_refused() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            p.append(&entry(1, 3, "x")).unwrap();
+        }
+        assert!(matches!(
+            Persistence::open(&dir.0),
+            Err(PersistenceError::LogGap { expected: 1, found: 3 })
+        ));
+    }
+
+    #[test]
+    fn a_damaged_snapshot_stops_startup_instead_of_starting_empty() {
+        let dir = TestDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        save_snapshot(dir.0.join(SNAPSHOT_FILE), meta(4, 1), &store_with("a", "b")).unwrap();
+        let path = dir.0.join(SNAPSHOT_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            Persistence::open(&dir.0),
+            Err(PersistenceError::Snapshot(SnapshotError::ChecksumMismatch))
+        ));
+    }
+
+    #[test]
+    fn an_older_snapshot_than_the_stored_one_is_refused_and_changes_nothing() {
+        let dir = TestDir::new();
+        let mut p = Persistence::open(&dir.0).unwrap().persistence;
+        p.append_batch(&(1..=6).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+        p.save_snapshot_and_compact(meta(5, 1), &store_with("new", "1")).unwrap();
+        let error = p.save_snapshot_and_compact(meta(3, 1), &store_with("old", "1")).unwrap_err();
+        assert!(matches!(error, PersistenceError::StaleSnapshot { requested: 3, current: 5 }));
+        assert_eq!(p.snapshot_base(), 5);
+        let (stored, state) = load_snapshot(dir.0.join(SNAPSHOT_FILE)).unwrap().unwrap();
+        assert_eq!(stored.last_included_index, 5);
+        assert!(state.get("new").is_some());
+    }
+
+    #[test]
+    fn the_term_is_raised_to_the_snapshots_when_the_log_after_it_is_empty() {
+        let dir = TestDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        save_snapshot(dir.0.join(SNAPSHOT_FILE), meta(9, 7), &KvStore::new()).unwrap();
+        let recovered = Persistence::open(&dir.0).unwrap();
+        assert_eq!(recovered.hard_state.current_term, 7);
+        assert_eq!(recovered.hard_state.voted_for, None);
+    }
+
+    #[test]
+    fn truncating_the_log_after_a_snapshot_still_works_across_a_reopen() {
+        let dir = TestDir::new();
+        {
+            let mut p = Persistence::open(&dir.0).unwrap().persistence;
+            p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+            p.save_snapshot_and_compact(meta(3, 1), &KvStore::new()).unwrap();
+            p.truncate_from(6).unwrap();
+        }
+        assert_eq!(indices(&Persistence::open(&dir.0).unwrap()), vec![4, 5]);
     }
 }

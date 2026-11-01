@@ -6,10 +6,10 @@ use raft_core::{
     RpcMessage, Term, VoteTally, VolatileState,
 };
 use std::collections::{BTreeMap, HashMap};
-use storage::{Command, KvStore, Persistence, Recovered};
+use storage::{Command, KvStore, Persistence, Recovered, RecoveredSnapshot};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{NodeConfig, ReadMode};
 
@@ -302,16 +302,34 @@ impl Cluster {
         inbox_rx: mpsc::Receiver<(NodeId, RpcMessage)>,
         connector: PeerConnector,
     ) -> (Self, ClusterHandle) {
-        let Recovered { persistence, hard_state: persistent, entries, .. } = recovered;
-        let mut history = ConfigHistory::new(config.base_membership());
+        let Recovered { persistence, hard_state: persistent, snapshot, entries, .. } = recovered;
+
+        // A node that has a snapshot starts from it: the state machine as it was,
+        // the log's starting point, and the membership at that point. The latter
+        // replaces the bootstrap membership from the environment, because the log
+        // entries that produced it are gone. Only the entries AFTER the snapshot
+        // are replayed on top.
+        let (base_index, base_term, kv_store, base_membership) = match snapshot {
+            Some(RecoveredSnapshot { metadata, state }) => (
+                metadata.last_included_index,
+                metadata.last_included_term,
+                state,
+                metadata.membership,
+            ),
+            None => (0, 0, KvStore::new(), config.base_membership()),
+        };
+        let mut history = ConfigHistory::new(base_membership);
         for entry in &entries {
             if let Some(change) = config_change_of(&entry.command) {
                 history.record(entry.index, change);
             }
         }
         let membership = history.current();
-        let log = Log::from_entries(entries);
-        let kv_store = KvStore::new();
+        let log = Log::from_parts(base_index, base_term, entries);
+        let mut volatile = VolatileState::new();
+        // Everything a snapshot covers was committed and applied before it was taken.
+        volatile.commit_index = base_index;
+        volatile.last_applied = base_index;
         let capacity = config.limits.channel_capacity;
         let (command_tx, command_rx) = mpsc::channel(capacity);
         let (query_tx, query_rx) = mpsc::channel(capacity);
@@ -323,8 +341,8 @@ impl Cluster {
             node_id: config.id,
             role: "Follower".to_string(),
             current_term: persistent.current_term,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: base_index,
+            last_applied: base_index,
             log_len: log.last_index(),
             leader_hint: None,
             wal_syncs: persistence.wal_sync_count(),
@@ -336,7 +354,7 @@ impl Cluster {
         let mut cluster = Self {
             config,
             persistent,
-            volatile: VolatileState::new(),
+            volatile,
             leader_state: LeaderState::default(),
             vote_tally: None,
             pre_vote: None,
@@ -864,6 +882,19 @@ impl Cluster {
         let peer_ids: Vec<NodeId> = self.peer_outboxes.keys().copied().collect();
         for peer_id in peer_ids {
             let next_index = *self.leader_state.next_index.get(&peer_id).unwrap_or(&1);
+            // A follower that is further behind than the start of this node's log
+            // needs the snapshot, not entries this node no longer has. Sending the
+            // remainder with a gap before it would only be rejected, so send nothing.
+            // (Sending the snapshot itself is InstallSnapshot, a later phase.)
+            if !self.log.can_send_after(next_index.saturating_sub(1)) {
+                debug!(
+                    peer_id,
+                    next_index,
+                    log_starts_at = self.log.first_index(),
+                    "peer needs entries that have been compacted away - cannot replicate to it yet"
+                );
+                continue;
+            }
             let req = build_append_entries(
                 &self.persistent,
                 &self.log,
@@ -1495,6 +1526,23 @@ mod tests {
             leader_commit: 0,
             seq: 0,
         })
+    }
+
+    /// Like `append_request`, but the leader also reports how far it has committed.
+    fn append_request_committing(
+        term: Term,
+        leader_id: NodeId,
+        prev_log_index: u64,
+        prev_log_term: Term,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
+    ) -> RpcMessage {
+        match append_request(term, leader_id, prev_log_index, prev_log_term, entries) {
+            RpcMessage::AppendEntries(req) => {
+                RpcMessage::AppendEntries(AppendEntriesRequest { leader_commit, ..req })
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn vote_request(term: Term, candidate_id: NodeId) -> RpcMessage {
@@ -3337,5 +3385,202 @@ mod tests {
         let snapshot = snapshots.borrow().clone();
         assert_eq!(snapshot.members, vec![1, 2, 3]);
         assert_eq!(snapshot.learners, vec![4]);
+    }
+
+    // ---- starting from a snapshot ---------------------------------------------
+
+    /// Writes a storage directory as a node leaves it after compaction: entries
+    /// 1..=`last_index` (each `Put k{i} = v{i}` in term 1), a snapshot of the state
+    /// through `base_index` carrying `membership`, and the log trimmed to match.
+    fn write_snapshot_fixture(dir: &Path, base_index: u64, last_index: u64, membership: Membership) {
+        let mut persistence = Persistence::open(dir).unwrap().persistence;
+        let mut state = KvStore::new();
+        for i in 1..=last_index {
+            let command = Command::Put { key: format!("k{i}"), value: format!("v{i}").into_bytes() };
+            persistence
+                .append(&LogEntry { term: 1, index: i, command: command.encode().unwrap() })
+                .unwrap();
+            if i <= base_index {
+                state.apply(&command);
+            }
+        }
+        persistence
+            .save_snapshot_and_compact(
+                storage::SnapshotMetadata {
+                    last_included_index: base_index,
+                    last_included_term: 1,
+                    membership,
+                },
+                &state,
+            )
+            .unwrap();
+    }
+
+    fn value_of(cluster: &Cluster, key: &str) -> Option<Vec<u8>> {
+        cluster.kv_store.get(key).cloned()
+    }
+
+    #[test]
+    fn a_node_starts_from_its_snapshot_and_replays_only_what_follows_it() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+
+        assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 7));
+        assert_eq!(cluster.log.len(), 2, "only the two entries after the snapshot are held");
+        assert_eq!((cluster.volatile.commit_index, cluster.volatile.last_applied), (5, 5));
+        assert_eq!(value_of(&cluster, "k5"), Some(b"v5".to_vec()), "state came from the snapshot");
+        assert_eq!(value_of(&cluster, "k1"), Some(b"v1".to_vec()));
+        assert_eq!(value_of(&cluster, "k6"), None, "entries after it are not committed yet");
+
+        // Once a leader says they are committed they are applied on top.
+        cluster.handle_rpc(2, append_request_committing(1, 2, 7, 1, vec![], 7));
+        settle(&mut cluster);
+        assert_eq!(value_of(&cluster, "k6"), Some(b"v6".to_vec()));
+        assert_eq!(value_of(&cluster, "k7"), Some(b"v7".to_vec()));
+        assert_eq!(cluster.volatile.last_applied, 7);
+    }
+
+    #[test]
+    fn the_snapshots_published_position_starts_at_its_index() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 5, Membership::of_ids([1, 2, 3]));
+        let (cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let snapshots = cluster.snapshot_tx.subscribe();
+        cluster.publish_snapshot();
+        let snapshot = snapshots.borrow().clone();
+        assert_eq!((snapshot.commit_index, snapshot.last_applied, snapshot.log_len), (5, 5, 5));
+    }
+
+    #[test]
+    fn the_snapshots_membership_replaces_the_one_from_the_environment() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(
+            dir.path(),
+            4,
+            4,
+            Membership::new([
+                (1, String::new()),
+                (2, String::new()),
+                (4, "node4:7000".to_string()),
+            ]),
+        );
+        // The environment still says {1,2,3}: node 3 was removed and 4 added since.
+        let (cluster, _outputs, connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        assert_eq!(members(&cluster), vec![1, 2, 4]);
+        assert!(connections.lock().unwrap().contains_key(&4), "dials the member it learned of");
+        assert!(!cluster.peer_outboxes.contains_key(&3), "and drops the one that was removed");
+    }
+
+    #[test]
+    fn configuration_entries_after_the_snapshot_build_on_the_snapshots_membership() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 3, 3, Membership::of_ids([1, 2, 3]));
+        {
+            let mut persistence = Persistence::open(dir.path()).unwrap().persistence;
+            persistence
+                .append(&LogEntry {
+                    term: 1,
+                    index: 4,
+                    command: Command::AddNode { id: 4, addr: "node4:7000".into() }
+                        .encode()
+                        .unwrap(),
+                })
+                .unwrap();
+        }
+        let (cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        assert_eq!(members(&cluster), vec![1, 2, 3, 4]);
+        assert_eq!(cluster.history.len(), 1, "only the entry after the snapshot is tracked");
+    }
+
+    #[test]
+    fn a_node_with_no_snapshot_still_takes_its_membership_from_the_environment() {
+        let dir = TestDir::new();
+        let (cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        assert_eq!(members(&cluster), vec![1, 2, 3]);
+        assert_eq!(cluster.log.base_index(), 0);
+    }
+
+    #[test]
+    fn a_follower_with_a_snapshot_accepts_entries_that_overlap_it() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+
+        // The leader believes this node is only at index 2 and resends 3..=9.
+        let entries: Vec<LogEntry> = (3..=9)
+            .map(|i| {
+                let command = Command::Put { key: format!("k{i}"), value: format!("v{i}").into_bytes() };
+                LogEntry { term: 1, index: i, command: command.encode().unwrap() }
+            })
+            .collect();
+        cluster.handle_rpc(2, append_request_committing(1, 2, 2, 1, entries, 9));
+        settle(&mut cluster);
+
+        match drain(&mut outputs, 2).pop() {
+            Some(RpcMessage::AppendEntriesResponse(resp)) => {
+                assert!(resp.success);
+                assert_eq!(resp.match_index, 9);
+            }
+            other => panic!("expected an append response, got {other:?}"),
+        }
+        assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 9));
+        assert_eq!(value_of(&cluster, "k9"), Some(b"v9".to_vec()));
+        drop(cluster);
+        // What reached the disk continues straight after the snapshot, with no
+        // duplicates of 6 and 7 and nothing from before the snapshot.
+        let recovered = Persistence::open(dir.path()).unwrap();
+        assert_eq!(
+            recovered.entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![6, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn a_leader_does_not_try_to_replicate_entries_it_has_compacted_away() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 2;
+        cluster.become_leader(); // no-op at index 8; both peers start at next_index 9
+        drain(&mut outputs, 2);
+        drain(&mut outputs, 3);
+
+        // Node 3 turns out to be far behind: it needs entry 4, which is gone.
+        cluster.leader_state.next_index.insert(3, 4);
+        cluster.broadcast_append_entries();
+
+        assert!(
+            !drain(&mut outputs, 2).is_empty(),
+            "the caught-up peer is still sent its entries"
+        );
+        assert!(
+            drain(&mut outputs, 3).is_empty(),
+            "nothing is sent that would have a gap before it"
+        );
+
+        // A peer that is exactly at the snapshot point can still be served: it
+        // needs entry 6 onward, which is held.
+        cluster.leader_state.next_index.insert(3, 6);
+        cluster.broadcast_append_entries();
+        assert!(!drain(&mut outputs, 3).is_empty());
+    }
+
+    #[test]
+    fn a_leader_with_a_snapshot_commits_and_applies_new_writes() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 5, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 2;
+        cluster.become_leader(); // no-op at index 6
+        ack(&mut cluster, 2, 6);
+        assert_eq!(cluster.volatile.commit_index, 6);
+
+        let (put, mut rx) = put_command_with_receiver("new", "value");
+        cluster.handle_client_command(put); // index 7
+        ack(&mut cluster, 2, 7);
+        assert!(matches!(rx.try_recv(), Ok(ClientCommandResult::Applied(_))));
+        assert_eq!(value_of(&cluster, "new"), Some(b"value".to_vec()));
+        assert_eq!(value_of(&cluster, "k3"), Some(b"v3".to_vec()), "snapshot state is intact");
     }
 }

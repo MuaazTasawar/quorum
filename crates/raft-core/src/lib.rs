@@ -8,7 +8,7 @@ pub mod state;
 pub use election::{
     handle_pre_vote, handle_request_vote, start_election, ElectionTimeoutConfig, VoteTally,
 };
-pub use log::{Log, LogEntry};
+pub use log::{BeyondLog, Log, LogEntry, SnapshotInstall};
 pub use membership::{ConfigChange, ConfigHistory, Membership};
 pub use messages::{
     AppendEntriesRequest, AppendEntriesResponse, PreVoteRequest, PreVoteResponse,
