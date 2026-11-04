@@ -70,7 +70,6 @@ impl AppError {
                 | AdminRejection::AlreadyMember
                 | AdminRejection::NotMember
                 | AdminRejection::LastMember
-                | AdminRejection::LogCompacted
                 | AdminRejection::CatchUpFailed => StatusCode::CONFLICT,
             },
         }
@@ -175,7 +174,6 @@ mod tests {
             AdminRejection::AlreadyMember,
             AdminRejection::NotMember,
             AdminRejection::LastMember,
-            AdminRejection::LogCompacted,
             AdminRejection::CatchUpFailed,
         ] {
             let (status, body) = render(AppError::MembershipRejected(reason)).await;

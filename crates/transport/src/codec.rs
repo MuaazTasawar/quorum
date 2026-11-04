@@ -64,6 +64,91 @@ mod tests {
     use std::io::Cursor;
 
     #[tokio::test]
+    async fn a_snapshot_chunk_and_its_answer_round_trip_through_the_codec() {
+        use raft_core::{InstallSnapshotRequest, InstallSnapshotResponse};
+        let data: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+        let request = RpcMessage::InstallSnapshot(InstallSnapshotRequest {
+            term: 4,
+            leader_id: 2,
+            last_included_index: 900,
+            last_included_term: 3,
+            offset: 65_536,
+            total_len: 165_536,
+            data: data.clone(),
+            done: false,
+            seq: 12,
+        });
+        let response = RpcMessage::InstallSnapshotResponse(InstallSnapshotResponse {
+            term: 4,
+            next_offset: 165_536,
+            installed: true,
+            last_included_index: 900,
+            seq: 12,
+        });
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &request).await.unwrap();
+        write_frame(&mut buf, &response).await.unwrap();
+        let mut cursor = Cursor::new(buf);
+
+        match read_frame(&mut cursor).await.unwrap().unwrap() {
+            RpcMessage::InstallSnapshot(req) => {
+                assert_eq!((req.last_included_index, req.offset, req.seq), (900, 65_536, 12));
+                assert_eq!(req.data, data, "the chunk's bytes arrive untouched");
+                assert!(!req.done);
+            }
+            other => panic!("decoded wrong variant: {other:?}"),
+        }
+        match read_frame(&mut cursor).await.unwrap().unwrap() {
+            RpcMessage::InstallSnapshotResponse(resp) => {
+                assert!(resp.installed);
+                assert_eq!(resp.next_offset, 165_536);
+            }
+            other => panic!("decoded wrong variant: {other:?}"),
+        }
+    }
+
+    /// Every node in a cluster must agree on the encoding, and new messages are only
+    /// ever added at the end of the enum. Pin the positions of the ones that exist.
+    #[test]
+    fn the_message_variants_keep_their_positions_in_the_encoding() {
+        use raft_core::{
+            InstallSnapshotRequest, PreVoteResponse, RequestVoteResponse,
+        };
+        let first_u32 = |msg: &RpcMessage| {
+            let bytes = bincode::serialize(msg).unwrap();
+            u32::from_le_bytes(bytes[..4].try_into().unwrap())
+        };
+        assert_eq!(first_u32(&RpcMessage::Hello(1)), 0);
+        assert_eq!(
+            first_u32(&RpcMessage::RequestVoteResponse(RequestVoteResponse { term: 1, vote_granted: true })),
+            2
+        );
+        assert_eq!(
+            first_u32(&RpcMessage::PreVoteResponse(PreVoteResponse {
+                term: 1,
+                vote_granted: true,
+                request_term: 1
+            })),
+            6
+        );
+        assert_eq!(
+            first_u32(&RpcMessage::InstallSnapshot(InstallSnapshotRequest {
+                term: 1,
+                leader_id: 1,
+                last_included_index: 1,
+                last_included_term: 1,
+                offset: 0,
+                total_len: 0,
+                data: vec![],
+                done: true,
+                seq: 0
+            })),
+            7
+        );
+    }
+
+    #[tokio::test]
     async fn round_trips_a_message_through_the_codec() {
         let msg = RpcMessage::RequestVote(RequestVoteRequest {
             term: 7,

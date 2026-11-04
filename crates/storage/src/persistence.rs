@@ -1,7 +1,8 @@
 use crate::hard_state::{load_hard_state, save_hard_state, HardStateError};
 use crate::kv_store::KvStore;
 use crate::snapshot::{
-    load_snapshot, save_snapshot, SnapshotError, SnapshotMetadata, SNAPSHOT_FILE,
+    load_snapshot, save_snapshot, write_snapshot_bytes, SnapshotError, SnapshotMetadata,
+    SNAPSHOT_FILE,
 };
 use crate::wal::{Wal, WalError, WalRecovery};
 use raft_core::{LogEntry, NodeId, PersistentState, Term};
@@ -195,6 +196,45 @@ impl Persistence {
             });
         }
         self.wal.compact_through(index)?;
+        Ok(())
+    }
+
+    /// The bytes of the snapshot file, for sending to a follower that needs it.
+    pub fn read_snapshot_bytes(&self) -> Result<Option<Vec<u8>>, PersistenceError> {
+        match std::fs::read(&self.snapshot_path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Adopts a snapshot received from the leader: its bytes become this node's
+    /// snapshot file, and the log is trimmed to match.
+    ///
+    /// `keep_log_suffix` says whether the log already held the snapshot's last entry
+    /// (same index and term), in which case the entries after it are still valid and
+    /// are kept; otherwise the whole log is discarded (Raft paper §7). As everywhere,
+    /// the snapshot is made durable FIRST. If the process dies before the log is
+    /// trimmed, entries that are not part of the snapshot's history may remain after
+    /// it, which is harmless: each (index, term) names one entry cluster-wide, so a
+    /// stale entry conflicts with the leader's at the same index and the ordinary
+    /// append path replaces it.
+    pub fn install_snapshot_bytes(
+        &mut self,
+        bytes: &[u8],
+        metadata: &SnapshotMetadata,
+        keep_log_suffix: bool,
+    ) -> Result<(), PersistenceError> {
+        let index = metadata.last_included_index;
+        if index < self.snapshot_base {
+            return Err(PersistenceError::StaleSnapshot {
+                requested: index,
+                current: self.snapshot_base,
+            });
+        }
+        write_snapshot_bytes(&self.snapshot_path, bytes)?;
+        self.snapshot_base = index;
+        self.wal.compact_through(if keep_log_suffix { index } else { u64::MAX })?;
         Ok(())
     }
 
@@ -616,5 +656,64 @@ mod tests {
             Err(PersistenceError::CompactBeyondSnapshot { requested: 6, snapshot: 5 })
         ));
         assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 8, "nothing was lost");
+    }
+
+    #[test]
+    fn the_snapshot_file_can_be_read_back_for_sending() {
+        let dir = TestDir::new();
+        let mut p = Persistence::open(&dir.0).unwrap().persistence;
+        assert!(p.read_snapshot_bytes().unwrap().is_none());
+        p.save_snapshot_only(meta(4, 1), &store_with("k", "v")).unwrap();
+        let bytes = p.read_snapshot_bytes().unwrap().expect("a snapshot exists");
+        let (decoded, state) = crate::snapshot::decode_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.last_included_index, 4);
+        assert_eq!(state.get("k"), Some(&b"v".to_vec()));
+    }
+
+    fn encoded(index: u64, key: &str) -> (SnapshotMetadata, Vec<u8>) {
+        let metadata = meta(index, 1);
+        let bytes = crate::snapshot::encode_snapshot(&metadata, &store_with(key, "v")).unwrap();
+        (metadata, bytes)
+    }
+
+    #[test]
+    fn installing_a_received_snapshot_can_keep_the_log_after_it() {
+        let dir = TestDir::new();
+        let mut p = Persistence::open(&dir.0).unwrap().persistence;
+        p.append_batch(&(1..=9).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+        let (metadata, bytes) = encoded(6, "from-leader");
+        p.install_snapshot_bytes(&bytes, &metadata, true).unwrap();
+        assert_eq!(p.snapshot_base(), 6);
+        drop(p);
+
+        let recovered = Persistence::open(&dir.0).unwrap();
+        assert_eq!(indices(&recovered), vec![7, 8, 9]);
+        let snapshot = recovered.snapshot.unwrap();
+        assert_eq!(snapshot.metadata.last_included_index, 6);
+        assert!(snapshot.state.get("from-leader").is_some());
+    }
+
+    #[test]
+    fn installing_a_received_snapshot_can_discard_the_whole_log() {
+        let dir = TestDir::new();
+        let mut p = Persistence::open(&dir.0).unwrap().persistence;
+        p.append_batch(&(1..=9).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+        let (metadata, bytes) = encoded(4, "from-leader");
+        p.install_snapshot_bytes(&bytes, &metadata, false).unwrap();
+        assert!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().is_empty(), "nothing is left");
+        drop(p);
+        assert!(indices(&Persistence::open(&dir.0).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn installing_an_older_snapshot_than_the_stored_one_is_refused() {
+        let dir = TestDir::new();
+        let mut p = Persistence::open(&dir.0).unwrap().persistence;
+        p.save_snapshot_only(meta(8, 1), &KvStore::new()).unwrap();
+        let (metadata, bytes) = encoded(5, "old");
+        assert!(matches!(
+            p.install_snapshot_bytes(&bytes, &metadata, true),
+            Err(PersistenceError::StaleSnapshot { requested: 5, current: 8 })
+        ));
     }
 }

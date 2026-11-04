@@ -13,7 +13,9 @@ use node::cluster::{
     AdminResult, ClientAdmin, ClientCommand, ClientCommandResult, ClientQuery, Cluster,
     ClusterHandle, ClusterSnapshot, MembershipChange, PeerConnector, QueryResult,
 };
-use node::config::{Limits, NodeConfig, ReadMode, DEFAULT_CATCH_UP_TIMEOUT};
+use node::config::{
+    Limits, NodeConfig, ReadMode, DEFAULT_CATCH_UP_TIMEOUT, DEFAULT_SNAPSHOT_CHUNK_BYTES,
+};
 use node::metrics_api::{router, AppState};
 use raft_core::{NodeId, RpcMessage};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -96,6 +98,8 @@ pub struct TestCluster {
     /// entries behind it. Applies to nodes launched afterwards.
     snapshot_threshold: u64,
     snapshot_retain: u64,
+    /// Size of each piece a snapshot is sent in.
+    snapshot_chunk_bytes: usize,
     network: Arc<Network>,
     nodes: BTreeMap<NodeId, TestNode>,
     base_dir: PathBuf,
@@ -123,11 +127,29 @@ impl TestCluster {
     /// Like `start`, but every node snapshots after `threshold` applied entries,
     /// keeping `retain` entries behind each snapshot.
     pub fn start_with_snapshots(ids: &[NodeId], threshold: u64, retain: u64) -> Self {
-        Self::start_full_with(ids, ReadMode::Linearizable, Limits::default(), threshold, retain)
+        Self::start_with_snapshot_chunks(ids, threshold, retain, DEFAULT_SNAPSHOT_CHUNK_BYTES as usize)
+    }
+
+    /// Like `start_with_snapshots`, and snapshots sent between nodes travel in pieces of
+    /// `chunk_bytes` (small, to force many pieces).
+    pub fn start_with_snapshot_chunks(
+        ids: &[NodeId],
+        threshold: u64,
+        retain: u64,
+        chunk_bytes: usize,
+    ) -> Self {
+        Self::start_full_with(
+            ids,
+            ReadMode::Linearizable,
+            Limits::default(),
+            threshold,
+            retain,
+            chunk_bytes,
+        )
     }
 
     fn start_full(ids: &[NodeId], read_mode: ReadMode, limits: Limits) -> Self {
-        Self::start_full_with(ids, read_mode, limits, 0, 0)
+        Self::start_full_with(ids, read_mode, limits, 0, 0, DEFAULT_SNAPSHOT_CHUNK_BYTES as usize)
     }
 
     fn start_full_with(
@@ -136,6 +158,7 @@ impl TestCluster {
         limits: Limits,
         snapshot_threshold: u64,
         snapshot_retain: u64,
+        snapshot_chunk_bytes: usize,
     ) -> Self {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -148,6 +171,7 @@ impl TestCluster {
             catch_up_timeout: DEFAULT_CATCH_UP_TIMEOUT,
             snapshot_threshold,
             snapshot_retain,
+            snapshot_chunk_bytes,
             network: Arc::new(Network::default()),
             nodes: BTreeMap::new(),
             base_dir,
@@ -205,6 +229,7 @@ impl TestCluster {
             join: self.joiners.contains(&id),
             catch_up_timeout: self.catch_up_timeout,
             snapshot_threshold: self.snapshot_threshold,
+            snapshot_chunk_bytes: self.snapshot_chunk_bytes,
             snapshot_retain: self.snapshot_retain,
         };
 
@@ -223,6 +248,12 @@ impl TestCluster {
     }
 
     // ---- membership ---------------------------------------------------------
+
+    /// Makes snapshots sent by nodes launched from now on travel in pieces of this
+    /// many bytes (small, to force many chunks).
+    pub fn set_snapshot_chunk_bytes(&mut self, bytes: usize) {
+        self.snapshot_chunk_bytes = bytes;
+    }
 
     /// Makes nodes launched from now on snapshot every `threshold` applied entries,
     /// keeping `retain` entries behind the snapshot.

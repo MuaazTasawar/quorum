@@ -9,7 +9,7 @@
 mod common;
 
 use common::TestCluster;
-use node::cluster::{AdminRejection, AdminResult, ClientCommandResult, QueryResult};
+use node::cluster::{AdminResult, ClientCommandResult, QueryResult};
 use raft_core::{Membership, NodeId};
 use std::time::Duration;
 use storage::{Command, KvStore, Persistence, SnapshotMetadata, Wal, WAL_FILE};
@@ -284,28 +284,105 @@ async fn a_leader_never_discards_log_a_lagging_follower_still_needs() {
     }
 }
 
+// ---- InstallSnapshot: catching up from a snapshot ---------------------------------
+
 #[tokio::test]
-async fn adding_a_node_after_the_log_was_compacted_is_refused_clearly() {
-    let mut cluster = TestCluster::start_with_snapshots(&[1, 2, 3], 5, 0);
+async fn a_node_added_after_the_log_was_compacted_catches_up_from_a_snapshot() {
+    // Small pieces, so the snapshot really does travel in many chunks.
+    let mut cluster = TestCluster::start_with_snapshot_chunks(&[1, 2, 3], 5, 0, 96);
     let all = [1, 2, 3];
     cluster.wait_for_leader(SETTLE).await;
-    for i in 0..30 {
-        write(&cluster, &all, &format!("key-{i}"), "v").await;
+    for i in 0..40 {
+        write(&cluster, &all, &format!("key-{i}"), &format!("value-{i}")).await;
     }
     cluster
         .wait_until(SETTLE, "the leader's log to be compacted", |c| {
-            all.iter().any(|&id| c.snapshot(id).log_base > 0 && c.leaders().contains(&id))
+            c.leaders().iter().any(|&l| c.snapshot(l).log_base > 0)
         })
         .await;
 
     cluster.start_joiner(4);
     let leader = cluster.wait_for_leader_among(&all, SETTLE).await;
+    assert!(cluster.snapshot(leader).log_base > 0, "the entries node 4 needs are gone");
     let result = cluster.add_member(leader, 4).await;
+    assert!(matches!(result, AdminResult::Applied { .. }), "{result:?}");
+
+    let joined = cluster.snapshot(4);
+    assert!(joined.snapshots_installed >= 1, "it was brought up to date by a snapshot");
+    assert_eq!(cluster.members_of(4), vec![1, 2, 3, 4]);
+
+    // It holds all the data and takes part: lose the old leader and node 4 is needed
+    // for a majority of the four.
+    write(&cluster, &[1, 2, 3, 4], "after-join", "ok").await;
+    cluster
+        .wait_until(SETTLE, "node 4 to apply everything", |c| {
+            let leader = c.leaders()[0];
+            c.snapshot(4).last_applied == c.snapshot(leader).last_applied
+        })
+        .await;
+    cluster.crash(leader).await;
+    let alive: Vec<NodeId> = [1, 2, 3, 4].into_iter().filter(|&id| id != leader).collect();
+    for i in 0..40 {
+        assert_eq!(
+            read(&cluster, &alive, &format!("key-{i}")).await,
+            Some(format!("value-{i}").into_bytes()),
+            "key-{i} must have reached node 4 through the snapshot"
+        );
+    }
+    assert_eq!(read(&cluster, &alive, "after-join").await, Some(b"ok".to_vec()));
+}
+
+#[tokio::test]
+async fn a_follower_behind_a_new_leaders_compacted_log_is_caught_up_from_a_snapshot() {
+    // Followers trim their own logs without waiting for anyone, so when one becomes
+    // leader its log may start after what a lagging peer needs. Only a snapshot helps.
+    let mut cluster = TestCluster::start_with_snapshot_chunks(&[1, 2, 3], 5, 0, 128);
+    let all = [1, 2, 3];
+    let old_leader = cluster.wait_for_leader(SETTLE).await;
+    let lagging = all.into_iter().find(|&id| id != old_leader).unwrap();
+    let healthy = all.into_iter().find(|&id| id != old_leader && id != lagging).unwrap();
+    write(&cluster, &all, "warmup", "1").await;
+    cluster
+        .wait_until(SETTLE, "everyone to be level", |c| {
+            all.iter().all(|&id| c.snapshot(id).last_applied == c.snapshot(old_leader).last_applied)
+        })
+        .await;
+
+    cluster.isolate(lagging);
+    let others = [old_leader, healthy];
+    for i in 0..45 {
+        write(&cluster, &others, &format!("key-{i}"), &format!("value-{i}")).await;
+    }
+    // The healthy follower snapshots and trims past what the lagging one has.
+    cluster
+        .wait_until(SETTLE, "the healthy follower to trim past the lagging one", |c| {
+            c.snapshot(healthy).log_base > c.snapshot(lagging).last_applied + 5
+        })
+        .await;
+
+    // The old leader goes; the lagging node comes back. The only node that can lead
+    // is the healthy one (the other has an out of date log), and it cannot send the
+    // entries the lagging node is missing.
+    cluster.crash(old_leader).await;
+    cluster.heal();
+    let survivors = [healthy, lagging];
+    cluster.wait_for_leader_among(&survivors, SETTLE).await;
+    cluster
+        .wait_until(SETTLE, "the lagging node to be brought up to date", |c| {
+            c.snapshot(lagging).last_applied == c.snapshot(healthy).last_applied
+                && c.snapshot(lagging).last_applied >= 45
+        })
+        .await;
     assert!(
-        matches!(result, AdminResult::Rejected(AdminRejection::LogCompacted)),
-        "expected a clear refusal, got {result:?}"
+        cluster.snapshot(lagging).snapshots_installed >= 1,
+        "it got there by installing a snapshot"
     );
-    assert!(cluster.snapshot(leader).learners.is_empty());
-    assert_eq!(cluster.members_of(leader), vec![1, 2, 3]);
-    write(&cluster, &all, "still", "working").await;
+    for i in 0..45 {
+        assert_eq!(
+            read(&cluster, &survivors, &format!("key-{i}")).await,
+            Some(format!("value-{i}").into_bytes())
+        );
+    }
+    write(&cluster, &survivors, "later", "fine").await;
+    assert_eq!(read(&cluster, &survivors, "later").await, Some(b"fine".to_vec()));
 }

@@ -81,56 +81,56 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Writes a snapshot atomically: serialize to a temp file, fsync, then rename
-/// over the real snapshot path. Same crash-safety reasoning as `Wal::truncate_from` -
-/// a reader must never observe a half-written snapshot. The file carries a magic
-/// number, a format version, the payload length and a checksum, so damage is
-/// detected on load instead of being decoded as if it were state.
-pub fn save_snapshot(
-    path: impl AsRef<Path>,
-    metadata: SnapshotMetadata,
+/// Encodes a snapshot into the bytes of a snapshot file: a magic number, a format
+/// version, the payload length and a checksum, then the payload. These are also the
+/// bytes sent to a follower that needs the snapshot, so what travels over the wire is
+/// checked the same way as what is read back from disk.
+pub fn encode_snapshot(
+    metadata: &SnapshotMetadata,
     state: &KvStore,
-) -> Result<(), SnapshotError> {
-    let path = path.as_ref();
-    let tmp_path = path.with_extension("snap.tmp");
-
-    let payload = bincode::serialize(&SnapshotPayloadRef { metadata: &metadata, state })?;
+) -> Result<Vec<u8>, SnapshotError> {
+    let payload = bincode::serialize(&SnapshotPayloadRef { metadata, state })?;
     let mut encoded = Vec::with_capacity(HEADER_LEN + payload.len());
     encoded.extend_from_slice(&MAGIC);
     encoded.extend_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
     encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     encoded.extend_from_slice(&crc32(&payload).to_le_bytes());
     encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
 
+/// Writes snapshot file bytes atomically: to a temp file, fsync, then rename over the
+/// real path. Same crash-safety reasoning as `Wal::truncate_from` - a reader must
+/// never observe a half-written snapshot.
+pub fn write_snapshot_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> Result<(), SnapshotError> {
+    let path = path.as_ref();
+    let tmp_path = path.with_extension("snap.tmp");
     {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&tmp_path)?;
-        file.write_all(&encoded)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
     }
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
 
-/// Loads the most recent snapshot, if one exists. Called at startup, before WAL
-/// replay: the node restores the snapshot first, then replays only the WAL
-/// entries *after* `last_included_index` on top of it, rather than replaying
-/// the entire history from scratch every restart.
-///
-/// A snapshot that is damaged, from an unsupported version, or not a snapshot at
-/// all is an ERROR, never "no snapshot": the log before it may already have been
-/// discarded, so quietly starting empty would lose acknowledged data.
-pub fn load_snapshot(
+/// Writes a snapshot atomically (see `write_snapshot_bytes`). The file carries a magic
+/// number, a format version, the payload length and a checksum, so damage is detected
+/// on load instead of being decoded as if it were state.
+pub fn save_snapshot(
     path: impl AsRef<Path>,
-) -> Result<Option<(SnapshotMetadata, KvStore)>, SnapshotError> {
-    let path = path.as_ref();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(path)?;
+    metadata: SnapshotMetadata,
+    state: &KvStore,
+) -> Result<(), SnapshotError> {
+    write_snapshot_bytes(path, &encode_snapshot(&metadata, state)?)
+}
+
+/// Checks the header and checksum of snapshot file bytes and returns the payload.
+fn verified_payload(bytes: &[u8]) -> Result<&[u8], SnapshotError> {
     if bytes.len() < HEADER_LEN || bytes[..4] != MAGIC {
         return Err(SnapshotError::BadMagic);
     }
@@ -150,8 +150,40 @@ pub fn load_snapshot(
     if crc32(payload) != expected_crc {
         return Err(SnapshotError::ChecksumMismatch);
     }
-    let decoded: SnapshotPayload = bincode::deserialize(payload)?;
-    Ok(Some((decoded.metadata, decoded.state)))
+    Ok(payload)
+}
+
+/// Decodes snapshot file bytes, refusing anything damaged, truncated or of an
+/// unsupported version.
+pub fn decode_snapshot(bytes: &[u8]) -> Result<(SnapshotMetadata, KvStore), SnapshotError> {
+    let decoded: SnapshotPayload = bincode::deserialize(verified_payload(bytes)?)?;
+    Ok((decoded.metadata, decoded.state))
+}
+
+/// Reads just the position and membership out of snapshot file bytes, after the same
+/// integrity checks as `decode_snapshot` but without decoding the state itself. A
+/// leader uses this to tell a follower which snapshot is on its way.
+pub fn peek_snapshot_metadata(bytes: &[u8]) -> Result<SnapshotMetadata, SnapshotError> {
+    // The metadata is the first thing in the payload; the state follows it.
+    Ok(bincode::deserialize(verified_payload(bytes)?)?)
+}
+
+/// Loads the most recent snapshot, if one exists. Called at startup, before WAL
+/// replay: the node restores the snapshot first, then replays only the WAL
+/// entries *after* `last_included_index` on top of it, rather than replaying
+/// the entire history from scratch every restart.
+///
+/// A snapshot that is damaged, from an unsupported version, or not a snapshot at
+/// all is an ERROR, never "no snapshot": the log before it may already have been
+/// discarded, so quietly starting empty would lose acknowledged data.
+pub fn load_snapshot(
+    path: impl AsRef<Path>,
+) -> Result<Option<(SnapshotMetadata, KvStore)>, SnapshotError> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    decode_snapshot(&std::fs::read(path)?).map(Some)
 }
 
 #[cfg(test)]
@@ -292,5 +324,39 @@ mod tests {
         let bytes = std::fs::read(dir.path()).unwrap();
         std::fs::write(dir.path(), &bytes[..bytes.len() - 5]).unwrap();
         assert!(matches!(load_snapshot(dir.path()), Err(SnapshotError::Truncated { .. })));
+    }
+
+    #[test]
+    fn encoded_bytes_decode_to_what_was_encoded() {
+        let bytes = encode_snapshot(&metadata(9, 2), &state()).unwrap();
+        let (loaded, store) = decode_snapshot(&bytes).unwrap();
+        assert_eq!(loaded, metadata(9, 2));
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn the_metadata_can_be_read_without_decoding_the_state() {
+        let bytes = encode_snapshot(&metadata(9, 2), &state()).unwrap();
+        assert_eq!(peek_snapshot_metadata(&bytes).unwrap(), metadata(9, 2));
+    }
+
+    #[test]
+    fn peeking_checks_integrity_like_decoding_does() {
+        let mut bytes = encode_snapshot(&metadata(9, 2), &state()).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x40;
+        assert!(matches!(peek_snapshot_metadata(&bytes), Err(SnapshotError::ChecksumMismatch)));
+        assert!(matches!(decode_snapshot(&bytes), Err(SnapshotError::ChecksumMismatch)));
+        assert!(matches!(decode_snapshot(&bytes[..10]), Err(SnapshotError::BadMagic)));
+    }
+
+    #[test]
+    fn received_bytes_written_to_disk_load_as_a_snapshot() {
+        let dir = TestDir::new();
+        let bytes = encode_snapshot(&metadata(12, 3), &state()).unwrap();
+        write_snapshot_bytes(dir.path(), &bytes).unwrap();
+        assert_eq!(std::fs::read(dir.path()).unwrap(), bytes, "byte for byte what was received");
+        let (loaded, _) = load_snapshot(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.last_included_index, 12);
     }
 }

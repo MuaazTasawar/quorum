@@ -65,8 +65,33 @@ caught; full suite twice and snapshot_test five times stable; real 3-process run
 kill -9 all, restart, 0 keys lost); 8 slow-fsync (80-200 ms) runs: 0 acknowledged writes lost, availability the same with
 snapshots on or off (leadership flaps either way at that disk speed: pre-existing).
 
+## Phase 22 (done): InstallSnapshot, snapshots on by default
+A leader whose peer needs entries it has compacted away sends it the snapshot instead (Raft paper section 7).
+- Wire: RpcMessage::InstallSnapshot / InstallSnapshotResponse appended at the END of the enum (variant positions are pinned by a
+  codec test). Every node in a cluster must be rebuilt together. The payload is the snapshot FILE bytes (already versioned and
+  checksummed), in chunks of QUORUM_SNAPSHOT_CHUNK_BYTES (default 65536).
+- raft-core snapshot_transfer.rs (pure): SnapshotSender (position, next_chunk, acknowledge: only a CHANGE of position triggers a send,
+  so duplicate answers do not multiply traffic), SnapshotAssembler (in-order reassembly, 1 GiB cap), accept_leader_term,
+  apply_snapshot_installed.
+- Leader: stop-and-wait, next chunk on each answer, current chunk retransmitted on every heartbeat tick; the snapshot bytes are read once
+  and held for the whole transfer (shared by followers); answers count as contact (check-quorum, ReadIndex seq); only voters and
+  learners are sent snapshots; transfers are dropped on losing leadership. The lagging peer pins the leader's log (floor) so
+  the base never moves past it during a transfer.
+- Follower: each chunk is leader contact (term adopted and made durable, known_leader, election timer reset). Offset 0 starts afresh;
+  a chunk of an unknown transfer is answered next_offset 0; misaligned chunks are answered with the expected offset; a snapshot
+  it already covers (commit_index >= index) is acknowledged on the FIRST chunk. When complete: checksum + the announced index/term must
+  match, then disk first (Persistence::install_snapshot_bytes: snapshot file, then WAL trimmed; log suffix kept only if the log held the
+  snapshot's last entry with the same term, else the whole log dropped), then memory (state, log base, commit/applied, membership =
+  snapshot's + kept config entries).
+- QUORUM_SNAPSHOT_THRESHOLD now defaults to 10000 (0 disables). AdminRejection::LogCompacted is gone: adding a node to a compacted
+  cluster works (learner -> snapshot -> entries -> promoted).
+- /health and /ws gain snapshots_installed.
+Verification: raft-core 103, storage 68, transport 6, node unit 151 + integration incl. snapshot_test 6 (377 total), 0 warnings; 18
+mutation checks all caught (two needed stronger tests); full suite twice, snapshot_test six times stable; real 4-process TCP run
+(join after the leader trimmed to 100, 200-byte chunks, kill -9 leader, 0 keys lost), also under an 80-200 ms fsync shim.
+
 ## Remaining plan
-22 InstallSnapshot (chunked; then flip the snapshot default on, remove the LogCompacted refusal) | 23 API + SDK hardening (binary-safe values, key validation, SDK handles 503/504/409)
+23 API + SDK hardening (binary-safe values, key validation, SDK handles 503/504/409)
 24 observability (Prometheus /metrics, dashboard) | 25 security (TLS, auth, certgen) | 26 chaos CLI v2 + Docker volumes
 27 deterministic simulation + linearizability checker | then regenerate the README.
 
@@ -92,5 +117,7 @@ snapshots on or off (leadership flaps either way at that disk speed: pre-existin
 - Wire format changes (new RPC fields) need all nodes rebuilt together; WAL/command encodings only append variants.
 
 ## Known limitations (roadmap)
-Snapshots/compaction exist but are off by default; no InstallSnapshot, so a follower behind the leader's compacted log (or a new node after compaction) cannot catch up; a dead member pins the leader's log; the snapshot write runs inside the event loop (stalls it in proportion to state size + fsync); WAL has no per-record checksums; no TLS/auth;
-values are lossy UTF-8 over HTTP; chaos CLI is Windows and 3-node only; a new node is copied the whole log (no InstallSnapshot yet).
+A dead member pins the leader's log until it is removed; snapshot work runs inside the event loop (writing, decoding a received one,
+and the leader reading the file all stall it in proportion to state size + fsync); a snapshot is held fully in memory while being sent or
+received (1 GiB cap) and a transfer interrupted by a restart starts over; transfer is stop-and-wait (one chunk per round trip);
+WAL has no per-record checksums; no TLS/auth; values are lossy UTF-8 over HTTP; chaos CLI is Windows and 3-node only.

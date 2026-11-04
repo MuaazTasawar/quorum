@@ -84,6 +84,44 @@ pub struct AppendEntriesResponse {
     pub seq: u64,
 }
 
+/// One chunk of a snapshot, sent by a leader to a follower that has fallen behind the
+/// part of the log the leader still holds (Raft paper §7). The snapshot travels as the
+/// bytes of the snapshot file, which already carry their own format version and
+/// checksum, split into chunks so no single message is large.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotRequest {
+    pub term: Term,
+    pub leader_id: NodeId,
+    /// The last log entry the snapshot covers. Identifies the transfer: a chunk
+    /// that belongs to a different snapshot than the one being received restarts it.
+    pub last_included_index: u64,
+    pub last_included_term: Term,
+    /// Where `data` starts within the snapshot.
+    pub offset: u64,
+    /// Size of the whole snapshot in bytes.
+    pub total_len: u64,
+    pub data: Vec<u8>,
+    /// True on the final chunk.
+    pub done: bool,
+    /// The heartbeat round this belongs to, echoed back like `AppendEntriesRequest::seq`.
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotResponse {
+    pub term: Term,
+    /// The next byte the follower expects. The leader continues from here, so a lost
+    /// or repeated chunk, or a follower that restarted mid-transfer, just means the
+    /// transfer resumes from where the follower really is.
+    pub next_offset: u64,
+    /// True once the follower's state includes everything through
+    /// `last_included_index`: it was installed by this transfer, or it already had it.
+    pub installed: bool,
+    /// Echo of the request's `last_included_index`: which transfer this answers.
+    pub last_included_index: u64,
+    pub seq: u64,
+}
+
 /// Top-level envelope for everything sent over the wire between nodes.
 /// The `transport` crate frames and deserializes into this; raft-core only
 /// ever sees `RpcMessage` variants, never raw bytes.
@@ -98,4 +136,8 @@ pub enum RpcMessage {
     AppendEntriesResponse(AppendEntriesResponse),
     PreVote(PreVoteRequest),
     PreVoteResponse(PreVoteResponse),
+    // New variants are only ever added at the END: the position of a variant is part
+    // of the wire encoding, and every node in a cluster must run the same build.
+    InstallSnapshot(InstallSnapshotRequest),
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }

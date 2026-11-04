@@ -1,10 +1,12 @@
 use raft_core::{
-    advance_commit_index, build_append_entries, handle_append_entries,
+    accept_leader_term, advance_commit_index, apply_snapshot_installed, build_append_entries, handle_append_entries,
     handle_append_entries_response, handle_pre_vote, handle_request_vote, start_election,
-    ConfigChange, ConfigHistory, ElectionTimeoutConfig, LeaderState, Log, LogEntry, Membership,
-    NodeId, PersistentState, PreVoteRequest, PreVoteResponse, RequestVoteResponse, Role,
-    RpcMessage, Term, VoteTally, VolatileState,
+    ChunkOutcome, ConfigChange, ConfigHistory, ElectionTimeoutConfig, InstallSnapshotRequest,
+    InstallSnapshotResponse, LeaderState, Log, LogEntry, Membership, NodeId, PersistentState,
+    PreVoteRequest, PreVoteResponse, RequestVoteResponse, Role, RpcMessage, SnapshotAssembler,
+    SnapshotSender, Term, VoteTally, VolatileState,
 };
+use std::sync::Arc;
 use std::collections::{BTreeMap, HashMap};
 use storage::{Command, KvStore, Persistence, Recovered, RecoveredSnapshot};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -110,10 +112,6 @@ pub enum AdminRejection {
     LastMember,
     /// A node to add needs an address the others can dial.
     BadAddress,
-    /// This leader's log no longer starts at the beginning, so a new node cannot be
-    /// brought up to date by replication alone and would need the snapshot sent to
-    /// it, which is not supported yet. Refused up front rather than left to time out.
-    LogCompacted,
     /// The joining node did not catch up with the log in time, or the caller gave
     /// up waiting. It was not added.
     CatchUpFailed,
@@ -132,10 +130,6 @@ impl std::fmt::Display for AdminRejection {
             AdminRejection::NotMember => "that node is not a member of the cluster",
             AdminRejection::LastMember => "the last remaining member cannot be removed",
             AdminRejection::BadAddress => "a node to add needs a non-empty address (host:port)",
-            AdminRejection::LogCompacted => {
-                "this cluster's log has been compacted into a snapshot, and a new node cannot \
-                 be brought up to date from a compacted log yet"
-            }
             AdminRejection::CatchUpFailed => {
                 "the new node did not catch up with the log in time and was not added"
             }
@@ -171,6 +165,8 @@ pub struct ClusterSnapshot {
     pub log_base: u64,
     /// Snapshots this process has taken since it started.
     pub snapshots_taken: u64,
+    /// Snapshots this process has received from a leader and installed.
+    pub snapshots_installed: u64,
 }
 
 pub struct ClusterHandle {
@@ -290,6 +286,16 @@ pub struct Cluster {
     connector: PeerConnector,
     /// Snapshots taken since this process started.
     snapshots_taken: u64,
+    /// Snapshots received from a leader and installed since this process started.
+    snapshots_installed: u64,
+    /// Leader only: the snapshot being sent to each follower that needs one, and how
+    /// far it has got.
+    snapshot_sends: HashMap<NodeId, SnapshotSender>,
+    /// The snapshot file's bytes while any transfer is using them, shared by every
+    /// follower being sent that snapshot. Dropped once no transfer needs it.
+    snapshot_cache: Option<(u64, Term, Arc<Vec<u8>>)>,
+    /// Follower only: the snapshot being received.
+    incoming_snapshot: Option<SnapshotAssembler>,
     /// After a failed snapshot, do not try again until this many entries are applied,
     /// so a full disk is not retried (and logged) on every event.
     snapshot_retry_after: u64,
@@ -371,6 +377,7 @@ impl Cluster {
             snapshot_index: base_index,
             log_base: base_index,
             snapshots_taken: 0,
+            snapshots_installed: 0,
         });
 
         let mut cluster = Self {
@@ -397,6 +404,10 @@ impl Cluster {
             pending_admin: None,
             connector,
             snapshots_taken: 0,
+            snapshots_installed: 0,
+            snapshot_sends: HashMap::new(),
+            snapshot_cache: None,
+            incoming_snapshot: None,
             snapshot_retry_after: 0,
             dropped_messages: 0,
             pending_commands: HashMap::new(),
@@ -506,6 +517,9 @@ impl Cluster {
             let _ = pending.respond_to.send(AdminResult::LeadershipLost);
         }
         self.drop_learners();
+        // Snapshot transfers are this leader's alone; the next leader starts its own.
+        self.snapshot_sends.clear();
+        self.snapshot_cache = None;
         if !self.pending_reads.is_empty() {
             info!(
                 pending = self.pending_reads.len(),
@@ -670,6 +684,12 @@ impl Cluster {
                 }
                 self.reset_election_deadline_if_follower();
                 self.send_to(from, RpcMessage::AppendEntriesResponse(resp));
+            }
+
+            RpcMessage::InstallSnapshot(req) => self.handle_install_snapshot(from, req),
+
+            RpcMessage::InstallSnapshotResponse(resp) => {
+                self.handle_install_snapshot_response(from, resp)
             }
 
             RpcMessage::AppendEntriesResponse(resp) => {
@@ -906,30 +926,276 @@ impl Cluster {
         let seq = self.heartbeat_seq;
         let peer_ids: Vec<NodeId> = self.peer_outboxes.keys().copied().collect();
         for peer_id in peer_ids {
-            let next_index = *self.leader_state.next_index.get(&peer_id).unwrap_or(&1);
-            // A follower that is further behind than the start of this node's log
-            // needs the snapshot, not entries this node no longer has. Sending the
-            // remainder with a gap before it would only be rejected, so send nothing.
-            // (Sending the snapshot itself is InstallSnapshot, a later phase.)
-            if !self.log.can_send_after(next_index.saturating_sub(1)) {
-                debug!(
-                    peer_id,
-                    next_index,
-                    log_starts_at = self.log.first_index(),
-                    "peer needs entries that have been compacted away - cannot replicate to it yet"
-                );
-                continue;
-            }
-            let req = build_append_entries(
-                &self.persistent,
-                &self.log,
-                self.config.id,
-                next_index,
-                self.volatile.commit_index,
-                seq,
-            );
-            self.send_to(peer_id, RpcMessage::AppendEntries(req));
+            self.send_append_entries_to(peer_id, seq);
         }
+        if self.snapshot_sends.is_empty() {
+            self.snapshot_cache = None;
+        }
+    }
+
+    /// Sends one peer what it needs next: the log entries after its `next_index`, or,
+    /// if those entries have been compacted away, the next piece of the snapshot.
+    fn send_append_entries_to(&mut self, peer_id: NodeId, seq: u64) {
+        let next_index = *self.leader_state.next_index.get(&peer_id).unwrap_or(&1);
+        if !self.log.can_send_after(next_index.saturating_sub(1)) {
+            // Entries before this node's log starts exist only in its snapshot. Only
+            // voters and learners are worth the trouble: a node that is on its way out
+            // of the cluster is not sent a snapshot.
+            if self.membership.contains(peer_id) || self.learners.contains_key(&peer_id) {
+                self.send_snapshot_chunk(peer_id, seq);
+            }
+            return;
+        }
+        // The peer is within reach of the log again, so any transfer is over.
+        self.snapshot_sends.remove(&peer_id);
+        let req = build_append_entries(
+            &self.persistent,
+            &self.log,
+            self.config.id,
+            next_index,
+            self.volatile.commit_index,
+            seq,
+        );
+        self.send_to(peer_id, RpcMessage::AppendEntries(req));
+    }
+
+    // ---- sending snapshots ----------------------------------------------------
+
+    /// Sends the chunk of the snapshot the peer is up to. Called on every heartbeat
+    /// tick, so a chunk or its answer that was lost is simply sent again; the
+    /// follower resumes from wherever it really is.
+    fn send_snapshot_chunk(&mut self, peer_id: NodeId, seq: u64) {
+        if !self.snapshot_sends.contains_key(&peer_id) {
+            let Some(sender) = self.start_snapshot_send() else {
+                return;
+            };
+            info!(
+                peer_id,
+                last_included_index = sender.last_included_index(),
+                bytes = sender.total_len(),
+                "peer is behind the start of the log - sending it a snapshot"
+            );
+            self.snapshot_sends.insert(peer_id, sender);
+        }
+        let request = self.snapshot_sends[&peer_id].next_chunk(
+            self.config.snapshot_chunk_bytes,
+            self.persistent.current_term,
+            self.config.id,
+            seq,
+        );
+        self.send_to(peer_id, RpcMessage::InstallSnapshot(request));
+    }
+
+    /// Begins a transfer of the newest snapshot. The bytes are read once and shared by
+    /// every follower being sent that snapshot, and kept for the whole transfer, so a
+    /// newer snapshot taken meanwhile cannot change what is half sent.
+    fn start_snapshot_send(&mut self) -> Option<SnapshotSender> {
+        let snapshot_index = self.persistence.snapshot_base();
+        if let Some((index, term, data)) = &self.snapshot_cache {
+            if *index == snapshot_index {
+                return Some(SnapshotSender::new(*index, *term, data.clone()));
+            }
+        }
+        let bytes = match self.persistence.read_snapshot_bytes() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                error!("a peer needs a snapshot but this node has none on disk");
+                return None;
+            }
+            Err(e) => {
+                error!(error = %e, "could not read the snapshot to send it");
+                return None;
+            }
+        };
+        // Reading it also checks it: a snapshot damaged on this disk is not sent on.
+        let metadata = match storage::peek_snapshot_metadata(&bytes) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                error!(error = %e, "the snapshot on disk is damaged - not sending it");
+                return None;
+            }
+        };
+        let data = Arc::new(bytes);
+        let (index, term) = (metadata.last_included_index, metadata.last_included_term);
+        self.snapshot_cache = Some((index, term, data.clone()));
+        Some(SnapshotSender::new(index, term, data))
+    }
+
+    fn handle_install_snapshot_response(&mut self, from: NodeId, resp: InstallSnapshotResponse) {
+        if resp.term > self.persistent.current_term {
+            self.step_down(resp.term);
+            return;
+        }
+        if resp.term < self.persistent.current_term || self.volatile.role != Role::Leader {
+            return;
+        }
+        // Any same-term answer proves the follower is reachable and recognises us.
+        self.leader_state.record_ack(from, std::time::Instant::now());
+        self.leader_state.record_ack_seq(from, resp.seq);
+
+        let Some(sender) = self.snapshot_sends.get_mut(&from) else {
+            return;
+        };
+        if sender.last_included_index() != resp.last_included_index {
+            return; // an answer about a transfer that is over
+        }
+        if resp.installed {
+            info!(peer_id = from, last_included_index = resp.last_included_index, "peer installed the snapshot");
+            apply_snapshot_installed(&mut self.leader_state, from, resp.last_included_index);
+            self.snapshot_sends.remove(&from);
+            self.advance_leader_commit();
+            // Ordinary replication takes over from the entry after the snapshot.
+            let seq = self.heartbeat_seq;
+            self.send_append_entries_to(from, seq);
+        } else if sender.acknowledge(resp.next_offset) {
+            // Only a CHANGE of position sends more: a repeated answer (to a chunk that
+            // was sent twice) must not make every duplicate multiply.
+            let seq = self.heartbeat_seq;
+            self.send_snapshot_chunk(from, seq);
+        }
+    }
+
+    // ---- receiving snapshots --------------------------------------------------
+
+    /// Handles one chunk of a snapshot from the leader. The snapshot is assembled in
+    /// memory and installed only once it is complete and has passed its checksum.
+    fn handle_install_snapshot(&mut self, from: NodeId, req: InstallSnapshotRequest) {
+        let reply = |me: &Cluster, next_offset: u64, installed: bool| {
+            RpcMessage::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: me.persistent.current_term,
+                next_offset,
+                installed,
+                last_included_index: req.last_included_index,
+                seq: req.seq,
+            })
+        };
+
+        let term_before = self.persistent.current_term;
+        let Some(is_new_term) =
+            accept_leader_term(&mut self.persistent, &mut self.volatile, req.term)
+        else {
+            // A stale leader: answer with our term so it steps down.
+            let answer = reply(self, 0, false);
+            self.send_to(from, answer);
+            return;
+        };
+        // The term must be durable before it is acknowledged, exactly as for an append.
+        self.persist_hard_state();
+        if req.term >= term_before {
+            self.known_leader = Some(req.leader_id);
+            self.pre_vote = None;
+            self.volatile.last_heartbeat = std::time::Instant::now();
+        }
+        if is_new_term {
+            self.vote_tally = None;
+        }
+        self.reset_election_deadline_if_follower();
+
+        // Everything this snapshot covers is already committed here.
+        if req.last_included_index <= self.volatile.commit_index {
+            self.incoming_snapshot = None;
+            let answer = reply(self, req.total_len, true);
+            self.send_to(from, answer);
+            return;
+        }
+
+        if req.offset == 0 {
+            // The start of a transfer: whatever was half received is abandoned.
+            self.incoming_snapshot =
+                SnapshotAssembler::start(req.last_included_index, req.last_included_term, req.total_len);
+            if self.incoming_snapshot.is_none() {
+                warn!(total_len = req.total_len, "refusing a snapshot larger than the limit");
+                let answer = reply(self, 0, false);
+                self.send_to(from, answer);
+                return;
+            }
+        } else if !self.incoming_snapshot.as_ref().map_or(false, |a| a.is_receiving(&req)) {
+            // Not part of a transfer this node knows about (it restarted, or the leader
+            // moved on to a different snapshot): ask for it from the start.
+            self.incoming_snapshot = None;
+            let answer = reply(self, 0, false);
+            self.send_to(from, answer);
+            return;
+        }
+
+        let outcome = self
+            .incoming_snapshot
+            .as_mut()
+            .expect("set just above")
+            .accept(req.offset, &req.data, req.done);
+        let answer = match outcome {
+            ChunkOutcome::Accepted { next_offset } => reply(self, next_offset, false),
+            ChunkOutcome::Misaligned { expected } => reply(self, expected, false),
+            ChunkOutcome::Invalid => {
+                warn!("a snapshot chunk contradicted the transfer - starting it over");
+                self.incoming_snapshot = None;
+                reply(self, 0, false)
+            }
+            ChunkOutcome::Complete(bytes) => {
+                self.incoming_snapshot = None;
+                match self.install_received_snapshot(bytes, req.last_included_index, req.last_included_term) {
+                    Ok(()) => reply(self, req.total_len, true),
+                    Err(reason) => {
+                        warn!(%reason, "the snapshot received from the leader was not installed");
+                        reply(self, 0, false)
+                    }
+                }
+            }
+        };
+        self.send_to(from, answer);
+    }
+
+    /// Replaces this node's state with a complete snapshot from the leader.
+    ///
+    /// Checked first: the bytes must pass their checksum and describe exactly the
+    /// snapshot the leader said it was sending. Then the disk is updated (snapshot
+    /// first, then the log, see `Persistence::install_snapshot_bytes`) and only then
+    /// the in-memory state, so a failure part way leaves memory untouched.
+    fn install_received_snapshot(
+        &mut self,
+        bytes: Vec<u8>,
+        index: u64,
+        term: Term,
+    ) -> Result<(), String> {
+        let (metadata, state) = storage::decode_snapshot(&bytes).map_err(|e| e.to_string())?;
+        if metadata.last_included_index != index || metadata.last_included_term != term {
+            return Err(format!(
+                "it describes index {} term {}, not the index {index} term {term} announced",
+                metadata.last_included_index, metadata.last_included_term
+            ));
+        }
+        if index <= self.volatile.commit_index {
+            return Ok(()); // already covered
+        }
+
+        // Does the log already hold the snapshot's last entry? Then what follows it
+        // is still valid and is kept; otherwise the whole log goes (Raft paper §7).
+        let keep_suffix = index <= self.log.last_index() && self.log.term_at(index) == Some(term);
+        persist_must(
+            self.persistence.install_snapshot_bytes(&bytes, &metadata, keep_suffix),
+            "snapshot install",
+        );
+
+        self.kv_store = state;
+        self.log.install_snapshot_point(index, term);
+        self.volatile.commit_index = index;
+        self.volatile.last_applied = index;
+
+        // The membership is the snapshot's, plus any configuration entries kept after it.
+        let mut history = ConfigHistory::new(metadata.membership);
+        for entry in self.log.entries_after(self.log.base_index()) {
+            if let Some(change) = config_change_of(&entry.command) {
+                history.record(entry.index, change);
+            }
+        }
+        self.history = history;
+        self.refresh_membership();
+        self.drop_peers_outside_membership();
+
+        self.snapshots_installed += 1;
+        self.snapshot_retry_after = 0;
+        info!(index, kept_log_after_it = keep_suffix, "installed a snapshot from the leader");
+        Ok(())
     }
 
     /// Most unfinished writes (and, separately, most waiting reads) this node will
@@ -1202,8 +1468,6 @@ impl Cluster {
                     Some(AdminRejection::BadAddress)
                 } else if self.membership.contains(*id) {
                     Some(AdminRejection::AlreadyMember)
-                } else if self.log.base_index() > 0 {
-                    Some(AdminRejection::LogCompacted)
                 } else {
                     None
                 }
@@ -1406,6 +1670,7 @@ impl Cluster {
             return;
         }
         self.peer_outboxes.remove(&id);
+        self.snapshot_sends.remove(&id);
         self.leader_state.next_index.remove(&id);
         self.leader_state.match_index.remove(&id);
         self.leader_state.last_ack.remove(&id);
@@ -1415,6 +1680,7 @@ impl Cluster {
     fn drop_learner(&mut self, id: NodeId) {
         if self.learners.remove(&id).is_some() && !self.membership.contains(id) {
             self.peer_outboxes.remove(&id);
+            self.snapshot_sends.remove(&id);
             self.leader_state.next_index.remove(&id);
             self.leader_state.match_index.remove(&id);
             self.leader_state.last_ack.remove(&id);
@@ -1499,6 +1765,7 @@ impl Cluster {
             snapshot_index: self.persistence.snapshot_base(),
             log_base: self.log.base_index(),
             snapshots_taken: self.snapshots_taken,
+            snapshots_installed: self.snapshots_installed,
         });
     }
 }
@@ -1598,6 +1865,7 @@ mod tests {
             join: false,
             catch_up_timeout: crate::config::DEFAULT_CATCH_UP_TIMEOUT,
             snapshot_threshold: 0,
+            snapshot_chunk_bytes: crate::config::DEFAULT_SNAPSHOT_CHUNK_BYTES as usize,
             snapshot_retain: 0,
         };
         let mut outboxes = HashMap::new();
@@ -2984,7 +3252,7 @@ mod tests {
     }
 
     fn config_entry_commands(cluster: &Cluster) -> Vec<Command> {
-        (1..=cluster.log.last_index())
+        (cluster.log.first_index()..=cluster.log.last_index())
             .filter_map(|i| Command::decode(&cluster.log.get(i).unwrap().command).ok())
             .filter(|c| c.config_change().is_some())
             .collect()
@@ -3657,36 +3925,6 @@ mod tests {
     }
 
     #[test]
-    fn a_leader_does_not_try_to_replicate_entries_it_has_compacted_away() {
-        let dir = TestDir::new();
-        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
-        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
-        cluster.persistent.current_term = 2;
-        cluster.become_leader(); // no-op at index 8; both peers start at next_index 9
-        drain(&mut outputs, 2);
-        drain(&mut outputs, 3);
-
-        // Node 3 turns out to be far behind: it needs entry 4, which is gone.
-        cluster.leader_state.next_index.insert(3, 4);
-        cluster.broadcast_append_entries();
-
-        assert!(
-            !drain(&mut outputs, 2).is_empty(),
-            "the caught-up peer is still sent its entries"
-        );
-        assert!(
-            drain(&mut outputs, 3).is_empty(),
-            "nothing is sent that would have a gap before it"
-        );
-
-        // A peer that is exactly at the snapshot point can still be served: it
-        // needs entry 6 onward, which is held.
-        cluster.leader_state.next_index.insert(3, 6);
-        cluster.broadcast_append_entries();
-        assert!(!drain(&mut outputs, 3).is_empty());
-    }
-
-    #[test]
     fn a_leader_with_a_snapshot_commits_and_applies_new_writes() {
         let dir = TestDir::new();
         write_snapshot_fixture(dir.path(), 5, 5, Membership::of_ids([1, 2, 3]));
@@ -3908,24 +4146,6 @@ mod tests {
     }
 
     #[test]
-    fn a_node_cannot_be_added_once_the_log_has_been_compacted() {
-        let dir = TestDir::new();
-        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[]);
-        cluster.config.snapshot_threshold = 2;
-        cluster.begin_election();
-        settle(&mut cluster);
-        for _ in 0..3 {
-            let (put, _rx) = put_command_with_receiver("k", "v");
-            cluster.handle_client_command(put);
-            settle(&mut cluster);
-        }
-        assert!(cluster.log.base_index() > 0, "a lone node trims as soon as it has a snapshot");
-
-        assert_eq!(rejected(request_change(&mut cluster, add(2))), AdminRejection::LogCompacted);
-        assert!(cluster.learners.is_empty());
-    }
-
-    #[test]
     fn a_snapshot_does_not_include_a_configuration_change_that_is_not_applied_yet() {
         let dir = TestDir::new();
         {
@@ -3956,5 +4176,553 @@ mod tests {
         // The change is still in the log tail, so a restart puts it back into effect.
         let (restarted, _outputs, _connections) = make_cluster_recording(dir.path(), &[2, 3]);
         assert_eq!(members(&restarted), vec![1, 2, 3, 4]);
+    }
+
+    // ---- InstallSnapshot ------------------------------------------------------------
+
+    fn install_requests(messages: Vec<RpcMessage>) -> Vec<InstallSnapshotRequest> {
+        messages
+            .into_iter()
+            .filter_map(|m| match m {
+                RpcMessage::InstallSnapshot(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn install_responses(outputs: &mut Outputs, peer: NodeId) -> Vec<InstallSnapshotResponse> {
+        drain(outputs, peer)
+            .into_iter()
+            .filter_map(|m| match m {
+                RpcMessage::InstallSnapshotResponse(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn install_answer(
+        term: Term,
+        next_offset: u64,
+        installed: bool,
+        last_included_index: u64,
+    ) -> RpcMessage {
+        RpcMessage::InstallSnapshotResponse(InstallSnapshotResponse {
+            term,
+            next_offset,
+            installed,
+            last_included_index,
+            seq: 1,
+        })
+    }
+
+    /// The bytes of a snapshot file at `index` (term `snap_term`) whose state holds
+    /// `keys` and whose membership is `members`.
+    fn snapshot_bytes(
+        index: u64,
+        snap_term: Term,
+        members: &[(NodeId, &str)],
+        keys: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut state = KvStore::new();
+        for (key, value) in keys {
+            state.apply(&Command::Put { key: key.to_string(), value: value.as_bytes().to_vec() });
+        }
+        let membership =
+            Membership::new(members.iter().map(|(id, addr)| (*id, addr.to_string())));
+        storage::encode_snapshot(
+            &storage::SnapshotMetadata {
+                last_included_index: index,
+                last_included_term: snap_term,
+                membership,
+            },
+            &state,
+        )
+        .unwrap()
+    }
+
+    fn chunk_from_leader(
+        term: Term,
+        index: u64,
+        snap_term: Term,
+        offset: u64,
+        total: u64,
+        data: &[u8],
+        done: bool,
+    ) -> RpcMessage {
+        RpcMessage::InstallSnapshot(InstallSnapshotRequest {
+            term,
+            leader_id: 2,
+            last_included_index: index,
+            last_included_term: snap_term,
+            offset,
+            total_len: total,
+            data: data.to_vec(),
+            done,
+            seq: 1,
+        })
+    }
+
+    /// Sends `bytes` to the cluster from leader 2 in pieces of `chunk` bytes, following
+    /// the follower's answers like a real leader would, and returns every answer.
+    fn send_snapshot(
+        cluster: &mut Cluster,
+        outputs: &mut Outputs,
+        bytes: &[u8],
+        index: u64,
+        snap_term: Term,
+        chunk: usize,
+    ) -> Vec<InstallSnapshotResponse> {
+        let total = bytes.len() as u64;
+        let mut answers = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let end = (offset + chunk).min(bytes.len());
+            cluster.handle_rpc(
+                2,
+                chunk_from_leader(1, index, snap_term, offset as u64, total, &bytes[offset..end], end == bytes.len()),
+            );
+            let responses = install_responses(outputs, 2);
+            let last = responses.last().cloned().expect("every chunk is answered");
+            answers.extend(responses);
+            if last.installed || end == bytes.len() {
+                return answers;
+            }
+            offset = last.next_offset as usize;
+        }
+    }
+
+    #[test]
+    fn a_peer_behind_the_start_of_the_log_is_sent_the_snapshot_not_entries() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 2;
+        cluster.become_leader();
+        drain(&mut outputs, 2);
+        drain(&mut outputs, 3);
+
+        // Node 3 needs entry 4, which only the snapshot still holds.
+        cluster.leader_state.next_index.insert(3, 4);
+        cluster.broadcast_append_entries();
+
+        assert!(
+            drain(&mut outputs, 2).iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))),
+            "the caught-up peer is still sent entries"
+        );
+        let sent = drain(&mut outputs, 3);
+        assert!(
+            !sent.iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))),
+            "and nothing with a gap in front of it goes to the lagging one"
+        );
+        let chunks = install_requests(sent);
+        assert_eq!(chunks.len(), 1);
+        let file = std::fs::read(dir.path().join(storage::SNAPSHOT_FILE)).unwrap();
+        let chunk = &chunks[0];
+        assert_eq!((chunk.last_included_index, chunk.last_included_term), (5, 1));
+        assert_eq!((chunk.term, chunk.leader_id, chunk.offset), (2, 1, 0));
+        assert_eq!(chunk.total_len, file.len() as u64);
+        assert_eq!(chunk.data, file, "the snapshot file itself, byte for byte");
+        assert!(chunk.done);
+
+        // A peer exactly at the snapshot point can still be served entries.
+        cluster.leader_state.next_index.insert(3, 6);
+        cluster.broadcast_append_entries();
+        assert!(drain(&mut outputs, 3).iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))));
+    }
+
+    #[test]
+    fn a_snapshot_is_sent_piece_by_piece_and_resumes_where_the_follower_is() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.config.snapshot_chunk_bytes = 16;
+        cluster.persistent.current_term = 2;
+        cluster.become_leader();
+        cluster.leader_state.next_index.insert(3, 4);
+        drain(&mut outputs, 3);
+        cluster.broadcast_append_entries();
+        let first = install_requests(drain(&mut outputs, 3));
+        assert_eq!((first[0].offset, first[0].data.len(), first[0].done), (0, 16, false));
+
+        // The follower took it: the next piece goes out at once.
+        cluster.handle_rpc(3, install_answer(2, 16, false, 5));
+        let next = install_requests(drain(&mut outputs, 3));
+        assert_eq!((next.len(), next[0].offset), (1, 16));
+
+        // The same answer again (to a duplicate) must not send anything more.
+        cluster.handle_rpc(3, install_answer(2, 16, false, 5));
+        assert!(drain(&mut outputs, 3).is_empty(), "duplicates must not multiply the traffic");
+
+        // A lost piece is simply sent again on the next heartbeat tick.
+        cluster.broadcast_append_entries();
+        let again = install_requests(drain(&mut outputs, 3));
+        assert_eq!((again.len(), again[0].offset), (1, 16));
+
+        // A follower that lost its progress sends the transfer back to the start.
+        cluster.handle_rpc(3, install_answer(2, 0, false, 5));
+        let restart = install_requests(drain(&mut outputs, 3));
+        assert_eq!(restart[0].offset, 0);
+    }
+
+    #[test]
+    fn once_the_follower_has_installed_it_replication_resumes_after_the_snapshot() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 2;
+        cluster.become_leader();
+        cluster.leader_state.next_index.insert(3, 4);
+        drain(&mut outputs, 3);
+        cluster.broadcast_append_entries();
+        drain(&mut outputs, 3);
+        assert!(cluster.snapshot_sends.contains_key(&3));
+
+        cluster.handle_rpc(3, install_answer(2, 999, true, 5));
+
+        assert_eq!(cluster.leader_state.match_index[&3], 5);
+        assert_eq!(cluster.leader_state.next_index[&3], 6);
+        assert!(cluster.snapshot_sends.is_empty(), "the transfer is over");
+        assert!(cluster.snapshot_cache.is_none() || cluster.snapshot_sends.is_empty());
+        let sent = drain(&mut outputs, 3);
+        match sent.iter().find_map(|m| match m {
+            RpcMessage::AppendEntries(r) => Some(r.clone()),
+            _ => None,
+        }) {
+            Some(request) => {
+                assert_eq!(request.prev_log_index, 5);
+                assert_eq!(request.entries.first().map(|e| e.index), Some(6));
+            }
+            None => panic!("expected entries to follow straight away, got {sent:?}"),
+        }
+    }
+
+    #[test]
+    fn an_answer_about_a_different_snapshot_is_ignored() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.config.snapshot_chunk_bytes = 16;
+        cluster.persistent.current_term = 2;
+        cluster.become_leader();
+        cluster.leader_state.next_index.insert(3, 4);
+        cluster.broadcast_append_entries();
+        drain(&mut outputs, 3);
+
+        cluster.handle_rpc(3, install_answer(2, 9999, true, 3)); // some older transfer
+        assert_eq!(cluster.snapshot_sends[&3].offset(), 0);
+        assert_eq!(cluster.leader_state.match_index.get(&3).copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn losing_leadership_abandons_every_transfer() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 2;
+        cluster.become_leader();
+        cluster.leader_state.next_index.insert(3, 4);
+        cluster.broadcast_append_entries();
+        assert!(!cluster.snapshot_sends.is_empty());
+
+        cluster.handle_rpc(2, higher_term_response(9));
+        assert!(cluster.snapshot_sends.is_empty());
+        assert!(cluster.snapshot_cache.is_none());
+    }
+
+    #[test]
+    fn a_node_can_be_added_after_the_log_was_compacted_and_is_caught_up_by_snapshot() {
+        let dir = TestDir::new();
+        let (mut cluster, _outputs, connections) = make_cluster_recording(dir.path(), &[]);
+        cluster.config.snapshot_threshold = 2;
+        cluster.begin_election();
+        settle(&mut cluster);
+        for _ in 0..3 {
+            let (put, _rx) = put_command_with_receiver("k", "v");
+            cluster.handle_client_command(put);
+            settle(&mut cluster);
+        }
+        let compacted_to = cluster.log.base_index();
+        assert!(compacted_to > 0, "a lone node trims as soon as it has a snapshot");
+
+        // No longer refused.
+        let mut receiver = request_change(&mut cluster, add(2));
+        assert!(cluster.learners.contains_key(&2), "the new node is taken on as a learner");
+        assert!(receiver.try_recv().is_err(), "and the request is still in progress");
+
+        // It starts empty, so it rejects the first entries it is sent...
+        let term = cluster.persistent.current_term;
+        cluster.handle_rpc(
+            2,
+            RpcMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term,
+                success: false,
+                conflict_index: Some(0),
+                match_index: 0,
+                seq: cluster.heartbeat_seq,
+            }),
+        );
+        // ...so the snapshot is what it is sent.
+        cluster.broadcast_append_entries();
+        let chunks = install_requests(drain_connection(&connections, 2));
+        assert!(!chunks.is_empty(), "the learner is sent the snapshot");
+        assert_eq!(chunks[0].last_included_index, cluster.persistence.snapshot_base());
+
+        // It installs it, catches up on what follows, and is admitted.
+        cluster.handle_rpc(2, install_answer(term, 1, true, chunks[0].last_included_index));
+        settle(&mut cluster);
+        let last = cluster.log.last_index();
+        ack(&mut cluster, 2, last);
+        assert_eq!(members(&cluster), vec![1, 2], "promoted once it had caught up");
+        assert!(config_entry_commands(&cluster).iter().any(|c| matches!(c, Command::AddNode { id: 2, .. })));
+    }
+
+    #[test]
+    fn a_snapshot_arrives_in_chunks_and_is_installed_once_complete() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs, connections) = make_cluster_recording(dir.path(), &[2, 3]);
+        let bytes = snapshot_bytes(
+            9,
+            1,
+            &[(1, ""), (2, ""), (3, ""), (4, "node4:7000")],
+            &[("alpha", "1"), ("beta", "2")],
+        );
+        let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 9, 1, 25);
+
+        let (last, earlier) = answers.split_last().unwrap();
+        assert!(earlier.iter().all(|a| !a.installed), "not installed before the last piece");
+        assert!(earlier.windows(2).all(|w| w[1].next_offset > w[0].next_offset));
+        assert!(last.installed);
+        assert_eq!(cluster.kv_store.get("alpha"), Some(&b"1".to_vec()));
+        assert_eq!(cluster.kv_store.get("beta"), Some(&b"2".to_vec()));
+        assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (9, 9));
+        assert_eq!((cluster.volatile.commit_index, cluster.volatile.last_applied), (9, 9));
+        assert_eq!(members(&cluster), vec![1, 2, 3, 4], "membership comes with the snapshot");
+        assert!(connections.lock().unwrap().contains_key(&4), "and node 4 is dialled");
+        assert_eq!(cluster.persistence.snapshot_base(), 9);
+        assert_eq!(cluster.snapshots_installed, 1);
+        assert!(cluster.incoming_snapshot.is_none());
+
+        // It is durable: a restart comes back to the same place.
+        drop(cluster);
+        let (restarted, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        assert_eq!(restarted.volatile.last_applied, 9);
+        assert_eq!(restarted.kv_store.get("alpha"), Some(&b"1".to_vec()));
+        assert_eq!(members(&restarted), vec![1, 2, 3, 4]);
+        assert_eq!(std::fs::read(dir.path().join(storage::SNAPSHOT_FILE)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_log_that_already_holds_the_snapshots_last_entry_keeps_what_follows_it() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let entries: Vec<LogEntry> = (1..=8).map(|i| put_log_entry(i, 1)).collect();
+        cluster.handle_rpc(2, append_request_committing(1, 2, 0, 0, entries, 0));
+        drain(&mut outputs, 2);
+
+        let bytes = snapshot_bytes(5, 1, &[(1, ""), (2, ""), (3, "")], &[("from-snapshot", "yes")]);
+        let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 5, 1, 10_000);
+
+        assert!(answers.last().unwrap().installed);
+        assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 8), "6..=8 are kept");
+        assert_eq!(cluster.volatile.commit_index, 5);
+        assert!(cluster.kv_store.get("from-snapshot").is_some(), "state is the snapshot's");
+        assert!(cluster.kv_store.get("k6").is_none(), "entries after it are not applied yet");
+        assert_eq!(wal_indices(dir.path()), vec![6, 7, 8]);
+    }
+
+    #[test]
+    fn a_log_that_disagrees_with_the_snapshot_is_discarded() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let entries: Vec<LogEntry> = (1..=8).map(|i| put_log_entry(i, 1)).collect();
+        cluster.handle_rpc(2, append_request_committing(1, 2, 0, 0, entries, 0));
+        drain(&mut outputs, 2);
+
+        // The snapshot says entry 5 was written in term 2; ours was term 1.
+        let bytes = snapshot_bytes(5, 2, &[(1, ""), (2, ""), (3, "")], &[("from-snapshot", "yes")]);
+        let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 5, 2, 10_000);
+
+        assert!(answers.last().unwrap().installed);
+        assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 5), "nothing after it");
+        assert!(wal_indices(dir.path()).is_empty());
+        assert!(cluster.kv_store.get("k1").is_none(), "the old state is gone");
+    }
+
+    #[test]
+    fn a_snapshot_the_node_already_has_everything_in_is_acknowledged_and_ignored() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        follower_applies(&mut cluster, 1, 7);
+        drain(&mut outputs, 2);
+
+        let bytes = snapshot_bytes(5, 1, &[(1, ""), (2, ""), (3, "")], &[("old", "state")]);
+        // In small pieces: the first one is enough to say "I have all of this", so the
+        // leader does not waste the rest of the transfer.
+        let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 5, 1, 10);
+
+        assert_eq!(answers.len(), 1, "the leader is told at the first piece, not the last");
+        assert!(answers[0].installed, "told it has everything, so the leader moves on");
+        assert!(cluster.kv_store.get("old").is_none(), "its own newer state is untouched");
+        assert!(cluster.kv_store.get("k7").is_some());
+        assert_eq!(cluster.volatile.last_applied, 7);
+        assert_eq!(cluster.snapshots_installed, 0);
+    }
+
+    #[test]
+    fn a_piece_that_skips_ahead_is_answered_with_where_to_continue() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
+        let total = bytes.len() as u64;
+        cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 0, total, &bytes[..20], false));
+        assert_eq!(install_responses(&mut outputs, 2)[0].next_offset, 20);
+
+        cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 40, total, &bytes[40..50], false));
+        let answer = install_responses(&mut outputs, 2).remove(0);
+        assert_eq!((answer.next_offset, answer.installed), (20, false));
+
+        // And the same piece twice is stored once.
+        cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 0, total, &bytes[..20], false));
+        assert_eq!(install_responses(&mut outputs, 2)[0].next_offset, 20);
+    }
+
+    #[test]
+    fn a_piece_of_a_transfer_the_node_knows_nothing_about_restarts_it() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
+        // The node restarted mid-transfer: it receives piece two with no piece one.
+        cluster.handle_rpc(
+            2,
+            chunk_from_leader(1, 9, 1, 30, bytes.len() as u64, &bytes[30..], true),
+        );
+        let answer = install_responses(&mut outputs, 2).remove(0);
+        assert_eq!((answer.next_offset, answer.installed), (0, false));
+        assert!(cluster.kv_store.is_empty());
+    }
+
+    #[test]
+    fn a_corrupted_snapshot_is_not_installed() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let mut bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1"), ("b", "2")]);
+        let middle = bytes.len() - 3;
+        bytes[middle] ^= 0xFF;
+        let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 9, 1, 30);
+
+        let last = answers.last().unwrap();
+        assert!(!last.installed);
+        assert_eq!(last.next_offset, 0, "and the leader is told to start over");
+        assert!(cluster.kv_store.is_empty());
+        assert_eq!((cluster.log.base_index(), cluster.volatile.last_applied), (0, 0));
+        assert_eq!(cluster.persistence.snapshot_base(), 0);
+        assert!(!dir.path().join(storage::SNAPSHOT_FILE).exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_snapshot_that_is_not_the_one_announced_is_not_installed() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
+        // The leader claims index 12; the bytes are index 9.
+        let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 12, 1, 10_000);
+        assert!(!answers.last().unwrap().installed);
+        assert!(cluster.kv_store.is_empty());
+        assert_eq!(cluster.persistence.snapshot_base(), 0);
+    }
+
+    #[test]
+    fn a_snapshot_from_a_stale_leader_is_refused_and_it_is_told_our_term() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.persistent.current_term = 3;
+        let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
+        cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 0, bytes.len() as u64, &bytes, true));
+        let answer = install_responses(&mut outputs, 2).remove(0);
+        assert_eq!((answer.term, answer.installed), (3, false));
+        assert!(cluster.kv_store.is_empty());
+        assert_eq!(cluster.known_leader, None, "a stale leader is not adopted");
+    }
+
+    #[test]
+    fn each_piece_counts_as_hearing_from_the_leader() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        forget_leader_contact(&mut cluster);
+        let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
+        cluster.handle_rpc(2, chunk_from_leader(4, 9, 1, 0, bytes.len() as u64, &bytes[..10], false));
+        drain(&mut outputs, 2);
+
+        assert_eq!(cluster.known_leader, Some(2));
+        assert_eq!(cluster.persistent.current_term, 4, "the leader's newer term is adopted");
+        assert!(cluster.volatile.last_heartbeat.elapsed() < Duration::from_millis(500));
+        // So a pre-vote against that leader is denied while the transfer is going on.
+        cluster.handle_rpc(3, pre_vote_request(5, 3));
+        match drain(&mut outputs, 3).pop() {
+            Some(RpcMessage::PreVoteResponse(resp)) => assert!(!resp.vote_granted),
+            other => panic!("expected a pre-vote answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_announcing_an_absurd_size_is_refused() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.handle_rpc(
+            2,
+            chunk_from_leader(1, 9, 1, 0, raft_core::MAX_SNAPSHOT_BYTES + 1, &[1, 2, 3], false),
+        );
+        let answer = install_responses(&mut outputs, 2).remove(0);
+        assert_eq!((answer.next_offset, answer.installed), (0, false));
+        assert!(cluster.incoming_snapshot.is_none());
+    }
+
+    #[test]
+    fn starting_over_abandons_what_was_half_received() {
+        let dir = TestDir::new();
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        let first = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("old-leader", "1")]);
+        let second = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("new-leader", "1")]);
+        // Half of one snapshot arrives...
+        cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 0, first.len() as u64, &first[..30], false));
+        drain(&mut outputs, 2);
+        // ...then a transfer starts from the beginning (a different leader, say).
+        let answers = send_snapshot(&mut cluster, &mut outputs, &second, 9, 1, 40);
+        assert!(answers.last().unwrap().installed);
+        assert!(cluster.kv_store.get("new-leader").is_some());
+        assert!(cluster.kv_store.get("old-leader").is_none(), "nothing of the first leaks in");
+    }
+
+    #[test]
+    fn the_term_adopted_from_a_snapshot_chunk_is_durable() {
+        let dir = TestDir::new();
+        {
+            let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+            let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
+            cluster.handle_rpc(2, chunk_from_leader(6, 9, 1, 0, bytes.len() as u64, &bytes[..10], false));
+            drain(&mut outputs, 2);
+        }
+        let (restarted, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        assert_eq!(restarted.persistent.current_term, 6, "acknowledged, so it must survive a crash");
+    }
+
+    #[test]
+    fn a_follower_receiving_a_snapshot_still_counts_as_reachable() {
+        let dir = TestDir::new();
+        write_snapshot_fixture(dir.path(), 5, 7, Membership::of_ids([1, 2, 3]));
+        let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
+        cluster.config.snapshot_chunk_bytes = 16;
+        cluster.persistent.current_term = 2;
+        cluster.become_leader();
+        cluster.leader_state.next_index.insert(3, 4);
+        cluster.broadcast_append_entries();
+        drain(&mut outputs, 3);
+        cluster.leader_state.last_ack.remove(&3);
+        cluster.leader_state.ack_seq.remove(&3);
+
+        cluster.handle_rpc(3, install_answer(2, 16, false, 5));
+
+        assert!(cluster.leader_state.last_ack.contains_key(&3), "the answer proves it is reachable");
+        assert!(cluster.leader_state.ack_seq.contains_key(&3), "and names the round it answered");
     }
 }

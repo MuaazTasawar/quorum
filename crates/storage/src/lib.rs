@@ -10,7 +10,8 @@ pub use persistence::{
     Persistence, PersistenceError, Recovered, RecoveredSnapshot, HARD_STATE_FILE, WAL_FILE,
 };
 pub use snapshot::{
-    load_snapshot, save_snapshot, SnapshotError, SnapshotMetadata, SNAPSHOT_FILE,
+    decode_snapshot, encode_snapshot, load_snapshot, peek_snapshot_metadata, save_snapshot,
+    write_snapshot_bytes, SnapshotError, SnapshotMetadata, SNAPSHOT_FILE,
     SNAPSHOT_FORMAT_VERSION,
 };
 pub use wal::{Wal, WalError, WalRecovery};

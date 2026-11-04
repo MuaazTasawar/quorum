@@ -60,6 +60,7 @@ fn idle_snapshot() -> ClusterSnapshot {
         snapshot_index: 0,
         log_base: 0,
         snapshots_taken: 0,
+        snapshots_installed: 0,
     }
 }
 

@@ -15,6 +15,14 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(3000);
 /// single membership-change slot forever.
 pub const DEFAULT_CATCH_UP_TIMEOUT: Duration = Duration::from_millis(20_000);
 
+/// Snapshot after this many applied entries, by default. A snapshot bounds the disk the
+/// log uses and the time a restart spends replaying it; a follower or new node that has
+/// fallen behind the compacted part of the log is brought up to date with the snapshot.
+pub const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 10_000;
+
+/// How big each piece of a snapshot sent to a follower is, by default.
+pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: u64 = 64 * 1024;
+
 /// How many log entries are kept behind a snapshot, by default, so that a follower
 /// that is only slightly behind can still be sent entries rather than a snapshot.
 pub const DEFAULT_SNAPSHOT_RETAIN: u64 = 1000;
@@ -85,10 +93,10 @@ pub struct NodeConfig {
     /// How long a joining node gets to catch up before the leader abandons it.
     pub catch_up_timeout: Duration,
     /// Take a snapshot once this many entries have been applied since the last one.
-    /// 0 turns snapshots, and with them log compaction, off. Off by default: a node
-    /// that falls behind the compacted part of a leader's log can only be caught up
-    /// by sending it a snapshot, which a later phase adds.
+    /// 0 turns snapshots, and with them log compaction, off.
     pub snapshot_threshold: u64,
+    /// Size of each piece a snapshot is sent in when a follower needs it.
+    pub snapshot_chunk_bytes: usize,
     /// How many entries to keep in the log behind the newest snapshot.
     pub snapshot_retain: u64,
 }
@@ -122,8 +130,10 @@ impl NodeConfig {
     ///                                     existing cluster, PEERS lists its members)
     ///   QUORUM_CATCH_UP_TIMEOUT_MS=20000 (optional; how long a joining node gets
     ///                                     to catch up with the leader)
-    ///   QUORUM_SNAPSHOT_THRESHOLD=0      (optional; snapshot after this many applied
-    ///                                     entries; 0 = never, the default)
+    ///   QUORUM_SNAPSHOT_THRESHOLD=10000  (optional; snapshot after this many applied
+    ///                                     entries; 0 = never)
+    ///   QUORUM_SNAPSHOT_CHUNK_BYTES=65536 (optional; size of each piece of a snapshot
+    ///                                     sent to a follower that needs it)
     ///   QUORUM_SNAPSHOT_RETAIN=1000      (optional; log entries kept behind a snapshot)
     pub fn from_env() -> anyhow::Result<Self> {
         let id: NodeId = std::env::var("QUORUM_NODE_ID")
@@ -156,8 +166,16 @@ impl NodeConfig {
         let snapshot_threshold = parse_count(
             "QUORUM_SNAPSHOT_THRESHOLD",
             std::env::var("QUORUM_SNAPSHOT_THRESHOLD").ok().as_deref(),
-            0,
+            DEFAULT_SNAPSHOT_THRESHOLD,
         )?;
+        let snapshot_chunk_bytes = parse_count(
+            "QUORUM_SNAPSHOT_CHUNK_BYTES",
+            std::env::var("QUORUM_SNAPSHOT_CHUNK_BYTES").ok().as_deref(),
+            DEFAULT_SNAPSHOT_CHUNK_BYTES,
+        )?;
+        if snapshot_chunk_bytes == 0 {
+            anyhow::bail!("QUORUM_SNAPSHOT_CHUNK_BYTES must be greater than zero");
+        }
         let snapshot_retain = parse_count(
             "QUORUM_SNAPSHOT_RETAIN",
             std::env::var("QUORUM_SNAPSHOT_RETAIN").ok().as_deref(),
@@ -175,6 +193,7 @@ impl NodeConfig {
             join,
             catch_up_timeout,
             snapshot_threshold,
+            snapshot_chunk_bytes: snapshot_chunk_bytes as usize,
             snapshot_retain,
         })
     }
@@ -402,6 +421,7 @@ mod tests {
             join,
             catch_up_timeout: DEFAULT_CATCH_UP_TIMEOUT,
             snapshot_threshold: 0,
+            snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES as usize,
             snapshot_retain: DEFAULT_SNAPSHOT_RETAIN,
         }
     }
@@ -420,11 +440,16 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_are_off_unless_asked_for() {
-        assert_eq!(parse_count("X", None, 0).unwrap(), 0);
-        assert_eq!(parse_count("X", Some("500"), 0).unwrap(), 500);
-        assert_eq!(parse_count("X", Some(" 0 "), 7).unwrap(), 0, "zero is a real setting");
+    fn snapshots_are_on_by_default_and_zero_turns_them_off() {
+        assert_eq!(
+            parse_count("X", None, DEFAULT_SNAPSHOT_THRESHOLD).unwrap(),
+            10_000,
+            "snapshots are on unless switched off"
+        );
+        assert_eq!(parse_count("X", Some("500"), 10_000).unwrap(), 500);
+        assert_eq!(parse_count("X", Some(" 0 "), 10_000).unwrap(), 0, "zero is a real setting");
         assert_eq!(parse_count("X", None, DEFAULT_SNAPSHOT_RETAIN).unwrap(), 1000);
+        assert_eq!(DEFAULT_SNAPSHOT_CHUNK_BYTES, 65_536);
     }
 
     #[test]
