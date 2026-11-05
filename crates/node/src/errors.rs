@@ -20,6 +20,24 @@ pub enum AppError {
     ChannelClosed,
     #[error("invalid key: {0}")]
     InvalidKey(String),
+    /// The request itself is malformed (bad JSON, bad base64, both or neither of
+    /// `value` / `value_b64`). Nothing was accepted; resending it unchanged fails again.
+    #[error("{0}")]
+    BadRequest(String),
+    /// The value is bigger than this cluster accepts. Nothing was accepted.
+    #[error("the value is too large: {detail}")]
+    ValueTooLarge { detail: String },
+    /// The body's content type is not one the key endpoints understand.
+    #[error("unsupported content type; send application/octet-stream (raw bytes) or application/json")]
+    UnsupportedMediaType,
+    /// A raw read of a key that does not exist on the leader.
+    #[error("key not found")]
+    KeyNotFound,
+    /// A raw read sent to a node that is not the leader. A raw response has no room for
+    /// the `is_leader` field a JSON one carries, so this gets its own status (421) and a
+    /// small JSON body naming the leader, if this node knows it.
+    #[error("this node is not the leader")]
+    NotLeader { leader_hint: Option<u32> },
     /// The node is carrying all the work it will hold at once. The request was
     /// NOT accepted (nothing was logged or replicated), so retrying is always
     /// safe, unlike a timeout, where a write may already have taken effect.
@@ -58,7 +76,11 @@ impl AppError {
     fn status(&self) -> StatusCode {
         match self {
             AppError::ChannelClosed => StatusCode::SERVICE_UNAVAILABLE,
-            AppError::InvalidKey(_) => StatusCode::BAD_REQUEST,
+            AppError::InvalidKey(_) | AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::ValueTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            AppError::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            AppError::KeyNotFound => StatusCode::NOT_FOUND,
+            AppError::NotLeader { .. } => StatusCode::MISDIRECTED_REQUEST,
             AppError::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             AppError::LeadershipLost => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
@@ -81,15 +103,37 @@ impl AppError {
             AppError::Timeout { may_have_applied } => *may_have_applied,
             AppError::ChannelClosed
             | AppError::InvalidKey(_)
+            | AppError::BadRequest(_)
+            | AppError::ValueTooLarge { .. }
+            | AppError::UnsupportedMediaType
+            | AppError::KeyNotFound
+            | AppError::NotLeader { .. }
             | AppError::Overloaded
             | AppError::MembershipRejected(_) => false,
         }
     }
 }
 
+#[derive(Serialize)]
+struct NotLeaderBody {
+    error: String,
+    outcome_unknown: bool,
+    is_leader: bool,
+    leader_hint: Option<u32>,
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
+        if let AppError::NotLeader { leader_hint } = &self {
+            let body = NotLeaderBody {
+                error: self.to_string(),
+                outcome_unknown: false,
+                is_leader: false,
+                leader_hint: *leader_hint,
+            };
+            return (status, Json(body)).into_response();
+        }
         let retry_after = matches!(
             self,
             AppError::Overloaded | AppError::MembershipRejected(AdminRejection::NotReady)
@@ -193,5 +237,42 @@ mod tests {
     async fn a_bad_address_is_400() {
         let (status, _) = render(AppError::MembershipRejected(AdminRejection::BadAddress)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn requests_that_can_never_succeed_are_4xx_and_safe_to_give_up_on() {
+        for (error, status) in [
+            (AppError::InvalidKey("empty".into()), StatusCode::BAD_REQUEST),
+            (AppError::BadRequest("bad json".into()), StatusCode::BAD_REQUEST),
+            (AppError::ValueTooLarge { detail: "5 > 4".into() }, StatusCode::PAYLOAD_TOO_LARGE),
+            (AppError::UnsupportedMediaType, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let (got, body) = render(error).await;
+            assert_eq!(got, status);
+            assert!(body.contains("\"outcome_unknown\":false"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_on_a_raw_read_is_404() {
+        let (status, body) = render(AppError::KeyNotFound).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("key not found"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_raw_read_on_a_follower_is_421_and_names_the_leader() {
+        let (status, body) = render(AppError::NotLeader { leader_hint: Some(3) }).await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+        assert!(body.contains("\"is_leader\":false") && body.contains("\"leader_hint\":3"), "{body}");
+        let (_, body) = render(AppError::NotLeader { leader_hint: None }).await;
+        assert!(body.contains("\"leader_hint\":null"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn none_of_the_new_errors_ask_the_client_to_retry_later() {
+        for error in [AppError::KeyNotFound, AppError::BadRequest("x".into()), AppError::UnsupportedMediaType] {
+            assert!(error.into_response().headers().get(header::RETRY_AFTER).is_none());
+        }
     }
 }

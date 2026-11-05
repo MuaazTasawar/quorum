@@ -1,3 +1,4 @@
+pub mod base64;
 pub mod cluster;
 pub mod config;
 pub mod errors;

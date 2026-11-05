@@ -1,6 +1,6 @@
 use node::{
     cluster::{Cluster, PeerConnector},
-    config::{request_timeout_from_env, NodeConfig},
+    config::{parse_max_value_bytes, request_timeout_from_env, NodeConfig},
     metrics_api, network,
 };
 use std::collections::HashMap;
@@ -73,7 +73,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(timeout_ms = request_timeout.as_millis() as u64, "request timeout");
     let (cluster, handle) = Cluster::new(config, recovered, peer_outboxes, inbox_rx, connector);
 
-    let app_state = metrics_api::AppState::from_handle(handle, request_timeout);
+    let max_value_bytes = parse_max_value_bytes(std::env::var("QUORUM_MAX_VALUE_BYTES").ok().as_deref())?;
+    tracing::info!(max_value_bytes, "largest accepted value");
+    let app_state = metrics_api::AppState::from_handle(handle, request_timeout)
+        .with_max_value_bytes(max_value_bytes);
     let router = metrics_api::router(app_state);
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(&metrics_addr).await {

@@ -23,6 +23,11 @@ pub const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 10_000;
 /// How big each piece of a snapshot sent to a follower is, by default.
 pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: u64 = 64 * 1024;
 
+/// The largest value, in bytes, the HTTP API accepts by default. A value travels in a log
+/// entry, is copied to every node, and is held in memory (and in every snapshot), so very
+/// large ones belong in an object store with a pointer here.
+pub const DEFAULT_MAX_VALUE_BYTES: usize = 1024 * 1024;
+
 /// How many log entries are kept behind a snapshot, by default, so that a follower
 /// that is only slightly behind can still be sent entries rather than a snapshot.
 pub const DEFAULT_SNAPSHOT_RETAIN: u64 = 1000;
@@ -277,6 +282,19 @@ pub fn parse_count(name: &str, raw: Option<&str>, default: u64) -> anyhow::Resul
     }
 }
 
+/// Parses `QUORUM_MAX_VALUE_BYTES`, defaulting to [`DEFAULT_MAX_VALUE_BYTES`].
+pub fn parse_max_value_bytes(raw: Option<&str>) -> anyhow::Result<usize> {
+    let bytes = parse_count("QUORUM_MAX_VALUE_BYTES", raw, DEFAULT_MAX_VALUE_BYTES as u64)?;
+    if bytes == 0 {
+        anyhow::bail!("QUORUM_MAX_VALUE_BYTES must be greater than zero");
+    }
+    // Snapshots are capped well below the frame limit; one value cannot exceed that.
+    if bytes > 16 * 1024 * 1024 {
+        anyhow::bail!("QUORUM_MAX_VALUE_BYTES must be at most 16777216 (16 MiB)");
+    }
+    Ok(bytes as usize)
+}
+
 /// Parses `QUORUM_CATCH_UP_TIMEOUT_MS`, defaulting to [`DEFAULT_CATCH_UP_TIMEOUT`].
 pub fn parse_catch_up_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
     let Some(raw) = raw else {
@@ -457,5 +475,15 @@ mod tests {
         let error = parse_count("QUORUM_SNAPSHOT_THRESHOLD", Some("lots"), 0).unwrap_err();
         assert!(error.to_string().contains("QUORUM_SNAPSHOT_THRESHOLD"), "{error}");
         assert!(parse_count("X", Some("-3"), 0).is_err());
+    }
+
+    #[test]
+    fn the_value_limit_defaults_to_one_mebibyte_and_rejects_nonsense() {
+        assert_eq!(parse_max_value_bytes(None).unwrap(), 1024 * 1024);
+        assert_eq!(parse_max_value_bytes(Some("4096")).unwrap(), 4096);
+        assert!(parse_max_value_bytes(Some("0")).is_err());
+        assert!(parse_max_value_bytes(Some("big")).is_err());
+        assert!(parse_max_value_bytes(Some("16777217")).is_err());
+        assert_eq!(parse_max_value_bytes(Some("16777216")).unwrap(), 16 * 1024 * 1024);
     }
 }

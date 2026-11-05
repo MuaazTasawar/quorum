@@ -90,8 +90,38 @@ Verification: raft-core 103, storage 68, transport 6, node unit 151 + integratio
 mutation checks all caught (two needed stronger tests); full suite twice, snapshot_test six times stable; real 4-process TCP run
 (join after the leader trimmed to 100, 200-byte chunks, kill -9 leader, 0 keys lost), also under an 80-200 ms fsync shim.
 
+## Phase 23 (done): API + SDK hardening
+HTTP API (node/src/metrics_api.rs):
+- Keys: shared rules in storage::validate_key (non-empty, <= 512 bytes, no control characters, not "." or ".."; those two cannot
+  be addressed over HTTP because URL parsers normalise them). Enforced on every request AND by the SDK. A bad key is 400.
+  Previously NOTHING validated keys (InvalidKey existed but was never produced).
+- Values are binary-safe. PUT /kv/{key}: Content-Type application/octet-stream = raw bytes; application/json = {"value":"text"} OR
+  {"value_b64":"..."} (exactly one; strict RFC 4648 base64, own codec in node/src/base64.rs, no new dependency). Other types: 415.
+  GET /kv/{key}: JSON now {is_leader, found, value, value_b64, leader_hint}: value_b64 is always the exact bytes, value is text only
+  when valid UTF-8 (null for binary). Accept: application/octet-stream returns the raw bytes (404 {"error":"key not found"} if
+  absent, 421 + {is_leader:false, leader_hint} on a follower). Old JSON clients are unchanged.
+- QUORUM_MAX_VALUE_BYTES (default 1 MiB, max 16 MiB): larger values are 413, nothing logged. Body limit = base64 size + 4 KiB.
+- Status map: 400 bad request/key, 409 membership conflict (nothing applied), 413 too large, 415 bad content type, 421 raw read on
+  a follower, 503 busy (outcome_unknown false) or leadership lost (true), 504 timeout (write: true, read: false).
+SDK (client crate): QuorumClient::{get,get_bytes,put,put_bytes,delete,add_member,remove_member,members}, ClientConfig
+{request_timeout, max_attempts, initial_backoff, max_backoff, retry_unknown_writes}.
+- Keys are percent-encoded (before: "a?b" silently addressed key "a", "a/b" a different route). Values are bytes; get() on non-UTF-8 is
+  ClientError::NotUtf8, never lossy.
+- Every answer is classified (pure fn `classify`): Done / NotLeader(hint) / Busy (retry with exponential backoff + jitter, honours
+  Retry-After capped at max_backoff) / Unknown / Fatal / Skip (try next node). Errors: InvalidKey, Rejected{status,message},
+  OutcomeUnknown, Unavailable, NoLeaderReachable{detail}, NotUtf8.
+- A write or membership change whose outcome is unknown (503/504 with outcome_unknown, or a client-side timeout AFTER connecting) is
+  NOT resent by default and NOT tried on another node: the cluster has no request de-duplication, so a replay can overwrite a newer
+  write. retry_unknown_writes=true opts in. A connection that failed before sending is safe to move past, even for writes.
+  members() reads /health to resolve an unknown membership change.
+- client/examples/smoke.rs is a runnable tour (QUORUM_NODES=1=host:port,...).
+Verification: storage 73, node unit 163, transport 6, raft-core 103, client unit 22 + scripted-server behaviour tests 23, node integration
+incl. api_test 12 and sdk_test 5 (451 total), 0 warnings; 19 mutation checks all caught (one needed a new test: leader memory);
+full suite twice, new suites five times stable; real 3-process run (SDK example, 5000 random bytes via curl cmp-identical, odd keys
+distinct, 400/413/415/421/404 as designed, old JSON client unchanged, SDK works after kill -9 of the leader).
+Cargo.lock changed (client -> storage, node dev-dep -> client): commit it, CI uses --locked.
+
 ## Remaining plan
-23 API + SDK hardening (binary-safe values, key validation, SDK handles 503/504/409)
 24 observability (Prometheus /metrics, dashboard) | 25 security (TLS, auth, certgen) | 26 chaos CLI v2 + Docker volumes
 27 deterministic simulation + linearizability checker | then regenerate the README.
 
@@ -120,4 +150,4 @@ mutation checks all caught (two needed stronger tests); full suite twice, snapsh
 A dead member pins the leader's log until it is removed; snapshot work runs inside the event loop (writing, decoding a received one,
 and the leader reading the file all stall it in proportion to state size + fsync); a snapshot is held fully in memory while being sent or
 received (1 GiB cap) and a transfer interrupted by a restart starts over; transfer is stop-and-wait (one chunk per round trip);
-WAL has no per-record checksums; no TLS/auth; values are lossy UTF-8 over HTTP; chaos CLI is Windows and 3-node only.
+WAL has no per-record checksums; no TLS/auth; the SDK has no request de-duplication (hence no automatic retry of unknown writes); chaos CLI is Windows and 3-node only.

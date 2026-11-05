@@ -81,6 +81,7 @@ async fn stuck_api(
         snapshot_rx,
         request_timeout: timeout,
         admin_timeout: timeout * 10,
+        max_value_bytes: node::config::DEFAULT_MAX_VALUE_BYTES,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

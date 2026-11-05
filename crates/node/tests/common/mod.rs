@@ -426,6 +426,16 @@ impl TestCluster {
     /// a free local port and returns its address. Lets a test exercise the whole
     /// path: HTTP request -> cluster -> consensus -> HTTP response.
     pub async fn serve_http(&self, id: NodeId, request_timeout: Duration) -> SocketAddr {
+        self.serve_http_limited(id, request_timeout, node::config::DEFAULT_MAX_VALUE_BYTES).await
+    }
+
+    /// Like `serve_http`, with the largest accepted value set to `max_value_bytes`.
+    pub async fn serve_http_limited(
+        &self,
+        id: NodeId,
+        request_timeout: Duration,
+        max_value_bytes: usize,
+    ) -> SocketAddr {
         let handle = &self.nodes[&id].handle;
         let state = AppState {
             command_tx: handle.command_tx.clone(),
@@ -434,6 +444,7 @@ impl TestCluster {
             snapshot_rx: handle.snapshot_rx.clone(),
             request_timeout,
             admin_timeout: request_timeout * 10,
+            max_value_bytes,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
