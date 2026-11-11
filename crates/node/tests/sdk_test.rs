@@ -101,28 +101,53 @@ async fn the_sdk_keeps_working_when_the_leader_crashes() {
 #[tokio::test]
 async fn a_write_to_a_leader_that_is_cut_off_is_reported_unknown_and_not_resent() {
     let cluster = TestCluster::start(&[1, 2, 3]);
-    let old_leader = cluster.wait_for_leader(SETTLE).await;
-    let others: Vec<NodeId> = [1, 2, 3].into_iter().filter(|&id| id != old_leader).collect();
+    cluster.wait_for_leader(SETTLE).await;
     let nodes = serve(&cluster, &[1, 2, 3], Duration::from_secs(2), 1 << 20).await;
-    let client = QuorumClient::with_config(nodes.clone(), patient());
+    let client = QuorumClient::with_config(nodes, patient());
 
-    client.put("warmup", "1").await.unwrap(); // the client now believes `old_leader` leads
-    cluster.isolate(old_leader);
-    cluster.wait_for_leader_among(&others, SETTLE).await;
+    // What happens to a write sent to a leader that has just been cut off depends on a
+    // race against that leader's own step-down, which no test can fix in advance:
+    //
+    //   * if the write reaches it while it still believes it leads, it takes the write,
+    //     cannot commit it, loses leadership, and cannot say whether the write survived.
+    //     The client must report that, and must NOT also send the write elsewhere;
+    //   * if it has already stepped down, it redirects, and the client follows the
+    //     redirect: an ordinary success.
+    //
+    // Both are correct. So the write is sent the instant the leader is cut off, and the
+    // scenario is repeated until the first case has been seen, checking every attempt.
+    let mut saw_unknown = false;
+    for attempt in 0..12 {
+        client.put(&format!("warmup-{attempt}"), "1").await.unwrap(); // learns the leader
+        let leader = cluster.wait_for_leader(SETTLE).await;
+        cluster.isolate(leader);
 
-    // The write goes to the leader the client knew. It takes it, cannot commit it, and
-    // loses leadership: it cannot say whether the write survived. The client says so,
-    // and does not quietly send it to the new leader as well.
-    let error = client.put("contested", "first").await.unwrap_err();
-    assert!(matches!(error, ClientError::OutcomeUnknown { .. }), "{error}");
+        let key = format!("contested-{attempt}");
+        let result = client.put(&key, "first").await;
 
-    cluster.heal();
-    cluster.wait_until(SETTLE, "one leader again", |c| c.leaders().len() == 1).await;
-    assert_eq!(
-        client.get("contested").await.unwrap(),
-        None,
-        "it never left the isolated node, so it was lost: unknown was the honest answer"
-    );
+        cluster.heal();
+        cluster.wait_until(SETTLE, "one leader again", |c| c.leaders().len() == 1).await;
+
+        match result {
+            Err(ClientError::OutcomeUnknown { .. }) => {
+                // Unknown really is unknown: the write may have been lost with the cut-off
+                // node, or (if that node won the next election) may have survived.
+                let now = client.get(&key).await.unwrap();
+                assert!(
+                    now.is_none() || now.as_deref() == Some("first"),
+                    "the key holds {now:?}"
+                );
+                saw_unknown = true;
+                break;
+            }
+            Ok(()) => {
+                // The leader had already stepped down and the client followed the redirect.
+                assert_eq!(client.get(&key).await.unwrap(), Some("first".to_string()));
+            }
+            Err(other) => panic!("attempt {attempt}: unexpected error: {other}"),
+        }
+    }
+    assert!(saw_unknown, "never caught the leader before it stepped down in 12 attempts");
 
     // The caller can decide to try again, now that it knows.
     client.put("contested", "second").await.unwrap();
