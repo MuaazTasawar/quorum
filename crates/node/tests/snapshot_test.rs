@@ -27,17 +27,27 @@ fn compact(cluster: &TestCluster, id: NodeId, through: u64, membership: Membersh
         state.apply(&Command::decode(&entry.command).expect("entries decode"));
         term = entry.term;
     }
-    assert!(term > 0, "node {id} has nothing to snapshot through {through}");
+    assert!(
+        term > 0,
+        "node {id} has nothing to snapshot through {through}"
+    );
     persistence
         .save_snapshot_and_compact(
-            SnapshotMetadata { last_included_index: through, last_included_term: term, membership },
+            SnapshotMetadata {
+                last_included_index: through,
+                last_included_term: term,
+                membership,
+            },
             &state,
         )
         .expect("compaction should succeed");
 }
 
 fn first_wal_index(cluster: &TestCluster, id: NodeId) -> Option<u64> {
-    Wal::replay(cluster.node_dir(id).join(WAL_FILE)).unwrap().first().map(|e| e.index)
+    Wal::replay(cluster.node_dir(id).join(WAL_FILE))
+        .unwrap()
+        .first()
+        .map(|e| e.index)
 }
 
 async fn write(cluster: &TestCluster, among: &[NodeId], key: &str, value: &str) {
@@ -47,7 +57,10 @@ async fn write(cluster: &TestCluster, among: &[NodeId], key: &str, value: &str) 
         if let ClientCommandResult::Applied(_) = cluster.put(leader, key, value).await {
             return;
         }
-        assert!(tokio::time::Instant::now() < deadline, "could not write {key} in time");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "could not write {key} in time"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -59,7 +72,10 @@ async fn read(cluster: &TestCluster, among: &[NodeId], key: &str) -> Option<Vec<
         if let QueryResult::Value(value) = cluster.get(leader, key).await {
             return value;
         }
-        assert!(tokio::time::Instant::now() < deadline, "could not read {key} in time");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "could not read {key} in time"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -69,10 +85,18 @@ async fn nodes_restarted_from_snapshots_hold_the_same_data_and_can_lead() {
     let mut cluster = TestCluster::start(&[1, 2, 3]);
     let original_leader = cluster.wait_for_leader(SETTLE).await;
     for i in 0..15 {
-        write(&cluster, &[1, 2, 3], &format!("before-{i}"), &format!("v{i}")).await;
+        write(
+            &cluster,
+            &[1, 2, 3],
+            &format!("before-{i}"),
+            &format!("v{i}"),
+        )
+        .await;
     }
-    let followers: Vec<NodeId> =
-        [1, 2, 3].into_iter().filter(|&id| id != original_leader).collect();
+    let followers: Vec<NodeId> = [1, 2, 3]
+        .into_iter()
+        .filter(|&id| id != original_leader)
+        .collect();
     cluster
         .wait_until(SETTLE, "followers to apply everything", |c| {
             followers
@@ -86,23 +110,38 @@ async fn nodes_restarted_from_snapshots_hold_the_same_data_and_can_lead() {
     for &f in &followers {
         cluster.crash(f).await;
         compact(&cluster, f, through, Membership::of_ids([1, 2, 3]));
-        assert_eq!(first_wal_index(&cluster, f), None, "everything was covered by the snapshot");
+        assert_eq!(
+            first_wal_index(&cluster, f),
+            None,
+            "everything was covered by the snapshot"
+        );
     }
     for &f in &followers {
         cluster.restart(f).await;
     }
     for &f in &followers {
         let snapshot = cluster.snapshot(f);
-        assert!(snapshot.last_applied >= through, "starts from the snapshot, not from zero");
+        assert!(
+            snapshot.last_applied >= through,
+            "starts from the snapshot, not from zero"
+        );
     }
 
     // They keep replicating with the leader that was never compacted.
     for i in 0..5 {
-        write(&cluster, &[1, 2, 3], &format!("after-{i}"), &format!("w{i}")).await;
+        write(
+            &cluster,
+            &[1, 2, 3],
+            &format!("after-{i}"),
+            &format!("w{i}"),
+        )
+        .await;
     }
     cluster
         .wait_until(SETTLE, "all nodes to apply the same entries", |c| {
-            [1, 2, 3].iter().all(|&id| c.snapshot(id).last_applied == c.snapshot(1).last_applied)
+            [1, 2, 3]
+                .iter()
+                .all(|&id| c.snapshot(id).last_applied == c.snapshot(1).last_applied)
         })
         .await;
 
@@ -123,7 +162,10 @@ async fn nodes_restarted_from_snapshots_hold_the_same_data_and_can_lead() {
         );
     }
     write(&cluster, &followers, "later", "still-works").await;
-    assert_eq!(read(&cluster, &followers, "later").await, Some(b"still-works".to_vec()));
+    assert_eq!(
+        read(&cluster, &followers, "later").await,
+        Some(b"still-works".to_vec())
+    );
 }
 
 #[tokio::test]
@@ -138,8 +180,7 @@ async fn the_snapshot_not_a_stale_environment_decides_who_the_members_are() {
     write(&cluster, &[1, 2, 3, 4], "k2", "v2").await;
 
     let follower = [1, 2, 3].into_iter().find(|&id| id != leader).unwrap();
-    let original_others: Vec<NodeId> =
-        [1, 2, 3].into_iter().filter(|&id| id != follower).collect();
+    let original_others: Vec<NodeId> = [1, 2, 3].into_iter().filter(|&id| id != follower).collect();
     cluster
         .wait_until(SETTLE, "the follower to apply everything", |c| {
             c.snapshot(follower).last_applied == c.snapshot(leader).last_applied
@@ -176,10 +217,16 @@ async fn the_snapshot_not_a_stale_environment_decides_who_the_members_are() {
     // which needs this node to talk to node 4 and to count its votes.
     write(&cluster, &[1, 2, 3, 4], "k3", "v3").await;
     cluster.crash(leader).await;
-    let alive: Vec<NodeId> = [1, 2, 3, 4].into_iter().filter(|&id| id != leader).collect();
+    let alive: Vec<NodeId> = [1, 2, 3, 4]
+        .into_iter()
+        .filter(|&id| id != leader)
+        .collect();
     write(&cluster, &alive, "k4", "v4").await;
     for (key, value) in [("k", "v"), ("k2", "v2"), ("k3", "v3"), ("k4", "v4")] {
-        assert_eq!(read(&cluster, &alive, key).await, Some(value.as_bytes().to_vec()));
+        assert_eq!(
+            read(&cluster, &alive, key).await,
+            Some(value.as_bytes().to_vec())
+        );
     }
     assert_eq!(cluster.members_of(follower), vec![1, 2, 3, 4]);
 }
@@ -218,7 +265,10 @@ async fn a_running_cluster_snapshots_trims_its_logs_and_restarts_from_them() {
         cluster.restart(id).await;
     }
     for id in all {
-        assert!(cluster.snapshot(id).snapshot_index >= 50, "node {id} restarts from its snapshot");
+        assert!(
+            cluster.snapshot(id).snapshot_index >= 50,
+            "node {id} restarts from its snapshot"
+        );
     }
     for i in 0..60 {
         assert_eq!(
@@ -228,7 +278,10 @@ async fn a_running_cluster_snapshots_trims_its_logs_and_restarts_from_them() {
         );
     }
     write(&cluster, &all, "after-restart", "ok").await;
-    assert_eq!(read(&cluster, &all, "after-restart").await, Some(b"ok".to_vec()));
+    assert_eq!(
+        read(&cluster, &all, "after-restart").await,
+        Some(b"ok".to_vec())
+    );
 }
 
 #[tokio::test]
@@ -248,10 +301,18 @@ async fn a_leader_never_discards_log_a_lagging_follower_still_needs() {
     // The follower drops out while the others carry on and snapshot repeatedly.
     cluster.isolate(lagging);
     for i in 0..50 {
-        write(&cluster, &others, &format!("key-{i}"), &format!("value-{i}")).await;
+        write(
+            &cluster,
+            &others,
+            &format!("key-{i}"),
+            &format!("value-{i}"),
+        )
+        .await;
     }
     cluster
-        .wait_until(SETTLE, "the leader to snapshot", |c| c.snapshot(leader).snapshot_index >= 40)
+        .wait_until(SETTLE, "the leader to snapshot", |c| {
+            c.snapshot(leader).snapshot_index >= 40
+        })
         .await;
     let behind = cluster.snapshot(lagging).last_applied;
     let leader_view = cluster.snapshot(leader);
@@ -260,7 +321,10 @@ async fn a_leader_never_discards_log_a_lagging_follower_still_needs() {
         "the leader trimmed to {} but the follower only has {behind}: it could never catch up",
         leader_view.log_base
     );
-    assert!(leader_view.snapshot_index > behind, "the snapshot itself is well ahead of it");
+    assert!(
+        leader_view.snapshot_index > behind,
+        "the snapshot itself is well ahead of it"
+    );
 
     // It comes back and catches up through ordinary replication, then the leader
     // is free to trim.
@@ -272,9 +336,11 @@ async fn a_leader_never_discards_log_a_lagging_follower_still_needs() {
         })
         .await;
     cluster
-        .wait_until(SETTLE, "the leader to trim now that nobody needs the log", |c| {
-            c.snapshot(leader).log_base >= 40
-        })
+        .wait_until(
+            SETTLE,
+            "the leader to trim now that nobody needs the log",
+            |c| c.snapshot(leader).log_base >= 40,
+        )
         .await;
     for i in 0..50 {
         assert_eq!(
@@ -303,12 +369,18 @@ async fn a_node_added_after_the_log_was_compacted_catches_up_from_a_snapshot() {
 
     cluster.start_joiner(4);
     let leader = cluster.wait_for_leader_among(&all, SETTLE).await;
-    assert!(cluster.snapshot(leader).log_base > 0, "the entries node 4 needs are gone");
+    assert!(
+        cluster.snapshot(leader).log_base > 0,
+        "the entries node 4 needs are gone"
+    );
     let result = cluster.add_member(leader, 4).await;
     assert!(matches!(result, AdminResult::Applied { .. }), "{result:?}");
 
     let joined = cluster.snapshot(4);
-    assert!(joined.snapshots_installed >= 1, "it was brought up to date by a snapshot");
+    assert!(
+        joined.snapshots_installed >= 1,
+        "it was brought up to date by a snapshot"
+    );
     assert_eq!(cluster.members_of(4), vec![1, 2, 3, 4]);
 
     // It holds all the data and takes part: lose the old leader and node 4 is needed
@@ -321,7 +393,10 @@ async fn a_node_added_after_the_log_was_compacted_catches_up_from_a_snapshot() {
         })
         .await;
     cluster.crash(leader).await;
-    let alive: Vec<NodeId> = [1, 2, 3, 4].into_iter().filter(|&id| id != leader).collect();
+    let alive: Vec<NodeId> = [1, 2, 3, 4]
+        .into_iter()
+        .filter(|&id| id != leader)
+        .collect();
     for i in 0..40 {
         assert_eq!(
             read(&cluster, &alive, &format!("key-{i}")).await,
@@ -329,7 +404,10 @@ async fn a_node_added_after_the_log_was_compacted_catches_up_from_a_snapshot() {
             "key-{i} must have reached node 4 through the snapshot"
         );
     }
-    assert_eq!(read(&cluster, &alive, "after-join").await, Some(b"ok".to_vec()));
+    assert_eq!(
+        read(&cluster, &alive, "after-join").await,
+        Some(b"ok".to_vec())
+    );
 }
 
 #[tokio::test]
@@ -340,24 +418,36 @@ async fn a_follower_behind_a_new_leaders_compacted_log_is_caught_up_from_a_snaps
     let all = [1, 2, 3];
     let old_leader = cluster.wait_for_leader(SETTLE).await;
     let lagging = all.into_iter().find(|&id| id != old_leader).unwrap();
-    let healthy = all.into_iter().find(|&id| id != old_leader && id != lagging).unwrap();
+    let healthy = all
+        .into_iter()
+        .find(|&id| id != old_leader && id != lagging)
+        .unwrap();
     write(&cluster, &all, "warmup", "1").await;
     cluster
         .wait_until(SETTLE, "everyone to be level", |c| {
-            all.iter().all(|&id| c.snapshot(id).last_applied == c.snapshot(old_leader).last_applied)
+            all.iter()
+                .all(|&id| c.snapshot(id).last_applied == c.snapshot(old_leader).last_applied)
         })
         .await;
 
     cluster.isolate(lagging);
     let others = [old_leader, healthy];
     for i in 0..45 {
-        write(&cluster, &others, &format!("key-{i}"), &format!("value-{i}")).await;
+        write(
+            &cluster,
+            &others,
+            &format!("key-{i}"),
+            &format!("value-{i}"),
+        )
+        .await;
     }
     // The healthy follower snapshots and trims past what the lagging one has.
     cluster
-        .wait_until(SETTLE, "the healthy follower to trim past the lagging one", |c| {
-            c.snapshot(healthy).log_base > c.snapshot(lagging).last_applied + 5
-        })
+        .wait_until(
+            SETTLE,
+            "the healthy follower to trim past the lagging one",
+            |c| c.snapshot(healthy).log_base > c.snapshot(lagging).last_applied + 5,
+        )
         .await;
 
     // The old leader goes; the lagging node comes back. The only node that can lead
@@ -384,5 +474,8 @@ async fn a_follower_behind_a_new_leaders_compacted_log_is_caught_up_from_a_snaps
         );
     }
     write(&cluster, &survivors, "later", "fine").await;
-    assert_eq!(read(&cluster, &survivors, "later").await, Some(b"fine".to_vec()));
+    assert_eq!(
+        read(&cluster, &survivors, "later").await,
+        Some(b"fine".to_vec())
+    );
 }

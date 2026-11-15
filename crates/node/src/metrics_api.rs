@@ -1,12 +1,12 @@
+use crate::base64;
 use crate::cluster::{
     AdminResult, ClientAdmin, ClientCommand, ClientCommandResult, ClientQuery, ClusterHandle,
     ClusterSnapshot, MembershipChange, QueryResult,
 };
 use crate::errors::AppError;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use crate::base64;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, PathRejection};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -123,7 +123,12 @@ fn checked_key(path: Result<Path<String>, PathRejection>) -> Result<String, AppE
 
 /// The media type of a header value, without parameters, lower-cased.
 fn media_type(value: &str) -> String {
-    value.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+    value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// `is_leader` is the field clients must check first - `value: None` alone is
@@ -152,7 +157,7 @@ async fn get_key(
     let wants_raw = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |accept| accept.split(',').any(|part| media_type(part) == RAW));
+        .is_some_and(|accept| accept.split(',').any(|part| media_type(part) == RAW));
 
     let (respond_to, receiver) = oneshot::channel();
     enqueue(&state.query_tx, ClientQuery { key, respond_to })?;
@@ -216,14 +221,15 @@ fn put_value(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, AppError> {
                 .map_err(|e| AppError::BadRequest(format!("the request body is not valid: {e}")))?;
             match (parsed.value, parsed.value_b64) {
                 (Some(text), None) => Ok(text.into_bytes()),
-                (None, Some(encoded)) => base64::decode(&encoded)
-                    .map_err(|e| AppError::BadRequest(format!("value_b64 is not valid base64: {e}"))),
+                (None, Some(encoded)) => base64::decode(&encoded).map_err(|e| {
+                    AppError::BadRequest(format!("value_b64 is not valid base64: {e}"))
+                }),
                 (Some(_), Some(_)) => Err(AppError::BadRequest(
                     "send either value or value_b64, not both".into(),
                 )),
-                (None, None) => {
-                    Err(AppError::BadRequest("the body needs a value or a value_b64".into()))
-                }
+                (None, None) => Err(AppError::BadRequest(
+                    "the body needs a value or a value_b64".into(),
+                )),
             }
         }
         _ => Err(AppError::UnsupportedMediaType),
@@ -235,15 +241,25 @@ fn put_value(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, AppError> {
 /// behaviour.
 async fn submit_write(state: &AppState, command: Command) -> Result<Json<WriteResponse>, AppError> {
     let (respond_to, receiver) = oneshot::channel();
-    enqueue(&state.command_tx, ClientCommand { command, respond_to })?;
+    enqueue(
+        &state.command_tx,
+        ClientCommand {
+            command,
+            respond_to,
+        },
+    )?;
 
     match await_reply(receiver, state.request_timeout, true).await? {
-        ClientCommandResult::Applied(_) => {
-            Ok(Json(WriteResponse { is_leader: true, applied: true, leader_hint: None }))
-        }
-        ClientCommandResult::NotLeader { leader_hint } => {
-            Ok(Json(WriteResponse { is_leader: false, applied: false, leader_hint }))
-        }
+        ClientCommandResult::Applied(_) => Ok(Json(WriteResponse {
+            is_leader: true,
+            applied: true,
+            leader_hint: None,
+        })),
+        ClientCommandResult::NotLeader { leader_hint } => Ok(Json(WriteResponse {
+            is_leader: false,
+            applied: false,
+            leader_hint,
+        })),
         ClientCommandResult::LeadershipLost => Err(AppError::LeadershipLost),
         ClientCommandResult::Overloaded => Err(AppError::Overloaded),
     }
@@ -259,7 +275,10 @@ async fn put_key(
     let body = body.map_err(|rejection| {
         if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
             AppError::ValueTooLarge {
-                detail: format!("the request is larger than the limit of {} bytes", state.max_value_bytes),
+                detail: format!(
+                    "the request is larger than the limit of {} bytes",
+                    state.max_value_bytes
+                ),
             }
         } else {
             AppError::BadRequest("the request body could not be read".into())
@@ -268,7 +287,11 @@ async fn put_key(
     let value = put_value(&headers, &body)?;
     if value.len() > state.max_value_bytes {
         return Err(AppError::ValueTooLarge {
-            detail: format!("{} bytes, and the limit is {}", value.len(), state.max_value_bytes),
+            detail: format!(
+                "{} bytes, and the limit is {}",
+                value.len(),
+                state.max_value_bytes
+            ),
         });
     }
     submit_write(&state, Command::Put { key, value }).await
@@ -330,7 +353,14 @@ async fn add_member(
     State(state): State<AppState>,
     Json(body): Json<AddMemberBody>,
 ) -> Result<Json<MembershipResponse>, AppError> {
-    submit_membership_change(&state, MembershipChange::Add { id: body.id, addr: body.addr }).await
+    submit_membership_change(
+        &state,
+        MembershipChange::Add {
+            id: body.id,
+            addr: body.addr,
+        },
+    )
+    .await
 }
 
 async fn remove_member(
@@ -344,7 +374,10 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
     ws.on_upgrade(move |socket| stream_snapshots(socket, state.snapshot_rx))
 }
 
-async fn stream_snapshots(mut socket: WebSocket, mut snapshot_rx: watch::Receiver<ClusterSnapshot>) {
+async fn stream_snapshots(
+    mut socket: WebSocket,
+    mut snapshot_rx: watch::Receiver<ClusterSnapshot>,
+) {
     let initial = snapshot_rx.borrow().clone();
     if send_snapshot(&mut socket, &initial).await.is_err() {
         return;
@@ -361,7 +394,10 @@ async fn stream_snapshots(mut socket: WebSocket, mut snapshot_rx: watch::Receive
     }
 }
 
-async fn send_snapshot(socket: &mut WebSocket, snapshot: &ClusterSnapshot) -> Result<(), axum::Error> {
+async fn send_snapshot(
+    socket: &mut WebSocket,
+    snapshot: &ClusterSnapshot,
+) -> Result<(), axum::Error> {
     let payload = serde_json::to_string(snapshot).unwrap_or_default();
     socket.send(Message::Text(payload.into())).await
 }

@@ -120,6 +120,12 @@ impl LeaderState {
     }
 }
 
+impl Default for VolatileState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VolatileState {
     pub fn new() -> Self {
         Self {
@@ -173,7 +179,12 @@ mod tests {
     fn five_nodes_need_two_recent_peers_besides_the_leader() {
         let now = Instant::now();
         assert!(!leader_with_acks(&[(2, now)]).has_recent_quorum(1, &members(5), now, WINDOW));
-        assert!(leader_with_acks(&[(2, now), (3, now)]).has_recent_quorum(1, &members(5), now, WINDOW));
+        assert!(leader_with_acks(&[(2, now), (3, now)]).has_recent_quorum(
+            1,
+            &members(5),
+            now,
+            WINDOW
+        ));
     }
 
     #[test]
@@ -204,18 +215,30 @@ mod tests {
     #[test]
     fn a_round_is_confirmed_once_a_majority_has_answered_it() {
         let mut state = LeaderState::default();
-        assert!(!state.has_quorum_acked(5, 1, &members(5)), "nobody has answered yet");
+        assert!(
+            !state.has_quorum_acked(5, 1, &members(5)),
+            "nobody has answered yet"
+        );
         state.record_ack_seq(2, 5);
-        assert!(!state.has_quorum_acked(5, 1, &members(5)), "leader + 1 of 5 is not a majority");
+        assert!(
+            !state.has_quorum_acked(5, 1, &members(5)),
+            "leader + 1 of 5 is not a majority"
+        );
         state.record_ack_seq(3, 5);
-        assert!(state.has_quorum_acked(5, 1, &members(5)), "leader + 2 of 5 is a majority");
+        assert!(
+            state.has_quorum_acked(5, 1, &members(5)),
+            "leader + 2 of 5 is a majority"
+        );
     }
 
     #[test]
     fn answers_to_an_earlier_round_do_not_confirm_a_later_one() {
         let mut state = LeaderState::default();
         state.record_ack_seq(2, 4);
-        assert!(!state.has_quorum_acked(5, 1, &members(3)), "round 4 was sent before round 5 began");
+        assert!(
+            !state.has_quorum_acked(5, 1, &members(3)),
+            "round 4 was sent before round 5 began"
+        );
         assert!(state.has_quorum_acked(4, 1, &members(3)));
     }
 

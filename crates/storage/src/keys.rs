@@ -34,7 +34,10 @@ pub fn validate_key(key: &str) -> Result<(), KeyError> {
         return Err(KeyError::Reserved(key.to_string()));
     }
     if key.len() > MAX_KEY_BYTES {
-        return Err(KeyError::TooLong { len: key.len(), max: MAX_KEY_BYTES });
+        return Err(KeyError::TooLong {
+            len: key.len(),
+            max: MAX_KEY_BYTES,
+        });
     }
     if let Some((at, _)) = key.char_indices().find(|(_, c)| c.is_control()) {
         return Err(KeyError::ControlCharacter { at });
@@ -48,7 +51,16 @@ mod tests {
 
     #[test]
     fn ordinary_keys_are_valid() {
-        for key in ["a", "user:42", "path/with/slashes", "with space", "q?x=1&y=2#frag", "100%", "ключ", "鍵🔑"] {
+        for key in [
+            "a",
+            "user:42",
+            "path/with/slashes",
+            "with space",
+            "q?x=1&y=2#frag",
+            "100%",
+            "ключ",
+            "鍵🔑",
+        ] {
             assert_eq!(validate_key(key), Ok(()), "{key:?}");
         }
     }
@@ -63,18 +75,33 @@ mod tests {
         assert_eq!(validate_key(&"a".repeat(MAX_KEY_BYTES)), Ok(()));
         assert_eq!(
             validate_key(&"a".repeat(MAX_KEY_BYTES + 1)),
-            Err(KeyError::TooLong { len: MAX_KEY_BYTES + 1, max: MAX_KEY_BYTES })
+            Err(KeyError::TooLong {
+                len: MAX_KEY_BYTES + 1,
+                max: MAX_KEY_BYTES
+            })
         );
         // 256 two-byte characters fit exactly; one more does not.
         assert_eq!(validate_key(&"é".repeat(256)), Ok(()));
-        assert!(matches!(validate_key(&"é".repeat(257)), Err(KeyError::TooLong { .. })));
+        assert!(matches!(
+            validate_key(&"é".repeat(257)),
+            Err(KeyError::TooLong { .. })
+        ));
     }
 
     #[test]
     fn control_characters_are_refused_wherever_they_are() {
-        assert_eq!(validate_key("a\0b"), Err(KeyError::ControlCharacter { at: 1 }));
-        assert_eq!(validate_key("line\nbreak"), Err(KeyError::ControlCharacter { at: 4 }));
-        assert_eq!(validate_key("\u{7f}"), Err(KeyError::ControlCharacter { at: 0 }));
+        assert_eq!(
+            validate_key("a\0b"),
+            Err(KeyError::ControlCharacter { at: 1 })
+        );
+        assert_eq!(
+            validate_key("line\nbreak"),
+            Err(KeyError::ControlCharacter { at: 4 })
+        );
+        assert_eq!(
+            validate_key("\u{7f}"),
+            Err(KeyError::ControlCharacter { at: 0 })
+        );
         assert!(validate_key("tab\there").is_err());
         assert!(validate_key("esc\u{1b}[0m").is_err());
         assert!(validate_key("c1\u{85}control").is_err(), "C1 controls too");

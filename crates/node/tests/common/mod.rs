@@ -127,7 +127,12 @@ impl TestCluster {
     /// Like `start`, but every node snapshots after `threshold` applied entries,
     /// keeping `retain` entries behind each snapshot.
     pub fn start_with_snapshots(ids: &[NodeId], threshold: u64, retain: u64) -> Self {
-        Self::start_with_snapshot_chunks(ids, threshold, retain, DEFAULT_SNAPSHOT_CHUNK_BYTES as usize)
+        Self::start_with_snapshot_chunks(
+            ids,
+            threshold,
+            retain,
+            DEFAULT_SNAPSHOT_CHUNK_BYTES as usize,
+        )
     }
 
     /// Like `start_with_snapshots`, and snapshots sent between nodes travel in pieces of
@@ -149,7 +154,14 @@ impl TestCluster {
     }
 
     fn start_full(ids: &[NodeId], read_mode: ReadMode, limits: Limits) -> Self {
-        Self::start_full_with(ids, read_mode, limits, 0, 0, DEFAULT_SNAPSHOT_CHUNK_BYTES as usize)
+        Self::start_full_with(
+            ids,
+            read_mode,
+            limits,
+            0,
+            0,
+            DEFAULT_SNAPSHOT_CHUNK_BYTES as usize,
+        )
     }
 
     fn start_full_with(
@@ -160,7 +172,10 @@ impl TestCluster {
         snapshot_retain: u64,
         snapshot_chunk_bytes: usize,
     ) -> Self {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         let base_dir = std::env::temp_dir().join(format!("quorum-itest-{nanos}-{n}"));
         std::fs::create_dir_all(&base_dir).expect("test dir should be creatable");
@@ -222,7 +237,10 @@ impl TestCluster {
             id,
             listen_addr: "127.0.0.1:0".to_string(),
             metrics_addr: "127.0.0.1:0".to_string(),
-            peers: peer_outboxes.keys().map(|&pid| (pid, String::new())).collect(),
+            peers: peer_outboxes
+                .keys()
+                .map(|&pid| (pid, String::new()))
+                .collect(),
             storage_dir: self.node_dir(id),
             read_mode: self.read_mode,
             limits: self.limits,
@@ -290,12 +308,16 @@ impl TestCluster {
     }
 
     pub async fn add_member(&self, via: NodeId, new_id: NodeId) -> AdminResult {
-        let change = MembershipChange::Add { id: new_id, addr: format!("node{new_id}:7000") };
+        let change = MembershipChange::Add {
+            id: new_id,
+            addr: format!("node{new_id}:7000"),
+        };
         self.change_membership(via, change).await
     }
 
     pub async fn remove_member(&self, via: NodeId, id: NodeId) -> AdminResult {
-        self.change_membership(via, MembershipChange::Remove { id }).await
+        self.change_membership(via, MembershipChange::Remove { id })
+            .await
     }
 
     /// The voting members node `id` currently believes in.
@@ -426,7 +448,8 @@ impl TestCluster {
     /// a free local port and returns its address. Lets a test exercise the whole
     /// path: HTTP request -> cluster -> consensus -> HTTP response.
     pub async fn serve_http(&self, id: NodeId, request_timeout: Duration) -> SocketAddr {
-        self.serve_http_limited(id, request_timeout, node::config::DEFAULT_MAX_VALUE_BYTES).await
+        self.serve_http_limited(id, request_timeout, node::config::DEFAULT_MAX_VALUE_BYTES)
+            .await
     }
 
     /// Like `serve_http`, with the largest accepted value set to `max_value_bytes`.
@@ -457,7 +480,10 @@ impl TestCluster {
     }
 
     pub async fn put(&self, id: NodeId, key: &str, value: &str) -> ClientCommandResult {
-        self.submit(id, key, value).await.await.expect("cluster should respond")
+        self.submit(id, key, value)
+            .await
+            .await
+            .expect("cluster should respond")
     }
 
     /// Queues a write and returns at once with the receiver for its eventual
@@ -473,7 +499,10 @@ impl TestCluster {
             .handle
             .command_tx
             .send(ClientCommand {
-                command: Command::Put { key: key.to_string(), value: value.as_bytes().to_vec() },
+                command: Command::Put {
+                    key: key.to_string(),
+                    value: value.as_bytes().to_vec(),
+                },
                 respond_to,
             })
             .await
@@ -501,7 +530,10 @@ impl TestCluster {
         self.nodes[&id]
             .handle
             .query_tx
-            .send(ClientQuery { key: key.to_string(), respond_to })
+            .send(ClientQuery {
+                key: key.to_string(),
+                respond_to,
+            })
             .await
             .expect("query channel should be open");
         receiver.await.expect("cluster should respond")

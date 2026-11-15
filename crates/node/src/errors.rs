@@ -28,7 +28,9 @@ pub enum AppError {
     #[error("the value is too large: {detail}")]
     ValueTooLarge { detail: String },
     /// The body's content type is not one the key endpoints understand.
-    #[error("unsupported content type; send application/octet-stream (raw bytes) or application/json")]
+    #[error(
+        "unsupported content type; send application/octet-stream (raw bytes) or application/json"
+    )]
     UnsupportedMediaType,
     /// A raw read of a key that does not exist on the leader.
     #[error("key not found")]
@@ -138,7 +140,10 @@ impl IntoResponse for AppError {
             self,
             AppError::Overloaded | AppError::MembershipRejected(AdminRejection::NotReady)
         );
-        let body = ErrorBody { error: self.to_string(), outcome_unknown: self.outcome_unknown() };
+        let body = ErrorBody {
+            error: self.to_string(),
+            outcome_unknown: self.outcome_unknown(),
+        };
         if retry_after {
             // Tells well-behaved clients to back off instead of hammering a node
             // that is already struggling.
@@ -156,7 +161,9 @@ mod tests {
     async fn render(error: AppError) -> (StatusCode, String) {
         let response = error.into_response();
         let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
@@ -169,14 +176,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_timeout_is_504_and_says_the_outcome_is_unknown() {
-        let (status, body) = render(AppError::Timeout { may_have_applied: true }).await;
+        let (status, body) = render(AppError::Timeout {
+            may_have_applied: true,
+        })
+        .await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert!(body.contains("\"outcome_unknown\":true"), "{body}");
     }
 
     #[tokio::test]
     async fn a_read_timeout_is_504_but_has_no_unknown_outcome() {
-        let (status, body) = render(AppError::Timeout { may_have_applied: false }).await;
+        let (status, body) = render(AppError::Timeout {
+            may_have_applied: false,
+        })
+        .await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert!(body.contains("\"outcome_unknown\":false"), "{body}");
     }
@@ -199,15 +212,24 @@ mod tests {
         let response = AppError::Overloaded.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(body.contains("\"outcome_unknown\":false"), "a rejected request took no effect: {body}");
+        assert!(
+            body.contains("\"outcome_unknown\":false"),
+            "a rejected request took no effect: {body}"
+        );
     }
 
     #[tokio::test]
     async fn only_overload_carries_a_retry_after_header() {
         for error in [AppError::LeadershipLost, AppError::ChannelClosed] {
-            assert!(error.into_response().headers().get(header::RETRY_AFTER).is_none());
+            assert!(error
+                .into_response()
+                .headers()
+                .get(header::RETRY_AFTER)
+                .is_none());
         }
     }
 
@@ -242,10 +264,24 @@ mod tests {
     #[tokio::test]
     async fn requests_that_can_never_succeed_are_4xx_and_safe_to_give_up_on() {
         for (error, status) in [
-            (AppError::InvalidKey("empty".into()), StatusCode::BAD_REQUEST),
-            (AppError::BadRequest("bad json".into()), StatusCode::BAD_REQUEST),
-            (AppError::ValueTooLarge { detail: "5 > 4".into() }, StatusCode::PAYLOAD_TOO_LARGE),
-            (AppError::UnsupportedMediaType, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            (
+                AppError::InvalidKey("empty".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AppError::BadRequest("bad json".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AppError::ValueTooLarge {
+                    detail: "5 > 4".into(),
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                AppError::UnsupportedMediaType,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
         ] {
             let (got, body) = render(error).await;
             assert_eq!(got, status);
@@ -262,17 +298,31 @@ mod tests {
 
     #[tokio::test]
     async fn a_raw_read_on_a_follower_is_421_and_names_the_leader() {
-        let (status, body) = render(AppError::NotLeader { leader_hint: Some(3) }).await;
+        let (status, body) = render(AppError::NotLeader {
+            leader_hint: Some(3),
+        })
+        .await;
         assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
-        assert!(body.contains("\"is_leader\":false") && body.contains("\"leader_hint\":3"), "{body}");
+        assert!(
+            body.contains("\"is_leader\":false") && body.contains("\"leader_hint\":3"),
+            "{body}"
+        );
         let (_, body) = render(AppError::NotLeader { leader_hint: None }).await;
         assert!(body.contains("\"leader_hint\":null"), "{body}");
     }
 
     #[tokio::test]
     async fn none_of_the_new_errors_ask_the_client_to_retry_later() {
-        for error in [AppError::KeyNotFound, AppError::BadRequest("x".into()), AppError::UnsupportedMediaType] {
-            assert!(error.into_response().headers().get(header::RETRY_AFTER).is_none());
+        for error in [
+            AppError::KeyNotFound,
+            AppError::BadRequest("x".into()),
+            AppError::UnsupportedMediaType,
+        ] {
+            assert!(error
+                .into_response()
+                .headers()
+                .get(header::RETRY_AFTER)
+                .is_none());
         }
     }
 }

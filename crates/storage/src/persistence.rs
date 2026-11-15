@@ -92,23 +92,30 @@ impl Persistence {
 
         let snapshot = load_snapshot(&snapshot_path)?
             .map(|(metadata, state)| RecoveredSnapshot { metadata, state });
-        let (base_index, base_term) = snapshot
-            .as_ref()
-            .map_or((0, 0), |s| (s.metadata.last_included_index, s.metadata.last_included_term));
+        let (base_index, base_term) = snapshot.as_ref().map_or((0, 0), |s| {
+            (
+                s.metadata.last_included_index,
+                s.metadata.last_included_term,
+            )
+        });
 
-        let WalRecovery { mut entries, discarded_bytes } = Wal::recover(&wal_path)?;
+        let WalRecovery {
+            mut entries,
+            discarded_bytes,
+        } = Wal::recover(&wal_path)?;
         let mut wal = Wal::open(&wal_path)?;
         let before = entries.len();
         entries.retain(|e| e.index > base_index);
         if entries.len() != before {
             wal.compact_through(base_index)?;
         }
-        let mut expected = base_index + 1;
-        for entry in &entries {
+        for (expected, entry) in (base_index + 1..).zip(&entries) {
             if entry.index != expected {
-                return Err(PersistenceError::LogGap { expected, found: entry.index });
+                return Err(PersistenceError::LogGap {
+                    expected,
+                    found: entry.index,
+                });
             }
-            expected += 1;
         }
 
         let mut hard_state = load_hard_state(&hard_state_path)?;
@@ -234,7 +241,8 @@ impl Persistence {
         }
         write_snapshot_bytes(&self.snapshot_path, bytes)?;
         self.snapshot_base = index;
-        self.wal.compact_through(if keep_log_suffix { index } else { u64::MAX })?;
+        self.wal
+            .compact_through(if keep_log_suffix { index } else { u64::MAX })?;
         Ok(())
     }
 
@@ -303,7 +311,10 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             Self(std::env::temp_dir().join(format!("quorum-persist-{nanos}-{n}")))
         }
@@ -316,11 +327,18 @@ mod tests {
     }
 
     fn entry(term: Term, index: u64, command: &str) -> LogEntry {
-        LogEntry { term, index, command: command.as_bytes().to_vec() }
+        LogEntry {
+            term,
+            index,
+            command: command.as_bytes().to_vec(),
+        }
     }
 
     fn state(term: Term, voted_for: Option<NodeId>) -> PersistentState {
-        PersistentState { current_term: term, voted_for }
+        PersistentState {
+            current_term: term,
+            voted_for,
+        }
     }
 
     #[test]
@@ -436,7 +454,11 @@ mod tests {
 
         let recovered = Persistence::open(&dir.0).unwrap();
 
-        assert_eq!(recovered.entries.len(), 2, "the unfinished record is dropped");
+        assert_eq!(
+            recovered.entries.len(),
+            2,
+            "the unfinished record is dropped"
+        );
         assert_eq!(recovered.discarded_wal_bytes, 7);
         // The node can carry on appending to a clean file.
         let mut p = recovered.persistence;
@@ -460,7 +482,10 @@ mod tests {
 
     fn store_with(key: &str, value: &str) -> KvStore {
         let mut store = KvStore::new();
-        store.apply(&Command::Put { key: key.into(), value: value.as_bytes().to_vec() });
+        store.apply(&Command::Put {
+            key: key.into(),
+            value: value.as_bytes().to_vec(),
+        });
         store
     }
 
@@ -482,15 +507,24 @@ mod tests {
             for i in 1..=8 {
                 p.append(&entry(2, i, &format!("c{i}"))).unwrap();
             }
-            p.save_snapshot_and_compact(meta(5, 2), &store_with("k", "v5")).unwrap();
+            p.save_snapshot_and_compact(meta(5, 2), &store_with("k", "v5"))
+                .unwrap();
             assert_eq!(p.snapshot_base(), 5);
         }
         let recovered = Persistence::open(&dir.0).unwrap();
         let snapshot = recovered.snapshot.as_ref().expect("snapshot recovered");
         assert_eq!(snapshot.metadata.last_included_index, 5);
         assert_eq!(snapshot.state.get("k"), Some(&b"v5".to_vec()));
-        assert_eq!(indices(&recovered), vec![6, 7, 8], "only what the snapshot does not cover");
-        assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 3, "and the file shrank");
+        assert_eq!(
+            indices(&recovered),
+            vec![6, 7, 8],
+            "only what the snapshot does not cover"
+        );
+        assert_eq!(
+            Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(),
+            3,
+            "and the file shrank"
+        );
     }
 
     #[test]
@@ -498,8 +532,10 @@ mod tests {
         let dir = TestDir::new();
         {
             let mut p = Persistence::open(&dir.0).unwrap().persistence;
-            p.append_batch(&(1..=4).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
-            p.save_snapshot_and_compact(meta(4, 1), &KvStore::new()).unwrap();
+            p.append_batch(&(1..=4).map(|i| entry(1, i, "x")).collect::<Vec<_>>())
+                .unwrap();
+            p.save_snapshot_and_compact(meta(4, 1), &KvStore::new())
+                .unwrap();
             p.append(&entry(1, 5, "y")).unwrap();
         }
         assert_eq!(indices(&Persistence::open(&dir.0).unwrap()), vec![5]);
@@ -519,7 +555,11 @@ mod tests {
         assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 6);
 
         let recovered = Persistence::open(&dir.0).unwrap();
-        assert_eq!(indices(&recovered), vec![5, 6], "redundant entries are dropped");
+        assert_eq!(
+            indices(&recovered),
+            vec![5, 6],
+            "redundant entries are dropped"
+        );
         assert!(recovered.snapshot.is_some());
         assert_eq!(
             Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(),
@@ -550,7 +590,10 @@ mod tests {
         }
         save_snapshot(dir.0.join(SNAPSHOT_FILE), meta(5, 1), &KvStore::new()).unwrap();
         match Persistence::open(&dir.0) {
-            Err(PersistenceError::LogGap { expected: 6, found: 8 }) => {}
+            Err(PersistenceError::LogGap {
+                expected: 6,
+                found: 8,
+            }) => {}
             other => panic!("expected a gap error, got {:?}", other.map(|_| ())),
         }
     }
@@ -564,7 +607,10 @@ mod tests {
         }
         assert!(matches!(
             Persistence::open(&dir.0),
-            Err(PersistenceError::LogGap { expected: 1, found: 3 })
+            Err(PersistenceError::LogGap {
+                expected: 1,
+                found: 3
+            })
         ));
     }
 
@@ -588,10 +634,20 @@ mod tests {
     fn an_older_snapshot_than_the_stored_one_is_refused_and_changes_nothing() {
         let dir = TestDir::new();
         let mut p = Persistence::open(&dir.0).unwrap().persistence;
-        p.append_batch(&(1..=6).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
-        p.save_snapshot_and_compact(meta(5, 1), &store_with("new", "1")).unwrap();
-        let error = p.save_snapshot_and_compact(meta(3, 1), &store_with("old", "1")).unwrap_err();
-        assert!(matches!(error, PersistenceError::StaleSnapshot { requested: 3, current: 5 }));
+        p.append_batch(&(1..=6).map(|i| entry(1, i, "x")).collect::<Vec<_>>())
+            .unwrap();
+        p.save_snapshot_and_compact(meta(5, 1), &store_with("new", "1"))
+            .unwrap();
+        let error = p
+            .save_snapshot_and_compact(meta(3, 1), &store_with("old", "1"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PersistenceError::StaleSnapshot {
+                requested: 3,
+                current: 5
+            }
+        ));
         assert_eq!(p.snapshot_base(), 5);
         let (stored, state) = load_snapshot(dir.0.join(SNAPSHOT_FILE)).unwrap().unwrap();
         assert_eq!(stored.last_included_index, 5);
@@ -613,8 +669,10 @@ mod tests {
         let dir = TestDir::new();
         {
             let mut p = Persistence::open(&dir.0).unwrap().persistence;
-            p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
-            p.save_snapshot_and_compact(meta(3, 1), &KvStore::new()).unwrap();
+            p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>())
+                .unwrap();
+            p.save_snapshot_and_compact(meta(3, 1), &KvStore::new())
+                .unwrap();
             p.truncate_from(6).unwrap();
         }
         assert_eq!(indices(&Persistence::open(&dir.0).unwrap()), vec![4, 5]);
@@ -624,14 +682,23 @@ mod tests {
     fn a_snapshot_can_be_saved_without_trimming_the_log_and_trimmed_later() {
         let dir = TestDir::new();
         let mut p = Persistence::open(&dir.0).unwrap().persistence;
-        p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
-        p.save_snapshot_only(meta(6, 1), &store_with("k", "v")).unwrap();
+        p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>())
+            .unwrap();
+        p.save_snapshot_only(meta(6, 1), &store_with("k", "v"))
+            .unwrap();
         assert_eq!(p.snapshot_base(), 6);
-        assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 8, "the log is untouched");
+        assert_eq!(
+            Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(),
+            8,
+            "the log is untouched"
+        );
 
         p.compact_log_through(4).unwrap(); // a slow follower still needs 5 onward
-        let kept: Vec<u64> =
-            Wal::replay(dir.0.join(WAL_FILE)).unwrap().iter().map(|e| e.index).collect();
+        let kept: Vec<u64> = Wal::replay(dir.0.join(WAL_FILE))
+            .unwrap()
+            .iter()
+            .map(|e| e.index)
+            .collect();
         assert_eq!(kept, vec![5, 6, 7, 8]);
         drop(p);
 
@@ -645,17 +712,28 @@ mod tests {
     fn the_log_cannot_be_trimmed_past_what_a_snapshot_covers() {
         let dir = TestDir::new();
         let mut p = Persistence::open(&dir.0).unwrap().persistence;
-        p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+        p.append_batch(&(1..=8).map(|i| entry(1, i, "x")).collect::<Vec<_>>())
+            .unwrap();
         assert!(matches!(
             p.compact_log_through(1),
-            Err(PersistenceError::CompactBeyondSnapshot { requested: 1, snapshot: 0 })
+            Err(PersistenceError::CompactBeyondSnapshot {
+                requested: 1,
+                snapshot: 0
+            })
         ));
         p.save_snapshot_only(meta(5, 1), &KvStore::new()).unwrap();
         assert!(matches!(
             p.compact_log_through(6),
-            Err(PersistenceError::CompactBeyondSnapshot { requested: 6, snapshot: 5 })
+            Err(PersistenceError::CompactBeyondSnapshot {
+                requested: 6,
+                snapshot: 5
+            })
         ));
-        assert_eq!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(), 8, "nothing was lost");
+        assert_eq!(
+            Wal::replay(dir.0.join(WAL_FILE)).unwrap().len(),
+            8,
+            "nothing was lost"
+        );
     }
 
     #[test]
@@ -663,7 +741,8 @@ mod tests {
         let dir = TestDir::new();
         let mut p = Persistence::open(&dir.0).unwrap().persistence;
         assert!(p.read_snapshot_bytes().unwrap().is_none());
-        p.save_snapshot_only(meta(4, 1), &store_with("k", "v")).unwrap();
+        p.save_snapshot_only(meta(4, 1), &store_with("k", "v"))
+            .unwrap();
         let bytes = p.read_snapshot_bytes().unwrap().expect("a snapshot exists");
         let (decoded, state) = crate::snapshot::decode_snapshot(&bytes).unwrap();
         assert_eq!(decoded.last_included_index, 4);
@@ -680,7 +759,8 @@ mod tests {
     fn installing_a_received_snapshot_can_keep_the_log_after_it() {
         let dir = TestDir::new();
         let mut p = Persistence::open(&dir.0).unwrap().persistence;
-        p.append_batch(&(1..=9).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+        p.append_batch(&(1..=9).map(|i| entry(1, i, "x")).collect::<Vec<_>>())
+            .unwrap();
         let (metadata, bytes) = encoded(6, "from-leader");
         p.install_snapshot_bytes(&bytes, &metadata, true).unwrap();
         assert_eq!(p.snapshot_base(), 6);
@@ -697,10 +777,14 @@ mod tests {
     fn installing_a_received_snapshot_can_discard_the_whole_log() {
         let dir = TestDir::new();
         let mut p = Persistence::open(&dir.0).unwrap().persistence;
-        p.append_batch(&(1..=9).map(|i| entry(1, i, "x")).collect::<Vec<_>>()).unwrap();
+        p.append_batch(&(1..=9).map(|i| entry(1, i, "x")).collect::<Vec<_>>())
+            .unwrap();
         let (metadata, bytes) = encoded(4, "from-leader");
         p.install_snapshot_bytes(&bytes, &metadata, false).unwrap();
-        assert!(Wal::replay(dir.0.join(WAL_FILE)).unwrap().is_empty(), "nothing is left");
+        assert!(
+            Wal::replay(dir.0.join(WAL_FILE)).unwrap().is_empty(),
+            "nothing is left"
+        );
         drop(p);
         assert!(indices(&Persistence::open(&dir.0).unwrap()).is_empty());
     }
@@ -713,7 +797,10 @@ mod tests {
         let (metadata, bytes) = encoded(5, "old");
         assert!(matches!(
             p.install_snapshot_bytes(&bytes, &metadata, true),
-            Err(PersistenceError::StaleSnapshot { requested: 5, current: 8 })
+            Err(PersistenceError::StaleSnapshot {
+                requested: 5,
+                current: 8
+            })
         ));
     }
 }

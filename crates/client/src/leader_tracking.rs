@@ -15,7 +15,10 @@ pub struct LeaderTracker {
 
 impl LeaderTracker {
     pub fn new(nodes: HashMap<NodeId, String>) -> Self {
-        Self { nodes, current_guess: Mutex::new(None) }
+        Self {
+            nodes,
+            current_guess: Mutex::new(None),
+        }
     }
 
     /// The address to try first: our current best guess at who the leader is,
@@ -78,14 +81,20 @@ mod tests {
     fn records_and_returns_confirmed_leader() {
         let tracker = LeaderTracker::new(sample_nodes());
         tracker.record_confirmed_leader(2);
-        assert_eq!(tracker.best_guess(), Some((2, "127.0.0.1:8002".to_string())));
+        assert_eq!(
+            tracker.best_guess(),
+            Some((2, "127.0.0.1:8002".to_string()))
+        );
     }
 
     #[test]
     fn recognized_hint_becomes_new_guess() {
         let tracker = LeaderTracker::new(sample_nodes());
         tracker.record_not_leader(Some(3));
-        assert_eq!(tracker.best_guess(), Some((3, "127.0.0.1:8003".to_string())));
+        assert_eq!(
+            tracker.best_guess(),
+            Some((3, "127.0.0.1:8003".to_string()))
+        );
     }
 
     #[test]

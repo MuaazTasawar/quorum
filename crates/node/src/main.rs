@@ -56,7 +56,13 @@ async fn main() -> anyhow::Result<()> {
         let inbox_tx = inbox_tx.clone();
         let capacity = config.limits.channel_capacity;
         Box::new(move |peer_id, addr| {
-            network::spawn_outbound(self_id, peer_id, addr.to_string(), inbox_tx.clone(), capacity)
+            network::spawn_outbound(
+                self_id,
+                peer_id,
+                addr.to_string(),
+                inbox_tx.clone(),
+                capacity,
+            )
         })
     };
 
@@ -70,10 +76,14 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics_addr = config.metrics_addr.clone();
     let request_timeout = request_timeout_from_env()?;
-    tracing::info!(timeout_ms = request_timeout.as_millis() as u64, "request timeout");
+    tracing::info!(
+        timeout_ms = request_timeout.as_millis() as u64,
+        "request timeout"
+    );
     let (cluster, handle) = Cluster::new(config, recovered, peer_outboxes, inbox_rx, connector);
 
-    let max_value_bytes = parse_max_value_bytes(std::env::var("QUORUM_MAX_VALUE_BYTES").ok().as_deref())?;
+    let max_value_bytes =
+        parse_max_value_bytes(std::env::var("QUORUM_MAX_VALUE_BYTES").ok().as_deref())?;
     tracing::info!(max_value_bytes, "largest accepted value");
     let app_state = metrics_api::AppState::from_handle(handle, request_timeout)
         .with_max_value_bytes(max_value_bytes);

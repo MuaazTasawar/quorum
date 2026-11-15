@@ -26,7 +26,11 @@ async fn main() -> Result<(), ClientError> {
     let blob: Vec<u8> = (0..=255u8).collect();
     client.put_bytes("blob", &blob).await?;
     let back = client.get_bytes("blob").await?.expect("just written");
-    println!("blob     = {} bytes, identical: {}", back.len(), back == blob);
+    println!(
+        "blob     = {} bytes, identical: {}",
+        back.len(),
+        back == blob
+    );
 
     // Keys may contain anything that is not a control character.
     client.put("path/with?odd#chars%", "ok").await?;

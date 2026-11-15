@@ -62,7 +62,8 @@ fn parse_records(bytes: &[u8]) -> Result<(Vec<LogEntry>, usize), WalError> {
         if remaining.len() < 4 {
             break; // not even a whole length prefix
         }
-        let len = u32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as usize;
+        let len =
+            u32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as usize;
         if remaining.len() - 4 < len {
             break; // the payload runs past the end of the file
         }
@@ -81,7 +82,11 @@ impl Wal {
             .append(true)
             .read(true)
             .open(&path)?;
-        Ok(Self { file, path, sync_count: 0 })
+        Ok(Self {
+            file,
+            path,
+            sync_count: 0,
+        })
     }
 
     /// Appends one entry and fsyncs before returning. The fsync is the whole
@@ -150,7 +155,10 @@ impl Wal {
     pub fn recover(path: impl AsRef<Path>) -> Result<WalRecovery, WalError> {
         let path = path.as_ref();
         if !path.exists() {
-            return Ok(WalRecovery { entries: Vec::new(), discarded_bytes: 0 });
+            return Ok(WalRecovery {
+                entries: Vec::new(),
+                discarded_bytes: 0,
+            });
         }
         let bytes = std::fs::read(path)?;
         let (entries, valid_len) = parse_records(&bytes)?;
@@ -161,7 +169,10 @@ impl Wal {
             file.set_len(valid_len as u64)?;
             file.sync_all()?;
         }
-        Ok(WalRecovery { entries, discarded_bytes })
+        Ok(WalRecovery {
+            entries,
+            discarded_bytes,
+        })
     }
 
     /// Rewrites the WAL keeping only entries with index < `from_index`, used when
@@ -185,8 +196,10 @@ impl Wal {
     }
 
     fn rewrite_keeping(&mut self, keep: impl Fn(&LogEntry) -> bool) -> Result<(), WalError> {
-        let kept: Vec<LogEntry> =
-            Self::replay(&self.path)?.into_iter().filter(|e| keep(e)).collect();
+        let kept: Vec<LogEntry> = Self::replay(&self.path)?
+            .into_iter()
+            .filter(|e| keep(e))
+            .collect();
 
         let tmp_path = self.path.with_extension("wal.tmp");
         {
@@ -226,7 +239,10 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             let dir = std::env::temp_dir().join(format!("quorum-wal-{nanos}-{n}"));
             std::fs::create_dir_all(&dir).unwrap();
@@ -244,11 +260,17 @@ mod tests {
     }
 
     fn entry(term: u64, index: u64, command: &str) -> LogEntry {
-        LogEntry { term, index, command: command.as_bytes().to_vec() }
+        LogEntry {
+            term,
+            index,
+            command: command.as_bytes().to_vec(),
+        }
     }
 
     fn entries(count: u64) -> Vec<LogEntry> {
-        (1..=count).map(|i| entry(1, i, &format!("cmd-{i}"))).collect()
+        (1..=count)
+            .map(|i| entry(1, i, &format!("cmd-{i}")))
+            .collect()
     }
 
     #[test]
@@ -301,7 +323,10 @@ mod tests {
         let mut b = Wal::open(batched.wal()).unwrap();
         b.append_batch(&entries(6)).unwrap();
 
-        assert_eq!(std::fs::read(single.wal()).unwrap(), std::fs::read(batched.wal()).unwrap());
+        assert_eq!(
+            std::fs::read(single.wal()).unwrap(),
+            std::fs::read(batched.wal()).unwrap()
+        );
     }
 
     #[test]
@@ -321,13 +346,22 @@ mod tests {
         let mut wal = Wal::open(dir.wal()).unwrap();
         wal.append_batch(&entries(3)).unwrap();
         let good_len = std::fs::metadata(dir.wal()).unwrap().len();
-        OpenOptions::new().append(true).open(dir.wal()).unwrap().write_all(&[9, 0]).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(dir.wal())
+            .unwrap()
+            .write_all(&[9, 0])
+            .unwrap();
 
         let recovery = Wal::recover(dir.wal()).unwrap();
 
         assert_eq!(recovery.entries.len(), 3);
         assert_eq!(recovery.discarded_bytes, 2);
-        assert_eq!(std::fs::metadata(dir.wal()).unwrap().len(), good_len, "file must be cut back");
+        assert_eq!(
+            std::fs::metadata(dir.wal()).unwrap().len(),
+            good_len,
+            "file must be cut back"
+        );
         // And it is now a clean WAL again.
         assert_eq!(Wal::replay(dir.wal()).unwrap().len(), 3);
     }
@@ -343,7 +377,12 @@ mod tests {
         let mut torn = Vec::new();
         torn.extend_from_slice(&50u32.to_le_bytes());
         torn.extend_from_slice(&[7u8; 10]);
-        OpenOptions::new().append(true).open(dir.wal()).unwrap().write_all(&torn).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(dir.wal())
+            .unwrap()
+            .write_all(&torn)
+            .unwrap();
 
         let recovery = Wal::recover(dir.wal()).unwrap();
 
@@ -393,7 +432,11 @@ mod tests {
             Wal::recover(dir.wal()).is_err(),
             "silently skipping a corrupt record would lose acknowledged data"
         );
-        assert_eq!(std::fs::read(dir.wal()).unwrap(), bytes, "and the file must be left alone");
+        assert_eq!(
+            std::fs::read(dir.wal()).unwrap(),
+            bytes,
+            "and the file must be left alone"
+        );
     }
 
     #[test]
@@ -401,7 +444,12 @@ mod tests {
         let dir = TestDir::new();
         let mut wal = Wal::open(dir.wal()).unwrap();
         wal.append_batch(&entries(2)).unwrap();
-        OpenOptions::new().append(true).open(dir.wal()).unwrap().write_all(&[1, 2, 3]).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(dir.wal())
+            .unwrap()
+            .write_all(&[1, 2, 3])
+            .unwrap();
         drop(wal);
 
         Wal::recover(dir.wal()).unwrap();
@@ -423,7 +471,11 @@ mod tests {
         let replayed = Wal::replay(dir.wal()).unwrap();
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[1].index, 2);
-        assert_eq!(wal.sync_count(), 2, "one for the batch, one for the rewritten file");
+        assert_eq!(
+            wal.sync_count(),
+            2,
+            "one for the batch, one for the rewritten file"
+        );
     }
 
     // ---- compaction ---------------------------------------------------------
@@ -436,7 +488,10 @@ mod tests {
         wal.compact_through(6).unwrap();
 
         let replayed = Wal::replay(dir.wal()).unwrap();
-        assert_eq!(replayed.iter().map(|e| e.index).collect::<Vec<_>>(), vec![7, 8, 9, 10]);
+        assert_eq!(
+            replayed.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![7, 8, 9, 10]
+        );
         assert_eq!(replayed[0].command, b"cmd-7".to_vec());
     }
 
@@ -465,7 +520,10 @@ mod tests {
         drop(wal);
 
         let recovery = Wal::recover(dir.wal()).unwrap();
-        assert_eq!(recovery.entries.iter().map(|e| e.index).collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(
+            recovery.entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
         assert_eq!(recovery.discarded_bytes, 0);
     }
 
@@ -488,7 +546,10 @@ mod tests {
         wal.compact_through(3).unwrap();
         wal.truncate_from(6).unwrap();
         let replayed = Wal::replay(dir.wal()).unwrap();
-        assert_eq!(replayed.iter().map(|e| e.index).collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(
+            replayed.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
     }
 
     #[test]

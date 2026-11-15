@@ -22,7 +22,11 @@ const LONG_ENOUGH_TO_TIME_OUT_MANY_TIMES: Duration = Duration::from_millis(2000)
 async fn an_isolated_follower_does_not_inflate_its_term() {
     let cluster = TestCluster::start(&[1, 2, 3]);
     let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
-    let follower = cluster.live_ids().into_iter().find(|&id| id != leader).unwrap();
+    let follower = cluster
+        .live_ids()
+        .into_iter()
+        .find(|&id| id != leader)
+        .unwrap();
 
     // Let the follower settle into the leader's term before cutting it off.
     cluster
@@ -50,7 +54,11 @@ async fn an_isolated_follower_does_not_inflate_its_term() {
 async fn a_follower_rejoining_after_a_partition_does_not_depose_the_leader() {
     let cluster = TestCluster::start(&[1, 2, 3]);
     let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
-    let follower = cluster.live_ids().into_iter().find(|&id| id != leader).unwrap();
+    let follower = cluster
+        .live_ids()
+        .into_iter()
+        .find(|&id| id != leader)
+        .unwrap();
     cluster
         .wait_until(SETTLE, "follower to adopt the leader's term", |c| {
             c.snapshot(follower).current_term == c.snapshot(leader).current_term
@@ -65,7 +73,11 @@ async fn a_follower_rejoining_after_a_partition_does_not_depose_the_leader() {
     // Give any disruption time to show itself.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    assert_eq!(cluster.leaders(), vec![leader], "the same node must still be the leader");
+    assert_eq!(
+        cluster.leaders(),
+        vec![leader],
+        "the same node must still be the leader"
+    );
     assert_eq!(
         cluster.snapshot(leader).current_term,
         leader_term,
@@ -93,7 +105,11 @@ async fn a_follower_rejoining_after_a_partition_does_not_depose_the_leader() {
 async fn a_follower_that_stops_hearing_the_leader_cannot_force_an_election() {
     let cluster = TestCluster::start(&[1, 2, 3]);
     let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
-    let deaf_follower = cluster.live_ids().into_iter().find(|&id| id != leader).unwrap();
+    let deaf_follower = cluster
+        .live_ids()
+        .into_iter()
+        .find(|&id| id != leader)
+        .unwrap();
     cluster
         .wait_until(SETTLE, "follower to adopt the leader's term", |c| {
             c.snapshot(deaf_follower).current_term == c.snapshot(leader).current_term
@@ -105,7 +121,11 @@ async fn a_follower_that_stops_hearing_the_leader_cannot_force_an_election() {
     cluster.cut_link(leader, deaf_follower);
     tokio::time::sleep(LONG_ENOUGH_TO_TIME_OUT_MANY_TIMES).await;
 
-    assert_eq!(cluster.leaders(), vec![leader], "the leader must be undisturbed");
+    assert_eq!(
+        cluster.leaders(),
+        vec![leader],
+        "the leader must be undisturbed"
+    );
     assert_eq!(cluster.snapshot(leader).current_term, leader_term);
     assert_eq!(
         cluster.snapshot(deaf_follower).current_term,
@@ -122,15 +142,21 @@ async fn a_follower_that_stops_hearing_the_leader_cannot_force_an_election() {
 async fn a_leader_cut_off_from_the_majority_steps_down_without_changing_its_term() {
     let cluster = TestCluster::start(&[1, 2, 3]);
     let old_leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
-    let others: Vec<u32> = cluster.live_ids().into_iter().filter(|&id| id != old_leader).collect();
+    let others: Vec<u32> = cluster
+        .live_ids()
+        .into_iter()
+        .filter(|&id| id != old_leader)
+        .collect();
     let old_term = cluster.snapshot(old_leader).current_term;
 
     cluster.isolate(old_leader);
 
     cluster
-        .wait_until(Duration::from_secs(3), "the cut-off leader to step down", |c| {
-            c.snapshot(old_leader).role != "Leader"
-        })
+        .wait_until(
+            Duration::from_secs(3),
+            "the cut-off leader to step down",
+            |c| c.snapshot(old_leader).role != "Leader",
+        )
         .await;
     assert_eq!(
         cluster.snapshot(old_leader).current_term,
@@ -139,12 +165,16 @@ async fn a_leader_cut_off_from_the_majority_steps_down_without_changing_its_term
     );
 
     // The connected majority carries on with a new leader in a newer term.
-    let new_leader = cluster.wait_for_leader_among(&others, Duration::from_secs(3)).await;
+    let new_leader = cluster
+        .wait_for_leader_among(&others, Duration::from_secs(3))
+        .await;
     assert!(cluster.snapshot(new_leader).current_term > old_term);
 
     cluster.heal();
     cluster
-        .wait_until(SETTLE, "a single leader after healing", |c| c.leaders() == vec![new_leader])
+        .wait_until(SETTLE, "a single leader after healing", |c| {
+            c.leaders() == vec![new_leader]
+        })
         .await;
 }
 
@@ -156,15 +186,24 @@ async fn a_minority_partition_elects_no_leader_and_does_not_disturb_the_majority
     let old_leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
 
     // Cut the leader plus one other node off from the remaining three.
-    let minority_partner = cluster.live_ids().into_iter().find(|&id| id != old_leader).unwrap();
+    let minority_partner = cluster
+        .live_ids()
+        .into_iter()
+        .find(|&id| id != old_leader)
+        .unwrap();
     let minority = vec![old_leader, minority_partner];
-    let majority: Vec<u32> =
-        cluster.live_ids().into_iter().filter(|id| !minority.contains(id)).collect();
+    let majority: Vec<u32> = cluster
+        .live_ids()
+        .into_iter()
+        .filter(|id| !minority.contains(id))
+        .collect();
     let term_before = cluster.snapshot(old_leader).current_term;
     cluster.partition(&minority, &majority);
 
     // The majority elects its own leader...
-    let majority_leader = cluster.wait_for_leader_among(&majority, Duration::from_secs(3)).await;
+    let majority_leader = cluster
+        .wait_for_leader_among(&majority, Duration::from_secs(3))
+        .await;
     let majority_term = cluster.snapshot(majority_leader).current_term;
     assert!(majority_term > term_before);
 
@@ -172,7 +211,10 @@ async fn a_minority_partition_elects_no_leader_and_does_not_disturb_the_majority
     tokio::time::sleep(LONG_ENOUGH_TO_TIME_OUT_MANY_TIMES).await;
     for &id in &minority {
         let snap = cluster.snapshot(id);
-        assert_ne!(snap.role, "Leader", "node {id} in the minority must not be leader");
+        assert_ne!(
+            snap.role, "Leader",
+            "node {id} in the minority must not be leader"
+        );
         assert_eq!(
             snap.current_term, term_before,
             "node {id} in the minority must not burn terms"
@@ -183,7 +225,10 @@ async fn a_minority_partition_elects_no_leader_and_does_not_disturb_the_majority
     cluster.heal();
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(cluster.leaders(), vec![majority_leader]);
-    assert_eq!(cluster.snapshot(majority_leader).current_term, majority_term);
+    assert_eq!(
+        cluster.snapshot(majority_leader).current_term,
+        majority_term
+    );
 }
 
 /// Pre-vote must not make elections impossible: after a real leader failure the

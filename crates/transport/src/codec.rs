@@ -93,7 +93,10 @@ mod tests {
 
         match read_frame(&mut cursor).await.unwrap().unwrap() {
             RpcMessage::InstallSnapshot(req) => {
-                assert_eq!((req.last_included_index, req.offset, req.seq), (900, 65_536, 12));
+                assert_eq!(
+                    (req.last_included_index, req.offset, req.seq),
+                    (900, 65_536, 12)
+                );
                 assert_eq!(req.data, data, "the chunk's bytes arrive untouched");
                 assert!(!req.done);
             }
@@ -112,16 +115,17 @@ mod tests {
     /// ever added at the end of the enum. Pin the positions of the ones that exist.
     #[test]
     fn the_message_variants_keep_their_positions_in_the_encoding() {
-        use raft_core::{
-            InstallSnapshotRequest, PreVoteResponse, RequestVoteResponse,
-        };
+        use raft_core::{InstallSnapshotRequest, PreVoteResponse, RequestVoteResponse};
         let first_u32 = |msg: &RpcMessage| {
             let bytes = bincode::serialize(msg).unwrap();
             u32::from_le_bytes(bytes[..4].try_into().unwrap())
         };
         assert_eq!(first_u32(&RpcMessage::Hello(1)), 0);
         assert_eq!(
-            first_u32(&RpcMessage::RequestVoteResponse(RequestVoteResponse { term: 1, vote_granted: true })),
+            first_u32(&RpcMessage::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                vote_granted: true
+            })),
             2
         );
         assert_eq!(

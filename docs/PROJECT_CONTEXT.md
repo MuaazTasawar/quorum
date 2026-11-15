@@ -134,6 +134,18 @@ Cargo.lock changed (client -> storage, node dev-dep -> client): commit it, CI us
 - Commit message format: "Phase N: Name, description".
 
 ## Gotchas learned
+- CODE STYLE IS A CI GATE: run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` before every commit
+  (both were made blocking after a one-off cleanup of ~660 rustfmt diffs and 10 clippy findings; behaviour unchanged, 451 tests).
+  Clippy suggests newer std APIs (is_none_or needs Rust 1.82, is_multiple_of needs 1.90): the project needs 1.85+, so prefer the
+  portable form when a suggestion needs newer than that.
+- Files extracted from a zip keep the SANDBOX's modification times; Cargo decides what changed by mtime, so a crate can be silently
+  left un-rebuilt (symptom: "cannot find function" for something that is in the source; no `Compiling <crate>` line). After
+  extracting, set LastWriteTime to now on the extracted files (or `cargo clean -p <crate>`). Never commit unless the tests pass.
+- Cluster tests run all nodes on ONE thread (#[tokio::test] default), so one node's slow fsync freezes the others and a leader
+  steps down (check-quorum). Symptoms on a slow/virus-scanned disk: random failures in read_index_test / request_lifecycle_test
+  (sanity reads answering is_leader:false). Reproduced with an LD_PRELOAD shim (5% of fsyncs taking 800 ms). A constant delay up
+  to ~100 ms is tolerated. On Windows exclude the repo's target dir and %TEMP% from Defender real-time scanning (it also halves
+  build time). Do not assert a timing the test cannot guarantee: sdk_test once assumed a cut-off leader had NOT yet stepped down.
 - Write-RepoFile leaves NO trailing newline; edits that match the end of a file must not assume one.
 - Timing-sensitive tests must stamp "last contact" AFTER durable writes (slow CI disks caused a real failure).
 - cargo test stops at the first failing binary, so CI uses --no-fail-fast.

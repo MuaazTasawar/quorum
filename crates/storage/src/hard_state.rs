@@ -40,7 +40,11 @@ pub fn save_hard_state(path: &Path, state: &PersistentState) -> Result<(), HardS
     let encoded = bincode::serialize(state)?;
     let tmp = temp_path(path);
     {
-        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
         file.write_all(&encoded)?;
         file.sync_all()?;
     }
@@ -78,7 +82,10 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             let dir = std::env::temp_dir().join(format!("quorum-hs-{nanos}-{n}"));
             fs::create_dir_all(&dir).unwrap();
@@ -96,7 +103,10 @@ mod tests {
     }
 
     fn state(term: u64, voted_for: Option<u32>) -> PersistentState {
-        PersistentState { current_term: term, voted_for }
+        PersistentState {
+            current_term: term,
+            voted_for,
+        }
     }
 
     #[test]

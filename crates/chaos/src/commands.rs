@@ -14,9 +14,27 @@ pub struct NodeInfo {
 
 pub fn node_registry() -> HashMap<u32, NodeInfo> {
     HashMap::from([
-        (1, NodeInfo { metrics_port: 8001, raft_port: 7001 }),
-        (2, NodeInfo { metrics_port: 8002, raft_port: 7002 }),
-        (3, NodeInfo { metrics_port: 8003, raft_port: 7003 }),
+        (
+            1,
+            NodeInfo {
+                metrics_port: 8001,
+                raft_port: 7001,
+            },
+        ),
+        (
+            2,
+            NodeInfo {
+                metrics_port: 8002,
+                raft_port: 7002,
+            },
+        ),
+        (
+            3,
+            NodeInfo {
+                metrics_port: 8003,
+                raft_port: 7003,
+            },
+        ),
     ])
 }
 
@@ -51,9 +69,14 @@ pub fn partition_node(node_id: u32) -> anyhow::Result<()> {
     let rule_name = format!("quorum-partition-node{node_id}");
     let status = ProcessCommand::new("netsh")
         .args([
-            "advfirewall", "firewall", "add", "rule",
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
             &format!("name={rule_name}"),
-            "dir=in", "action=block", "protocol=TCP",
+            "dir=in",
+            "action=block",
+            "protocol=TCP",
             &format!("localport={}", info.raft_port),
         ])
         .status()
@@ -75,7 +98,13 @@ pub fn partition_node(node_id: u32) -> anyhow::Result<()> {
 pub fn heal_node(node_id: u32) -> anyhow::Result<()> {
     let rule_name = format!("quorum-partition-node{node_id}");
     let status = ProcessCommand::new("netsh")
-        .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule_name}")])
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={rule_name}"),
+        ])
         .status()
         .context("failed to invoke netsh - is this terminal running as Administrator?")?;
     if !status.success() {
@@ -104,8 +133,11 @@ pub fn status() -> anyhow::Result<()> {
             Ok(resp) => match resp.json::<serde_json::Value>() {
                 Ok(body) => println!(
                     "node {id}: role={} term={} commit_index={} last_applied={} log_len={}",
-                    body["role"], body["current_term"], body["commit_index"],
-                    body["last_applied"], body["log_len"]
+                    body["role"],
+                    body["current_term"],
+                    body["commit_index"],
+                    body["last_applied"],
+                    body["log_len"]
                 ),
                 Err(_) => println!("node {id}: reachable but returned invalid JSON"),
             },

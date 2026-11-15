@@ -73,7 +73,10 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { channel_capacity: DEFAULT_CHANNEL_CAPACITY, max_batch: DEFAULT_MAX_BATCH }
+        Self {
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            max_batch: DEFAULT_MAX_BATCH,
+        }
     }
 }
 
@@ -113,8 +116,11 @@ impl NodeConfig {
     /// this is only the bootstrap configuration the first entries build upon, so
     /// it must stay the same across restarts of the same node.
     pub fn base_membership(&self) -> Membership {
-        let mut members: Vec<(NodeId, String)> =
-            self.peers.iter().map(|(&id, addr)| (id, addr.clone())).collect();
+        let mut members: Vec<(NodeId, String)> = self
+            .peers
+            .iter()
+            .map(|(&id, addr)| (id, addr.clone()))
+            .collect();
         if !self.join {
             members.push((self.id, self.listen_addr.clone()));
         }
@@ -148,8 +154,9 @@ impl NodeConfig {
             std::env::var("QUORUM_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:7000".to_string());
         let metrics_addr =
             std::env::var("QUORUM_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
-        let storage_dir: PathBuf =
-            std::env::var("QUORUM_STORAGE_DIR").unwrap_or_else(|_| "./data".to_string()).into();
+        let storage_dir: PathBuf = std::env::var("QUORUM_STORAGE_DIR")
+            .unwrap_or_else(|_| "./data".to_string())
+            .into();
 
         let mut peers = HashMap::new();
         if let Ok(raw) = std::env::var("QUORUM_PEERS") {
@@ -265,7 +272,10 @@ pub fn parse_join(raw: Option<&str>) -> anyhow::Result<bool> {
         Some(value) => match value.as_str() {
             "true" | "1" => Ok(true),
             "false" | "0" => Ok(false),
-            _ => anyhow::bail!("QUORUM_JOIN must be true, false, 1 or 0, got {:?}", raw.unwrap_or("")),
+            _ => anyhow::bail!(
+                "QUORUM_JOIN must be true, false, 1 or 0, got {:?}",
+                raw.unwrap_or("")
+            ),
         },
     }
 }
@@ -284,7 +294,11 @@ pub fn parse_count(name: &str, raw: Option<&str>, default: u64) -> anyhow::Resul
 
 /// Parses `QUORUM_MAX_VALUE_BYTES`, defaulting to [`DEFAULT_MAX_VALUE_BYTES`].
 pub fn parse_max_value_bytes(raw: Option<&str>) -> anyhow::Result<usize> {
-    let bytes = parse_count("QUORUM_MAX_VALUE_BYTES", raw, DEFAULT_MAX_VALUE_BYTES as u64)?;
+    let bytes = parse_count(
+        "QUORUM_MAX_VALUE_BYTES",
+        raw,
+        DEFAULT_MAX_VALUE_BYTES as u64,
+    )?;
     if bytes == 0 {
         anyhow::bail!("QUORUM_MAX_VALUE_BYTES must be greater than zero");
     }
@@ -321,10 +335,9 @@ pub fn parse_request_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
     let Some(raw) = raw else {
         return Ok(DEFAULT_REQUEST_TIMEOUT);
     };
-    let millis: u64 = raw
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("QUORUM_REQUEST_TIMEOUT_MS must be a whole number, got {raw:?}"))?;
+    let millis: u64 = raw.trim().parse().map_err(|_| {
+        anyhow::anyhow!("QUORUM_REQUEST_TIMEOUT_MS must be a whole number, got {raw:?}")
+    })?;
     if millis == 0 {
         anyhow::bail!("QUORUM_REQUEST_TIMEOUT_MS must be greater than zero");
     }
@@ -337,13 +350,22 @@ mod tests {
 
     #[test]
     fn request_timeout_defaults_when_unset() {
-        assert_eq!(parse_request_timeout(None).unwrap(), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(
+            parse_request_timeout(None).unwrap(),
+            DEFAULT_REQUEST_TIMEOUT
+        );
     }
 
     #[test]
     fn request_timeout_parses_milliseconds() {
-        assert_eq!(parse_request_timeout(Some("1500")).unwrap(), Duration::from_millis(1500));
-        assert_eq!(parse_request_timeout(Some(" 250 ")).unwrap(), Duration::from_millis(250));
+        assert_eq!(
+            parse_request_timeout(Some("1500")).unwrap(),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            parse_request_timeout(Some(" 250 ")).unwrap(),
+            Duration::from_millis(250)
+        );
     }
 
     #[test]
@@ -357,7 +379,10 @@ mod tests {
     #[test]
     fn reads_are_linearizable_unless_local_reads_are_requested() {
         assert_eq!(parse_read_mode(None).unwrap(), ReadMode::Linearizable);
-        assert_eq!(parse_read_mode(Some("false")).unwrap(), ReadMode::Linearizable);
+        assert_eq!(
+            parse_read_mode(Some("false")).unwrap(),
+            ReadMode::Linearizable
+        );
         assert_eq!(parse_read_mode(Some("0")).unwrap(), ReadMode::Linearizable);
     }
 
@@ -398,7 +423,9 @@ mod tests {
 
     #[test]
     fn a_rejected_limit_names_the_setting() {
-        let message = parse_limit("QUORUM_MAX_BATCH", Some("0"), 128).unwrap_err().to_string();
+        let message = parse_limit("QUORUM_MAX_BATCH", Some("0"), 128)
+            .unwrap_err()
+            .to_string();
         assert!(message.contains("QUORUM_MAX_BATCH"), "{message}");
     }
 
@@ -421,8 +448,14 @@ mod tests {
 
     #[test]
     fn catch_up_timeout_defaults_parses_and_rejects_nonsense() {
-        assert_eq!(parse_catch_up_timeout(None).unwrap(), DEFAULT_CATCH_UP_TIMEOUT);
-        assert_eq!(parse_catch_up_timeout(Some("1500")).unwrap(), Duration::from_millis(1500));
+        assert_eq!(
+            parse_catch_up_timeout(None).unwrap(),
+            DEFAULT_CATCH_UP_TIMEOUT
+        );
+        assert_eq!(
+            parse_catch_up_timeout(Some("1500")).unwrap(),
+            Duration::from_millis(1500)
+        );
         assert!(parse_catch_up_timeout(Some("0")).is_err());
         assert!(parse_catch_up_timeout(Some("soon")).is_err());
     }
@@ -454,7 +487,10 @@ mod tests {
     fn a_joining_node_starts_outside_the_cluster_it_is_joining() {
         let members = config_with(true).base_membership();
         assert_eq!(members.ids().collect::<Vec<_>>(), vec![1, 2]);
-        assert!(!members.contains(4), "it must not vote until the log says so");
+        assert!(
+            !members.contains(4),
+            "it must not vote until the log says so"
+        );
     }
 
     #[test]
@@ -465,15 +501,25 @@ mod tests {
             "snapshots are on unless switched off"
         );
         assert_eq!(parse_count("X", Some("500"), 10_000).unwrap(), 500);
-        assert_eq!(parse_count("X", Some(" 0 "), 10_000).unwrap(), 0, "zero is a real setting");
-        assert_eq!(parse_count("X", None, DEFAULT_SNAPSHOT_RETAIN).unwrap(), 1000);
+        assert_eq!(
+            parse_count("X", Some(" 0 "), 10_000).unwrap(),
+            0,
+            "zero is a real setting"
+        );
+        assert_eq!(
+            parse_count("X", None, DEFAULT_SNAPSHOT_RETAIN).unwrap(),
+            1000
+        );
         assert_eq!(DEFAULT_SNAPSHOT_CHUNK_BYTES, 65_536);
     }
 
     #[test]
     fn a_typo_in_a_snapshot_setting_names_the_setting() {
         let error = parse_count("QUORUM_SNAPSHOT_THRESHOLD", Some("lots"), 0).unwrap_err();
-        assert!(error.to_string().contains("QUORUM_SNAPSHOT_THRESHOLD"), "{error}");
+        assert!(
+            error.to_string().contains("QUORUM_SNAPSHOT_THRESHOLD"),
+            "{error}"
+        );
         assert!(parse_count("X", Some("-3"), 0).is_err());
     }
 
@@ -484,6 +530,9 @@ mod tests {
         assert!(parse_max_value_bytes(Some("0")).is_err());
         assert!(parse_max_value_bytes(Some("big")).is_err());
         assert!(parse_max_value_bytes(Some("16777217")).is_err());
-        assert_eq!(parse_max_value_bytes(Some("16777216")).unwrap(), 16 * 1024 * 1024);
+        assert_eq!(
+            parse_max_value_bytes(Some("16777216")).unwrap(),
+            16 * 1024 * 1024
+        );
     }
 }

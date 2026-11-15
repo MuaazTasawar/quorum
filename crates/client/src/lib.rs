@@ -131,7 +131,10 @@ enum Verdict {
     /// This node is not the leader; the hint, if any, says who is.
     NotLeader { hint: Option<NodeId> },
     /// The node did not take the request and nothing was applied: try again later.
-    Busy { retry_after: Option<Duration>, message: String },
+    Busy {
+        retry_after: Option<Duration>,
+        message: String,
+    },
     /// The request may have taken effect.
     Unknown { message: String },
     /// The request can never succeed as sent.
@@ -174,7 +177,9 @@ fn status_text(raw: &Raw) -> String {
 /// Decides what an answer means. Pure, so every rule is testable without a network.
 fn classify(op: &Op, raw: &Raw) -> Verdict {
     let hint = |raw: &Raw| {
-        serde_json::from_slice::<ErrorBody>(&raw.body).ok().and_then(|b| b.leader_hint)
+        serde_json::from_slice::<ErrorBody>(&raw.body)
+            .ok()
+            .and_then(|b| b.leader_hint)
     };
     match raw.status {
         200 => match op {
@@ -184,8 +189,12 @@ fn classify(op: &Op, raw: &Raw) -> Verdict {
                     Op::AddMember { .. } | Op::RemoveMember(_) => Output::Members(body.members),
                     _ => Output::Applied,
                 }),
-                Ok(body) => Verdict::NotLeader { hint: body.leader_hint },
-                Err(e) => Verdict::Skip { detail: format!("an answer that is not understood: {e}") },
+                Ok(body) => Verdict::NotLeader {
+                    hint: body.leader_hint,
+                },
+                Err(e) => Verdict::Skip {
+                    detail: format!("an answer that is not understood: {e}"),
+                },
             },
         },
         // A raw read of a key that does not exist, from the leader.
@@ -193,20 +202,30 @@ fn classify(op: &Op, raw: &Raw) -> Verdict {
             Verdict::Done(Output::Value(None))
         }
         // A raw read sent to a node that is not the leader.
-        421 => Verdict::NotLeader { hint: hint(raw).map(|h| h as NodeId) },
+        421 => Verdict::NotLeader {
+            hint: hint(raw).map(|h| h as NodeId),
+        },
         503 | 504 => match serde_json::from_slice::<ErrorBody>(&raw.body) {
-            Ok(body) if body.outcome_unknown && op.changes_state() => {
-                Verdict::Unknown { message: body.error }
-            }
+            Ok(body) if body.outcome_unknown && op.changes_state() => Verdict::Unknown {
+                message: body.error,
+            },
             // Includes a read that timed out inside the cluster: reads change nothing.
-            Ok(body) => Verdict::Busy { retry_after: raw.retry_after, message: body.error },
-            Err(_) => Verdict::Busy { retry_after: raw.retry_after, message: format!("HTTP {}", raw.status) },
+            Ok(body) => Verdict::Busy {
+                retry_after: raw.retry_after,
+                message: body.error,
+            },
+            Err(_) => Verdict::Busy {
+                retry_after: raw.retry_after,
+                message: format!("HTTP {}", raw.status),
+            },
         },
         400 | 404 | 405 | 409 | 413 | 415 | 422 => Verdict::Fatal(ClientError::Rejected {
             status: raw.status,
             message: status_text(raw),
         }),
-        other => Verdict::Skip { detail: format!("HTTP {other}") },
+        other => Verdict::Skip {
+            detail: format!("HTTP {other}"),
+        },
     }
 }
 
@@ -214,12 +233,19 @@ fn classify(op: &Op, raw: &Raw) -> Verdict {
 /// time, capped, raised to the cluster's `Retry-After` if it gave one (still capped),
 /// then spread by up to 20% either way so many clients do not retry in step.
 /// `jitter` is a number in 0..1 supplied by the caller (random in real use).
-fn backoff_delay(config: &ClientConfig, attempt: u32, hint: Option<Duration>, jitter: f64) -> Duration {
+fn backoff_delay(
+    config: &ClientConfig,
+    attempt: u32,
+    hint: Option<Duration>,
+    jitter: f64,
+) -> Duration {
     let exponential = config
         .initial_backoff
         .saturating_mul(2u32.saturating_pow(attempt.min(16)))
         .min(config.max_backoff);
-    let base = hint.map_or(exponential, |h| exponential.max(h)).min(config.max_backoff);
+    let base = hint
+        .map_or(exponential, |h| exponential.max(h))
+        .min(config.max_backoff);
     let spread = 0.8 + 0.4 * jitter.clamp(0.0, 1.0);
     base.mul_f64(spread)
 }
@@ -259,7 +285,11 @@ impl QuorumClient {
         let http = reqwest::Client::builder()
             .build()
             .expect("reqwest client builds with a static config");
-        Self { http, tracker: LeaderTracker::new(nodes), config }
+        Self {
+            http,
+            tracker: LeaderTracker::new(nodes),
+            config,
+        }
     }
 
     /// Reads a value as text. A value that is not valid UTF-8 is an error
@@ -267,7 +297,9 @@ impl QuorumClient {
     pub async fn get(&self, key: &str) -> Result<Option<String>, ClientError> {
         match self.get_bytes(key).await? {
             None => Ok(None),
-            Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| ClientError::NotUtf8),
+            Some(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| ClientError::NotUtf8),
         }
     }
 
@@ -288,7 +320,9 @@ impl QuorumClient {
     /// Writes any bytes. Returns once the write is committed on a majority.
     pub async fn put_bytes(&self, key: &str, value: impl AsRef<[u8]>) -> Result<(), ClientError> {
         check_key(key)?;
-        self.execute(Op::Put(key.to_string(), value.as_ref().to_vec())).await.map(|_| ())
+        self.execute(Op::Put(key.to_string(), value.as_ref().to_vec()))
+            .await
+            .map(|_| ())
     }
 
     pub async fn delete(&self, key: &str) -> Result<(), ClientError> {
@@ -300,7 +334,13 @@ impl QuorumClient {
     /// The new node must already be running with `QUORUM_JOIN=true`. This can take a
     /// while: the node is brought up to date first.
     pub async fn add_member(&self, id: NodeId, addr: &str) -> Result<Vec<NodeId>, ClientError> {
-        match self.execute(Op::AddMember { id, addr: addr.to_string() }).await? {
+        match self
+            .execute(Op::AddMember {
+                id,
+                addr: addr.to_string(),
+            })
+            .await?
+        {
             Output::Members(members) => Ok(members),
             _ => unreachable!("a membership change answers with the members"),
         }
@@ -326,7 +366,13 @@ impl QuorumClient {
                     continue;
                 }
             };
-            match self.http.get(url).timeout(self.config.request_timeout).send().await {
+            match self
+                .http
+                .get(url)
+                .timeout(self.config.request_timeout)
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => match resp.json::<HealthBody>().await {
                     Ok(body) => return Ok(body.members),
                     Err(e) => detail = format!("node {id}: {e}"),
@@ -359,7 +405,8 @@ impl QuorumClient {
                     }
                     Err(e) => {
                         // Sent, but no answer: a write may have taken effect.
-                        let message = format!("node {node_id} did not answer in time: {}", e.message);
+                        let message =
+                            format!("node {node_id} did not answer in time: {}", e.message);
                         if self.config.retry_unknown_writes {
                             last_detail = message;
                             continue;
@@ -376,7 +423,10 @@ impl QuorumClient {
                     Verdict::NotLeader { hint } => {
                         self.tracker.record_not_leader(hint.map(|h| h as NodeId));
                     }
-                    Verdict::Busy { retry_after, message } => {
+                    Verdict::Busy {
+                        retry_after,
+                        message,
+                    } => {
                         wait_hint = wait_hint.max(retry_after);
                         last_busy = Some(message);
                     }
@@ -399,12 +449,17 @@ impl QuorumClient {
 
         match last_busy {
             Some(message) => Err(ClientError::Unavailable { message }),
-            None => Err(ClientError::NoLeaderReachable { detail: last_detail }),
+            None => Err(ClientError::NoLeaderReachable {
+                detail: last_detail,
+            }),
         }
     }
 
     async fn send(&self, op: &Op, addr: &str) -> Result<Raw, SendError> {
-        let fail = |message: String| SendError { connect_failed: false, message };
+        let fail = |message: String| SendError {
+            connect_failed: false,
+            message,
+        };
         let mut url = Url::parse(&format!("http://{addr}"))
             .map_err(|e| fail(format!("bad node address {addr:?}: {e}")))?;
         // `extend` percent-encodes each segment, so a key can hold `/`, `?`, `#`, `%`
@@ -432,18 +487,27 @@ impl QuorumClient {
         };
         let request = match op {
             Op::Get(_) => self.http.get(url).header(ACCEPT, RAW),
-            Op::Put(_, value) => self.http.put(url).header(CONTENT_TYPE, RAW).body(value.clone()),
+            Op::Put(_, value) => self
+                .http
+                .put(url)
+                .header(CONTENT_TYPE, RAW)
+                .body(value.clone()),
             Op::Delete(_) => self.http.delete(url),
-            Op::AddMember { id, addr } => {
-                self.http.post(url).json(&serde_json::json!({ "id": id, "addr": addr }))
-            }
+            Op::AddMember { id, addr } => self
+                .http
+                .post(url)
+                .json(&serde_json::json!({ "id": id, "addr": addr })),
             Op::RemoveMember(_) => self.http.delete(url),
         };
 
-        let response = request.timeout(timeout).send().await.map_err(|e| SendError {
-            connect_failed: e.is_connect(),
-            message: e.to_string(),
-        })?;
+        let response = request
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| SendError {
+                connect_failed: e.is_connect(),
+                message: e.to_string(),
+            })?;
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -455,7 +519,11 @@ impl QuorumClient {
             connect_failed: false,
             message: format!("the answer was cut short: {e}"),
         })?;
-        Ok(Raw { status, retry_after, body: body.to_vec() })
+        Ok(Raw {
+            status,
+            retry_after,
+            body: body.to_vec(),
+        })
     }
 
     /// Current best guess first (if any), then every other node as fallback -
@@ -481,7 +549,11 @@ mod tests {
     use super::*;
 
     fn raw(status: u16, body: &str) -> Raw {
-        Raw { status, retry_after: None, body: body.as_bytes().to_vec() }
+        Raw {
+            status,
+            retry_after: None,
+            body: body.as_bytes().to_vec(),
+        }
     }
 
     fn get() -> Op {
@@ -494,36 +566,70 @@ mod tests {
 
     #[test]
     fn a_successful_write_from_the_leader_is_done() {
-        let verdict = classify(&put(), &raw(200, r#"{"is_leader":true,"applied":true,"leader_hint":null}"#));
+        let verdict = classify(
+            &put(),
+            &raw(
+                200,
+                r#"{"is_leader":true,"applied":true,"leader_hint":null}"#,
+            ),
+        );
         assert!(matches!(verdict, Verdict::Done(Output::Applied)));
     }
 
     #[test]
     fn a_write_answered_by_a_follower_follows_the_hint() {
-        let verdict = classify(&put(), &raw(200, r#"{"is_leader":false,"applied":false,"leader_hint":3}"#));
+        let verdict = classify(
+            &put(),
+            &raw(
+                200,
+                r#"{"is_leader":false,"applied":false,"leader_hint":3}"#,
+            ),
+        );
         assert!(matches!(verdict, Verdict::NotLeader { hint: Some(3) }));
-        let verdict = classify(&put(), &raw(200, r#"{"is_leader":false,"applied":false,"leader_hint":null}"#));
+        let verdict = classify(
+            &put(),
+            &raw(
+                200,
+                r#"{"is_leader":false,"applied":false,"leader_hint":null}"#,
+            ),
+        );
         assert!(matches!(verdict, Verdict::NotLeader { hint: None }));
     }
 
     #[test]
     fn a_raw_read_returns_the_body_untouched() {
-        let verdict = classify(&get(), &Raw { status: 200, retry_after: None, body: vec![0, 255, 7] });
+        let verdict = classify(
+            &get(),
+            &Raw {
+                status: 200,
+                retry_after: None,
+                body: vec![0, 255, 7],
+            },
+        );
         assert!(matches!(verdict, Verdict::Done(Output::Value(Some(v))) if v == vec![0, 255, 7]));
     }
 
     #[test]
     fn a_missing_key_is_none_but_only_when_the_leader_says_so() {
-        let ok = classify(&get(), &raw(404, r#"{"error":"key not found","outcome_unknown":false}"#));
+        let ok = classify(
+            &get(),
+            &raw(404, r#"{"error":"key not found","outcome_unknown":false}"#),
+        );
         assert!(matches!(ok, Verdict::Done(Output::Value(None))));
         // Some other 404 (a proxy, a wrong path) is not "the key does not exist".
         let other = classify(&get(), &raw(404, "<html>not found</html>"));
-        assert!(matches!(other, Verdict::Fatal(ClientError::Rejected { status: 404, .. })));
+        assert!(matches!(
+            other,
+            Verdict::Fatal(ClientError::Rejected { status: 404, .. })
+        ));
     }
 
     #[test]
     fn a_raw_read_on_a_follower_follows_the_hint() {
-        let verdict = classify(&get(), &raw(421, r#"{"error":"x","is_leader":false,"leader_hint":2}"#));
+        let verdict = classify(
+            &get(),
+            &raw(421, r#"{"error":"x","is_leader":false,"leader_hint":2}"#),
+        );
         assert!(matches!(verdict, Verdict::NotLeader { hint: Some(2) }));
     }
 
@@ -532,7 +638,9 @@ mod tests {
         let mut answer = raw(503, r#"{"error":"overloaded","outcome_unknown":false}"#);
         answer.retry_after = Some(Duration::from_secs(1));
         match classify(&put(), &answer) {
-            Verdict::Busy { retry_after, .. } => assert_eq!(retry_after, Some(Duration::from_secs(1))),
+            Verdict::Busy { retry_after, .. } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(1)))
+            }
             other => panic!("expected Busy, got {other:?}"),
         }
     }
@@ -540,31 +648,52 @@ mod tests {
     #[test]
     fn a_write_with_an_unknown_outcome_is_never_treated_as_busy() {
         for status in [503, 504] {
-            let verdict = classify(&put(), &raw(status, r#"{"error":"lost leadership","outcome_unknown":true}"#));
+            let verdict = classify(
+                &put(),
+                &raw(
+                    status,
+                    r#"{"error":"lost leadership","outcome_unknown":true}"#,
+                ),
+            );
             assert!(matches!(verdict, Verdict::Unknown { .. }), "{status}");
         }
         // The same for a delete and for a membership change.
         let body = raw(504, r#"{"error":"timed out","outcome_unknown":true}"#);
-        assert!(matches!(classify(&Op::Delete("k".into()), &body), Verdict::Unknown { .. }));
-        assert!(matches!(classify(&Op::RemoveMember(2), &body), Verdict::Unknown { .. }));
+        assert!(matches!(
+            classify(&Op::Delete("k".into()), &body),
+            Verdict::Unknown { .. }
+        ));
+        assert!(matches!(
+            classify(&Op::RemoveMember(2), &body),
+            Verdict::Unknown { .. }
+        ));
     }
 
     #[test]
     fn a_read_that_timed_out_inside_the_cluster_is_just_busy() {
-        let verdict = classify(&get(), &raw(504, r#"{"error":"timed out","outcome_unknown":false}"#));
+        let verdict = classify(
+            &get(),
+            &raw(504, r#"{"error":"timed out","outcome_unknown":false}"#),
+        );
         assert!(matches!(verdict, Verdict::Busy { .. }));
     }
 
     #[test]
     fn a_503_with_no_readable_body_is_busy_not_unknown() {
         let verdict = classify(&put(), &raw(503, "Service Unavailable"));
-        assert!(matches!(verdict, Verdict::Busy { .. }), "a proxy's error page says nothing about the write");
+        assert!(
+            matches!(verdict, Verdict::Busy { .. }),
+            "a proxy's error page says nothing about the write"
+        );
     }
 
     #[test]
     fn requests_that_can_never_succeed_are_fatal_with_the_servers_reason() {
         for status in [400, 409, 413, 415] {
-            match classify(&put(), &raw(status, r#"{"error":"the reason","outcome_unknown":false}"#)) {
+            match classify(
+                &put(),
+                &raw(status, r#"{"error":"the reason","outcome_unknown":false}"#),
+            ) {
                 Verdict::Fatal(ClientError::Rejected { status: s, message }) => {
                     assert_eq!((s, message.as_str()), (status, "the reason"));
                 }
@@ -575,7 +704,10 @@ mod tests {
 
     #[test]
     fn a_membership_change_answers_with_the_members() {
-        let body = raw(200, r#"{"is_leader":true,"applied":true,"leader_hint":null,"members":[1,2,3,4]}"#);
+        let body = raw(
+            200,
+            r#"{"is_leader":true,"applied":true,"leader_hint":null,"members":[1,2,3,4]}"#,
+        );
         assert!(matches!(
             classify(&Op::AddMember { id: 4, addr: "x:1".into() }, &body),
             Verdict::Done(Output::Members(m)) if m == vec![1, 2, 3, 4]
@@ -584,9 +716,18 @@ mod tests {
 
     #[test]
     fn other_server_errors_and_garbage_just_try_the_next_node() {
-        assert!(matches!(classify(&put(), &raw(500, "boom")), Verdict::Skip { .. }));
-        assert!(matches!(classify(&put(), &raw(502, "")), Verdict::Skip { .. }));
-        assert!(matches!(classify(&put(), &raw(200, "not json")), Verdict::Skip { .. }));
+        assert!(matches!(
+            classify(&put(), &raw(500, "boom")),
+            Verdict::Skip { .. }
+        ));
+        assert!(matches!(
+            classify(&put(), &raw(502, "")),
+            Verdict::Skip { .. }
+        ));
+        assert!(matches!(
+            classify(&put(), &raw(200, "not json")),
+            Verdict::Skip { .. }
+        ));
     }
 
     fn config() -> ClientConfig {
@@ -599,17 +740,30 @@ mod tests {
 
     #[test]
     fn backoff_doubles_up_to_the_cap() {
-        let delays: Vec<u128> =
-            (0..6).map(|a| backoff_delay(&config(), a, None, 0.5).as_millis()).collect();
+        let delays: Vec<u128> = (0..6)
+            .map(|a| backoff_delay(&config(), a, None, 0.5).as_millis())
+            .collect();
         assert_eq!(delays, vec![100, 200, 400, 800, 1000, 1000]);
     }
 
     #[test]
     fn the_clusters_retry_after_is_honoured_but_capped() {
         let wait = |hint| backoff_delay(&config(), 0, Some(hint), 0.5).as_millis();
-        assert_eq!(wait(Duration::from_millis(600)), 600, "longer than the doubling would give");
-        assert_eq!(wait(Duration::from_millis(10)), 100, "never shorter than the doubling");
-        assert_eq!(wait(Duration::from_secs(30)), 1000, "never longer than the cap");
+        assert_eq!(
+            wait(Duration::from_millis(600)),
+            600,
+            "longer than the doubling would give"
+        );
+        assert_eq!(
+            wait(Duration::from_millis(10)),
+            100,
+            "never shorter than the doubling"
+        );
+        assert_eq!(
+            wait(Duration::from_secs(30)),
+            1000,
+            "never longer than the cap"
+        );
     }
 
     #[test]
@@ -627,7 +781,10 @@ mod tests {
     fn bad_keys_are_rejected_before_anything_is_sent() {
         assert!(matches!(check_key(""), Err(ClientError::InvalidKey(_))));
         assert!(matches!(check_key("a\0b"), Err(ClientError::InvalidKey(_))));
-        assert!(matches!(check_key(&"k".repeat(600)), Err(ClientError::InvalidKey(_))));
+        assert!(matches!(
+            check_key(&"k".repeat(600)),
+            Err(ClientError::InvalidKey(_))
+        ));
         assert!(check_key("fine key/with?odd#chars%").is_ok());
     }
 }

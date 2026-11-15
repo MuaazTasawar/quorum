@@ -197,7 +197,11 @@ pub fn handle_append_entries_response(
     follower_id: NodeId,
     response: &AppendEntriesResponse,
 ) {
-    let known_match = leader_state.match_index.get(&follower_id).copied().unwrap_or(0);
+    let known_match = leader_state
+        .match_index
+        .get(&follower_id)
+        .copied()
+        .unwrap_or(0);
     let current_next = leader_state.next_index.get(&follower_id).copied();
 
     if response.success {
@@ -285,7 +289,11 @@ mod tests {
     }
 
     fn entry(term: Term, index: u64, command: &str) -> LogEntry {
-        LogEntry { term, index, command: command.as_bytes().to_vec() }
+        LogEntry {
+            term,
+            index,
+            command: command.as_bytes().to_vec(),
+        }
     }
 
     fn request(
@@ -307,11 +315,23 @@ mod tests {
     }
 
     fn ok_response(match_index: u64) -> AppendEntriesResponse {
-        AppendEntriesResponse { term: 1, success: true, conflict_index: None, match_index, seq: 0 }
+        AppendEntriesResponse {
+            term: 1,
+            success: true,
+            conflict_index: None,
+            match_index,
+            seq: 0,
+        }
     }
 
     fn rejection(conflict_index: Option<u64>) -> AppendEntriesResponse {
-        AppendEntriesResponse { term: 1, success: false, conflict_index, match_index: 0, seq: 0 }
+        AppendEntriesResponse {
+            term: 1,
+            success: false,
+            conflict_index,
+            match_index: 0,
+            seq: 0,
+        }
     }
 
     // ---- receiver side: handle_append_entries -------------------------------
@@ -623,7 +643,10 @@ mod tests {
         let req = with_seq(request(1, 5, 1, vec![], 0), 7);
         let (resp, _) = handle_append_entries(&mut persistent, &mut volatile, &mut log, &req);
         assert!(!resp.success);
-        assert_eq!(resp.seq, 7, "a rejection still proves the follower accepted this leader");
+        assert_eq!(
+            resp.seq, 7,
+            "a rejection still proves the follower accepted this leader"
+        );
     }
 
     #[test]
@@ -648,7 +671,10 @@ mod tests {
 
     #[test]
     fn built_requests_carry_the_round_number_they_are_given() {
-        let persistent = PersistentState { current_term: 2, voted_for: None };
+        let persistent = PersistentState {
+            current_term: 2,
+            voted_for: None,
+        };
         let log = Log::new();
         let req = build_append_entries(&persistent, &log, 1, 1, 0, 123);
         assert_eq!(req.seq, 123);
@@ -706,8 +732,14 @@ mod tests {
         let state = progress(&[(2, 5), (3, 0)]);
         // With {1,2,3} the entry is on 2 of 3: committed. With {1,2} it still is.
         // With node 2 gone and the leader alone with node 3 absent from progress:
-        assert_eq!(advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 3]), 5), None);
-        assert_eq!(advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1]), 5), Some(5));
+        assert_eq!(
+            advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 3]), 5),
+            None
+        );
+        assert_eq!(
+            advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1]), 5),
+            Some(5)
+        );
     }
 
     #[test]
@@ -718,7 +750,10 @@ mod tests {
         let state = progress(&[(2, 5), (3, 0), (4, 0)]);
         assert_eq!(advance_commit_index(&state, &log, 1, 1, &members, 5), None);
         let state = progress(&[(2, 5), (3, 5), (4, 0)]);
-        assert_eq!(advance_commit_index(&state, &log, 1, 1, &members, 5), Some(5));
+        assert_eq!(
+            advance_commit_index(&state, &log, 1, 1, &members, 5),
+            Some(5)
+        );
     }
 
     #[test]
@@ -726,7 +761,10 @@ mod tests {
         let log = log_of(5);
         // Node 3 is far ahead in the map but no longer a member.
         let state = progress(&[(2, 0), (3, 5)]);
-        assert_eq!(advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 2, 4]), 5), None);
+        assert_eq!(
+            advance_commit_index(&state, &log, 1, 1, &Membership::of_ids([1, 2, 4]), 5),
+            None
+        );
     }
 
     // ---- a follower with a snapshot -----------------------------------------
@@ -738,8 +776,10 @@ mod tests {
             log.append(1, format!("c{i}").into_bytes());
         }
         log.compact_through(5).unwrap();
-        let mut persistent = PersistentState::default();
-        persistent.current_term = 1;
+        let persistent = PersistentState {
+            current_term: 1,
+            ..PersistentState::default()
+        };
         let mut volatile = VolatileState::new();
         volatile.commit_index = 5;
         volatile.last_applied = 5;
@@ -750,8 +790,7 @@ mod tests {
     fn entries_inside_the_snapshot_are_skipped_not_compared_or_rejected() {
         let (mut persistent, mut volatile, mut log) = follower_with_snapshot_at_five();
         // The leader still thinks we are at index 2 and sends 3..=8.
-        let entries: Vec<LogEntry> =
-            (3..=8).map(|i| entry(1, i, &format!("c{i}"))).collect();
+        let entries: Vec<LogEntry> = (3..=8).map(|i| entry(1, i, &format!("c{i}"))).collect();
         let (resp, effect) = handle_append_entries(
             &mut persistent,
             &mut volatile,
@@ -772,8 +811,7 @@ mod tests {
     #[test]
     fn a_request_entirely_inside_the_snapshot_succeeds_and_changes_nothing() {
         let (mut persistent, mut volatile, mut log) = follower_with_snapshot_at_five();
-        let entries: Vec<LogEntry> =
-            (2..=4).map(|i| entry(1, i, &format!("c{i}"))).collect();
+        let entries: Vec<LogEntry> = (2..=4).map(|i| entry(1, i, &format!("c{i}"))).collect();
         let (resp, effect) = handle_append_entries(
             &mut persistent,
             &mut volatile,

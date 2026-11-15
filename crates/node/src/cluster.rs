@@ -1,13 +1,13 @@
 use raft_core::{
-    accept_leader_term, advance_commit_index, apply_snapshot_installed, build_append_entries, handle_append_entries,
-    handle_append_entries_response, handle_pre_vote, handle_request_vote, start_election,
-    ChunkOutcome, ConfigChange, ConfigHistory, ElectionTimeoutConfig, InstallSnapshotRequest,
-    InstallSnapshotResponse, LeaderState, Log, LogEntry, Membership, NodeId, PersistentState,
-    PreVoteRequest, PreVoteResponse, RequestVoteResponse, Role, RpcMessage, SnapshotAssembler,
-    SnapshotSender, Term, VoteTally, VolatileState,
+    accept_leader_term, advance_commit_index, apply_snapshot_installed, build_append_entries,
+    handle_append_entries, handle_append_entries_response, handle_pre_vote, handle_request_vote,
+    start_election, ChunkOutcome, ConfigChange, ConfigHistory, ElectionTimeoutConfig,
+    InstallSnapshotRequest, InstallSnapshotResponse, LeaderState, Log, LogEntry, Membership,
+    NodeId, PersistentState, PreVoteRequest, PreVoteResponse, RequestVoteResponse, Role,
+    RpcMessage, SnapshotAssembler, SnapshotSender, Term, VolatileState, VoteTally,
 };
-use std::sync::Arc;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use storage::{Command, KvStore, Persistence, Recovered, RecoveredSnapshot};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
@@ -26,7 +26,9 @@ pub struct ClientCommand {
 #[derive(Debug, Clone)]
 pub enum ClientCommandResult {
     Applied(Option<Vec<u8>>),
-    NotLeader { leader_hint: Option<NodeId> },
+    NotLeader {
+        leader_hint: Option<NodeId>,
+    },
     /// This node was the leader when it accepted the write but lost leadership
     /// before the write was confirmed. The outcome is UNKNOWN, not "failed": the
     /// entry may already be on a majority, in which case the next leader will
@@ -56,7 +58,9 @@ pub struct ClientQuery {
 #[derive(Debug, Clone)]
 pub enum QueryResult {
     Value(Option<Vec<u8>>),
-    NotLeader { leader_hint: Option<NodeId> },
+    NotLeader {
+        leader_hint: Option<NodeId>,
+    },
     /// The leader already holds as many waiting reads as it will carry. Retry.
     Overloaded,
 }
@@ -87,8 +91,12 @@ pub struct ClientAdmin {
 #[derive(Debug, Clone)]
 pub enum AdminResult {
     /// The change was committed and is in effect cluster-wide.
-    Applied { members: Vec<NodeId> },
-    NotLeader { leader_hint: Option<NodeId> },
+    Applied {
+        members: Vec<NodeId>,
+    },
+    NotLeader {
+        leader_hint: Option<NodeId>,
+    },
     /// The change was refused and NOTHING was logged, so retrying (once the reason
     /// has gone) is always safe.
     Rejected(AdminRejection),
@@ -236,7 +244,11 @@ enum AdminStage {
     /// its acknowledgements. It is promoted once its match index reaches the
     /// leader's commit index, so that adding it can never leave the cluster one
     /// slow disk away from losing its majority.
-    CatchingUp { id: NodeId, addr: String, deadline: Instant },
+    CatchingUp {
+        id: NodeId,
+        addr: String,
+        deadline: Instant,
+    },
     /// The configuration entry is in the log and in effect; waiting for it to be
     /// committed and applied.
     Committing { index: u64, removes_self: bool },
@@ -244,7 +256,9 @@ enum AdminStage {
 
 /// The change a log entry carries, if it carries one.
 fn config_change_of(command: &[u8]) -> Option<ConfigChange> {
-    Command::decode(command).ok().and_then(|c| c.config_change())
+    Command::decode(command)
+        .ok()
+        .and_then(|c| c.config_change())
 }
 
 /// An in-progress pre-vote round: the term this node WOULD use, and the answers
@@ -327,7 +341,13 @@ impl Cluster {
         inbox_rx: mpsc::Receiver<(NodeId, RpcMessage)>,
         connector: PeerConnector,
     ) -> (Self, ClusterHandle) {
-        let Recovered { persistence, hard_state: persistent, snapshot, entries, .. } = recovered;
+        let Recovered {
+            persistence,
+            hard_state: persistent,
+            snapshot,
+            entries,
+            ..
+        } = recovered;
 
         // A node that has a snapshot starts from it: the state machine as it was,
         // the log's starting point, and the membership at that point. The latter
@@ -422,7 +442,15 @@ impl Cluster {
         cluster.connect_missing_peers();
         cluster.drop_peers_outside_membership();
 
-        (cluster, ClusterHandle { command_tx, query_tx, admin_tx, snapshot_rx })
+        (
+            cluster,
+            ClusterHandle {
+                command_tx,
+                query_tx,
+                admin_tx,
+                snapshot_rx,
+            },
+        )
     }
 
     /// Heartbeat interval must sit well below the minimum election timeout -
@@ -537,8 +565,10 @@ impl Cluster {
     /// stays and is committed or discarded as usual; only the reply slot is
     /// released, so an unreachable majority cannot make these queues grow forever.
     fn prune_abandoned_requests(&mut self) {
-        self.pending_commands.retain(|_, respond_to| !respond_to.is_closed());
-        self.pending_reads.retain(|read| !read.respond_to.is_closed());
+        self.pending_commands
+            .retain(|_, respond_to| !respond_to.is_closed());
+        self.pending_reads
+            .retain(|read| !read.respond_to.is_closed());
     }
 
     fn dispatch_rpc(&mut self, from: NodeId, msg: RpcMessage) {
@@ -614,7 +644,8 @@ impl Cluster {
                 // Read-only by construction: no term change, no vote recorded, no
                 // timer reset, nothing to persist. Answering must never have side
                 // effects, or a disruptive node could use it to suppress elections.
-                let resp = handle_pre_vote(&self.persistent, &self.log, &req, self.leader_is_active());
+                let resp =
+                    handle_pre_vote(&self.persistent, &self.log, &req, self.leader_is_active());
                 self.send_to(from, RpcMessage::PreVoteResponse(resp));
             }
 
@@ -658,7 +689,10 @@ impl Cluster {
                     persist_must(self.persistence.truncate_from(from_index), "log truncate");
                 }
                 // One fsync for the whole batch, however many entries it carries.
-                persist_must(self.persistence.append_batch(&effect.appended), "log append");
+                persist_must(
+                    self.persistence.append_batch(&effect.appended),
+                    "log append",
+                );
 
                 // A configuration entry is in effect as soon as it is in the log,
                 // and one that was truncated away must stop counting.
@@ -708,7 +742,8 @@ impl Cluster {
                 }
                 // Any same-term answer, even a rejection, proves this follower is
                 // reachable and still recognises us as its leader.
-                self.leader_state.record_ack(from, std::time::Instant::now());
+                self.leader_state
+                    .record_ack(from, std::time::Instant::now());
                 // And it names the heartbeat round it answered, which is what lets
                 // a waiting read prove leadership (see `complete_ready_reads`).
                 self.leader_state.record_ack_seq(from, resp.seq);
@@ -748,7 +783,8 @@ impl Cluster {
     /// heartbeats cost nothing.
     fn persist_hard_state(&mut self) {
         persist_must(
-            self.persistence.save_hard_state_if_changed(&self.persistent),
+            self.persistence
+                .save_hard_state_if_changed(&self.persistent),
             "hard state",
         );
     }
@@ -806,7 +842,10 @@ impl Cluster {
         });
         // If this round gets no majority, the timer fires again and we ask again.
         self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
-        info!(proposed_term, "election timeout - asking peers whether they would vote");
+        info!(
+            proposed_term,
+            "election timeout - asking peers whether they would vote"
+        );
 
         let req = PreVoteRequest {
             term: proposed_term,
@@ -814,8 +853,11 @@ impl Cluster {
             last_log_index: self.log.last_index(),
             last_log_term: self.log.last_term(),
         };
-        let peer_ids: Vec<NodeId> =
-            self.membership.ids().filter(|&id| id != self.config.id).collect();
+        let peer_ids: Vec<NodeId> = self
+            .membership
+            .ids()
+            .filter(|&id| id != self.config.id)
+            .collect();
         for peer_id in peer_ids {
             self.send_to(peer_id, RpcMessage::PreVote(req.clone()));
         }
@@ -859,7 +901,12 @@ impl Cluster {
 
     fn begin_election(&mut self) {
         self.pre_vote = None;
-        let req = start_election(&mut self.persistent, &mut self.volatile, &self.log, self.config.id);
+        let req = start_election(
+            &mut self.persistent,
+            &mut self.volatile,
+            &self.log,
+            self.config.id,
+        );
         // The new term and our vote for ourselves must be durable before any
         // RequestVote leaves this node.
         self.persist_hard_state();
@@ -868,13 +915,21 @@ impl Cluster {
         self.election_deadline = Instant::now() + self.election_timeout.random_timeout();
         info!(term = self.persistent.current_term, "starting election");
 
-        let peer_ids: Vec<NodeId> =
-            self.membership.ids().filter(|&id| id != self.config.id).collect();
+        let peer_ids: Vec<NodeId> = self
+            .membership
+            .ids()
+            .filter(|&id| id != self.config.id)
+            .collect();
         for peer_id in peer_ids {
             self.send_to(peer_id, RpcMessage::RequestVote(req.clone()));
         }
 
-        if self.vote_tally.as_ref().map(|t| t.has_majority()).unwrap_or(false) {
+        if self
+            .vote_tally
+            .as_ref()
+            .map(|t| t.has_majority())
+            .unwrap_or(false)
+        {
             self.become_leader();
         }
     }
@@ -1030,7 +1085,8 @@ impl Cluster {
             return;
         }
         // Any same-term answer proves the follower is reachable and recognises us.
-        self.leader_state.record_ack(from, std::time::Instant::now());
+        self.leader_state
+            .record_ack(from, std::time::Instant::now());
         self.leader_state.record_ack_seq(from, resp.seq);
 
         let Some(sender) = self.snapshot_sends.get_mut(&from) else {
@@ -1040,7 +1096,11 @@ impl Cluster {
             return; // an answer about a transfer that is over
         }
         if resp.installed {
-            info!(peer_id = from, last_included_index = resp.last_included_index, "peer installed the snapshot");
+            info!(
+                peer_id = from,
+                last_included_index = resp.last_included_index,
+                "peer installed the snapshot"
+            );
             apply_snapshot_installed(&mut self.leader_state, from, resp.last_included_index);
             self.snapshot_sends.remove(&from);
             self.advance_leader_commit();
@@ -1101,15 +1161,25 @@ impl Cluster {
 
         if req.offset == 0 {
             // The start of a transfer: whatever was half received is abandoned.
-            self.incoming_snapshot =
-                SnapshotAssembler::start(req.last_included_index, req.last_included_term, req.total_len);
+            self.incoming_snapshot = SnapshotAssembler::start(
+                req.last_included_index,
+                req.last_included_term,
+                req.total_len,
+            );
             if self.incoming_snapshot.is_none() {
-                warn!(total_len = req.total_len, "refusing a snapshot larger than the limit");
+                warn!(
+                    total_len = req.total_len,
+                    "refusing a snapshot larger than the limit"
+                );
                 let answer = reply(self, 0, false);
                 self.send_to(from, answer);
                 return;
             }
-        } else if !self.incoming_snapshot.as_ref().map_or(false, |a| a.is_receiving(&req)) {
+        } else if !self
+            .incoming_snapshot
+            .as_ref()
+            .is_some_and(|a| a.is_receiving(&req))
+        {
             // Not part of a transfer this node knows about (it restarted, or the leader
             // moved on to a different snapshot): ask for it from the start.
             self.incoming_snapshot = None;
@@ -1133,7 +1203,11 @@ impl Cluster {
             }
             ChunkOutcome::Complete(bytes) => {
                 self.incoming_snapshot = None;
-                match self.install_received_snapshot(bytes, req.last_included_index, req.last_included_term) {
+                match self.install_received_snapshot(
+                    bytes,
+                    req.last_included_index,
+                    req.last_included_term,
+                ) {
                     Ok(()) => reply(self, req.total_len, true),
                     Err(reason) => {
                         warn!(%reason, "the snapshot received from the leader was not installed");
@@ -1172,7 +1246,8 @@ impl Cluster {
         // is still valid and is kept; otherwise the whole log goes (Raft paper §7).
         let keep_suffix = index <= self.log.last_index() && self.log.term_at(index) == Some(term);
         persist_must(
-            self.persistence.install_snapshot_bytes(&bytes, &metadata, keep_suffix),
+            self.persistence
+                .install_snapshot_bytes(&bytes, &metadata, keep_suffix),
             "snapshot install",
         );
 
@@ -1194,7 +1269,11 @@ impl Cluster {
 
         self.snapshots_installed += 1;
         self.snapshot_retry_after = 0;
-        info!(index, kept_log_after_it = keep_suffix, "installed a snapshot from the leader");
+        info!(
+            index,
+            kept_log_after_it = keep_suffix,
+            "installed a snapshot from the leader"
+        );
         Ok(())
     }
 
@@ -1220,9 +1299,9 @@ impl Cluster {
     fn handle_client_commands(&mut self, commands: Vec<ClientCommand>) {
         if self.volatile.role != Role::Leader {
             for cmd in commands {
-                let _ = cmd
-                    .respond_to
-                    .send(ClientCommandResult::NotLeader { leader_hint: self.known_leader });
+                let _ = cmd.respond_to.send(ClientCommandResult::NotLeader {
+                    leader_hint: self.known_leader,
+                });
             }
             return;
         }
@@ -1276,9 +1355,9 @@ impl Cluster {
     fn handle_client_queries(&mut self, queries: Vec<ClientQuery>) {
         if self.volatile.role != Role::Leader {
             for query in queries {
-                let _ = query
-                    .respond_to
-                    .send(QueryResult::NotLeader { leader_hint: self.known_leader });
+                let _ = query.respond_to.send(QueryResult::NotLeader {
+                    leader_hint: self.known_leader,
+                });
             }
             return;
         }
@@ -1387,10 +1466,18 @@ impl Cluster {
             membership: self.history.membership_at(index),
         };
         let started = Instant::now();
-        match self.persistence.save_snapshot_only(metadata, &self.kv_store) {
+        match self
+            .persistence
+            .save_snapshot_only(metadata, &self.kv_store)
+        {
             Ok(()) => {
                 self.snapshots_taken += 1;
-                info!(index, keys = self.kv_store.len(), took_ms = started.elapsed().as_millis() as u64, "snapshot taken");
+                info!(
+                    index,
+                    keys = self.kv_store.len(),
+                    took_ms = started.elapsed().as_millis() as u64,
+                    "snapshot taken"
+                );
             }
             Err(e) => {
                 error!(error = %e, index, "could not write a snapshot - carrying on without one");
@@ -1419,7 +1506,9 @@ impl Cluster {
         }
         match self.persistence.compact_log_through(upto) {
             Ok(()) => {
-                self.log.compact_through(upto).expect("only entries that exist are compacted");
+                self.log
+                    .compact_through(upto)
+                    .expect("only entries that exist are compacted");
                 self.history.compact_through(upto);
                 debug!(upto, "log compacted");
             }
@@ -1455,7 +1544,7 @@ impl Cluster {
         let change_in_log_uncommitted = self
             .history
             .last_change_index()
-            .map_or(false, |index| index > self.volatile.commit_index);
+            .is_some_and(|index| index > self.volatile.commit_index);
         if self.pending_admin.is_some() || change_in_log_uncommitted {
             return Some(AdminRejection::ChangeInProgress);
         }
@@ -1486,7 +1575,9 @@ impl Cluster {
 
     fn handle_client_admin(&mut self, admin: ClientAdmin) {
         if self.volatile.role != Role::Leader {
-            let _ = admin.respond_to.send(AdminResult::NotLeader { leader_hint: self.known_leader });
+            let _ = admin.respond_to.send(AdminResult::NotLeader {
+                leader_hint: self.known_leader,
+            });
             return;
         }
         if let Some(rejection) = self.admin_rejection(&admin.change) {
@@ -1501,7 +1592,9 @@ impl Cluster {
                 // vote or count toward any majority yet.
                 let outbox = (self.connector)(id, &addr);
                 self.peer_outboxes.insert(id, outbox);
-                self.leader_state.next_index.insert(id, self.log.last_index() + 1);
+                self.leader_state
+                    .next_index
+                    .insert(id, self.log.last_index() + 1);
                 self.leader_state.match_index.insert(id, 0);
                 self.leader_state.last_ack.remove(&id);
                 self.leader_state.ack_seq.remove(&id);
@@ -1521,7 +1614,10 @@ impl Cluster {
                 let index = self.append_config_entry(Command::RemoveNode { id });
                 self.pending_admin = Some(PendingAdmin {
                     respond_to: admin.respond_to,
-                    stage: AdminStage::Committing { index, removes_self: id == self.config.id },
+                    stage: AdminStage::Committing {
+                        index,
+                        removes_self: id == self.config.id,
+                    },
                 });
                 self.broadcast_append_entries();
                 // The new, smaller configuration is already in effect, and it may
@@ -1535,7 +1631,9 @@ impl Cluster {
     /// what it waits for (a learner catching up, an entry committing) is changed by
     /// ordinary replication traffic.
     fn drive_admin(&mut self) {
-        let Some(pending) = self.pending_admin.take() else { return };
+        let Some(pending) = self.pending_admin.take() else {
+            return;
+        };
         if self.volatile.role != Role::Leader {
             // Leadership was lost; `abort_pending_requests` answers the caller.
             self.pending_admin = Some(pending);
@@ -1555,11 +1653,17 @@ impl Cluster {
                 }
                 let matched = self.leader_state.match_index.get(&id).copied().unwrap_or(0);
                 if matched >= self.volatile.commit_index {
-                    info!(id, matched, "learner has caught up - admitting it as a voting member");
+                    info!(
+                        id,
+                        matched, "learner has caught up - admitting it as a voting member"
+                    );
                     let index = self.append_config_entry(Command::AddNode { id, addr });
                     self.pending_admin = Some(PendingAdmin {
                         respond_to,
-                        stage: AdminStage::Committing { index, removes_self: false },
+                        stage: AdminStage::Committing {
+                            index,
+                            removes_self: false,
+                        },
                     });
                     self.broadcast_append_entries();
                     self.advance_leader_commit();
@@ -1570,7 +1674,10 @@ impl Cluster {
                     });
                 }
             }
-            AdminStage::Committing { index, removes_self } => {
+            AdminStage::Committing {
+                index,
+                removes_self,
+            } => {
                 if self.volatile.last_applied >= index {
                     let members = self.membership.ids().collect();
                     let _ = respond_to.send(AdminResult::Applied { members });
@@ -1584,7 +1691,10 @@ impl Cluster {
                 } else {
                     self.pending_admin = Some(PendingAdmin {
                         respond_to,
-                        stage: AdminStage::Committing { index, removes_self },
+                        stage: AdminStage::Committing {
+                            index,
+                            removes_self,
+                        },
                     });
                 }
             }
@@ -1594,7 +1704,9 @@ impl Cluster {
     /// Appends a configuration entry to this leader's log, makes it durable, and
     /// puts it into effect. Returns its index.
     fn append_config_entry(&mut self, command: Command) -> u64 {
-        let change = command.config_change().expect("only membership commands come through here");
+        let change = command
+            .config_change()
+            .expect("only membership commands come through here");
         let encoded = command.encode().expect("membership commands always encode");
         let index = self.log.append(self.persistent.current_term, encoded);
         self.append_to_wal(index);
@@ -1650,7 +1762,10 @@ impl Cluster {
             let outbox = (self.connector)(id, &addr);
             self.peer_outboxes.insert(id, outbox);
             // Only meaningful on a leader, harmless elsewhere (reset on election).
-            self.leader_state.next_index.entry(id).or_insert(self.log.last_index() + 1);
+            self.leader_state
+                .next_index
+                .entry(id)
+                .or_insert(self.log.last_index() + 1);
             self.leader_state.match_index.entry(id).or_insert(0);
         }
     }
@@ -1659,7 +1774,8 @@ impl Cluster {
     fn drop_peers_outside_membership(&mut self) {
         let membership = &self.membership;
         let learners = &self.learners;
-        self.peer_outboxes.retain(|id, _| membership.contains(*id) || learners.contains_key(id));
+        self.peer_outboxes
+            .retain(|id, _| membership.contains(*id) || learners.contains_key(id));
     }
 
     /// A removal has committed. Stop sending to the node (it is not a member, and
@@ -1698,7 +1814,9 @@ impl Cluster {
     fn apply_committed_entries(&mut self) {
         while self.volatile.last_applied < self.volatile.commit_index {
             let next_index = self.volatile.last_applied + 1;
-            let Some(entry) = self.log.get(next_index) else { break };
+            let Some(entry) = self.log.get(next_index) else {
+                break;
+            };
             let result = match Command::decode(&entry.command) {
                 Ok(command) => {
                     let removed = match command.config_change() {
@@ -1730,7 +1848,9 @@ impl Cluster {
     /// matters on its next heartbeat. What must never happen is the event loop
     /// stalling on one slow peer while the rest of the cluster waits.
     fn send_to(&mut self, peer_id: NodeId, msg: RpcMessage) {
-        let Some(tx) = self.peer_outboxes.get(&peer_id) else { return };
+        let Some(tx) = self.peer_outboxes.get(&peer_id) else {
+            return;
+        };
         match tx.try_send(msg) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1775,8 +1895,8 @@ mod tests {
     use super::*;
     use crate::config::Limits;
     use raft_core::{
-        AppendEntriesRequest, AppendEntriesResponse, LogEntry, PreVoteResponse,
-        RequestVoteRequest, RequestVoteResponse,
+        AppendEntriesRequest, AppendEntriesResponse, LogEntry, PreVoteResponse, RequestVoteRequest,
+        RequestVoteResponse,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1791,7 +1911,10 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
             Self(std::env::temp_dir().join(format!("quorum-unit-{nanos}-{n}")))
         }
@@ -1894,7 +2017,11 @@ mod tests {
     }
 
     fn entry(term: Term, index: u64, command: &str) -> LogEntry {
-        LogEntry { term, index, command: command.as_bytes().to_vec() }
+        LogEntry {
+            term,
+            index,
+            command: command.as_bytes().to_vec(),
+        }
     }
 
     fn append_request(
@@ -1925,9 +2052,10 @@ mod tests {
         leader_commit: u64,
     ) -> RpcMessage {
         match append_request(term, leader_id, prev_log_index, prev_log_term, entries) {
-            RpcMessage::AppendEntries(req) => {
-                RpcMessage::AppendEntries(AppendEntriesRequest { leader_commit, ..req })
-            }
+            RpcMessage::AppendEntries(req) => RpcMessage::AppendEntries(AppendEntriesRequest {
+                leader_commit,
+                ..req
+            }),
             _ => unreachable!(),
         }
     }
@@ -1953,7 +2081,10 @@ mod tests {
     ) -> (ClientCommand, oneshot::Receiver<ClientCommandResult>) {
         let (respond_to, receiver) = oneshot::channel();
         let command = ClientCommand {
-            command: Command::Put { key: key.into(), value: value.as_bytes().to_vec() },
+            command: Command::Put {
+                key: key.into(),
+                value: value.as_bytes().to_vec(),
+            },
             respond_to,
         };
         (command, receiver)
@@ -1973,7 +2104,13 @@ mod tests {
 
     fn read_query(key: &str) -> (ClientQuery, oneshot::Receiver<QueryResult>) {
         let (respond_to, receiver) = oneshot::channel();
-        (ClientQuery { key: key.into(), respond_to }, receiver)
+        (
+            ClientQuery {
+                key: key.into(),
+                respond_to,
+            },
+            receiver,
+        )
     }
 
     /// A 3-node cluster whose node 1 is leader in term 1 and has committed and
@@ -2008,7 +2145,11 @@ mod tests {
     }
 
     fn pre_vote_response(term: Term, vote_granted: bool, request_term: Term) -> RpcMessage {
-        RpcMessage::PreVoteResponse(PreVoteResponse { term, vote_granted, request_term })
+        RpcMessage::PreVoteResponse(PreVoteResponse {
+            term,
+            vote_granted,
+            request_term,
+        })
     }
 
     /// Makes the node behave as if it last heard from a leader long ago.
@@ -2064,7 +2205,10 @@ mod tests {
         let mut cluster = build_cluster(&dir, &[]);
         let (respond_to, receiver) = oneshot::channel();
         cluster.handle_client_command(ClientCommand {
-            command: Command::Put { key: "k".into(), value: b"v".to_vec() },
+            command: Command::Put {
+                key: "k".into(),
+                value: b"v".to_vec(),
+            },
             respond_to,
         });
         let result = receiver.await.unwrap();
@@ -2085,7 +2229,10 @@ mod tests {
 
         let (respond_to, _receiver) = oneshot::channel();
         cluster.handle_client_command(ClientCommand {
-            command: Command::Put { key: "k".into(), value: b"v".to_vec() },
+            command: Command::Put {
+                key: "k".into(),
+                value: b"v".to_vec(),
+            },
             respond_to,
         });
         assert_eq!(cluster.log.last_index(), 2);
@@ -2096,7 +2243,10 @@ mod tests {
         let dir = TestDir::new();
         let mut cluster = build_cluster(&dir, &[]);
         let (respond_to, receiver) = oneshot::channel();
-        cluster.handle_client_query(ClientQuery { key: "k".into(), respond_to });
+        cluster.handle_client_query(ClientQuery {
+            key: "k".into(),
+            respond_to,
+        });
         let result = receiver.await.unwrap();
         assert!(matches!(result, QueryResult::NotLeader { .. }));
     }
@@ -2110,10 +2260,16 @@ mod tests {
         // Directly apply, bypassing the full commit pipeline - this test is
         // only checking the query path reads from kv_store correctly, not
         // re-testing commit/apply (already covered by raft-core's own tests).
-        cluster.kv_store.apply(&Command::Put { key: "k".into(), value: b"v".to_vec() });
+        cluster.kv_store.apply(&Command::Put {
+            key: "k".into(),
+            value: b"v".to_vec(),
+        });
 
         let (respond_to, receiver) = oneshot::channel();
-        cluster.handle_client_query(ClientQuery { key: "k".into(), respond_to });
+        cluster.handle_client_query(ClientQuery {
+            key: "k".into(),
+            respond_to,
+        });
         // A read is parked until leadership is proven. A single node needs no peers
         // to prove it, so the end-of-pass steps the event loop runs are enough.
         cluster.apply_committed_entries();
@@ -2235,8 +2391,15 @@ mod tests {
 
         // Second life, same storage directory.
         let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
-        assert_eq!(cluster.persistent.current_term, 5, "term must survive the restart");
-        assert_eq!(cluster.persistent.voted_for, Some(2), "vote must survive the restart");
+        assert_eq!(
+            cluster.persistent.current_term, 5,
+            "term must survive the restart"
+        );
+        assert_eq!(
+            cluster.persistent.voted_for,
+            Some(2),
+            "vote must survive the restart"
+        );
 
         // Node 3 now asks for a vote in the same term. Without a persisted vote
         // this restarted node would grant it: two votes in one term.
@@ -2270,7 +2433,11 @@ mod tests {
         }
         let cluster = build_cluster(&dir, &[2, 3]);
         assert_eq!(cluster.persistent.current_term, 1);
-        assert_eq!(cluster.persistent.voted_for, Some(1), "must remember it voted for itself");
+        assert_eq!(
+            cluster.persistent.voted_for,
+            Some(1),
+            "must remember it voted for itself"
+        );
     }
 
     #[test]
@@ -2333,8 +2500,14 @@ mod tests {
         cluster.handle_rpc(2, higher_term_response(7));
 
         assert_eq!(cluster.volatile.role, Role::Follower);
-        assert!(matches!(first_rx.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
-        assert!(matches!(second_rx.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(ClientCommandResult::LeadershipLost)
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(ClientCommandResult::LeadershipLost)
+        ));
         assert!(cluster.pending_commands.is_empty());
     }
 
@@ -2352,7 +2525,10 @@ mod tests {
         cluster.handle_rpc(3, vote_request(9, 3));
 
         assert_eq!(cluster.volatile.role, Role::Follower);
-        assert!(matches!(receiver.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ClientCommandResult::LeadershipLost)
+        ));
     }
 
     #[test]
@@ -2368,7 +2544,10 @@ mod tests {
         cluster.handle_rpc(2, append_request(5, 2, 0, 0, vec![]));
 
         assert_eq!(cluster.volatile.role, Role::Follower);
-        assert!(matches!(receiver.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ClientCommandResult::LeadershipLost)
+        ));
     }
 
     #[test]
@@ -2464,7 +2643,8 @@ mod tests {
         assert_eq!(cluster.volatile.role, Role::Candidate);
         let sent = drain(&mut outputs, 3);
         assert!(
-            sent.iter().any(|m| matches!(m, RpcMessage::RequestVote(req) if req.term == 1)),
+            sent.iter()
+                .any(|m| matches!(m, RpcMessage::RequestVote(req) if req.term == 1)),
             "real vote requests must follow, got {sent:?}"
         );
     }
@@ -2502,7 +2682,10 @@ mod tests {
 
         cluster.handle_rpc(2, pre_vote_response(8, false, 1));
 
-        assert_eq!(cluster.persistent.current_term, 8, "learns it was out of date");
+        assert_eq!(
+            cluster.persistent.current_term, 8,
+            "learns it was out of date"
+        );
         assert!(cluster.pre_vote.is_none());
     }
 
@@ -2536,7 +2719,10 @@ mod tests {
         assert_eq!(cluster.persistent.current_term, 3, "term must not change");
         assert_eq!(cluster.persistent.voted_for, None, "vote must not be spent");
         assert_eq!(cluster.volatile.role, Role::Follower);
-        assert_eq!(cluster.election_deadline, deadline_before, "timer must not be reset");
+        assert_eq!(
+            cluster.election_deadline, deadline_before,
+            "timer must not be reset"
+        );
     }
 
     #[test]
@@ -2597,8 +2783,14 @@ mod tests {
         cluster.check_quorum();
 
         assert_eq!(cluster.volatile.role, Role::Follower);
-        assert_eq!(cluster.persistent.current_term, 1, "stepping down must not touch the term");
-        assert!(matches!(receiver.try_recv(), Ok(ClientCommandResult::LeadershipLost)));
+        assert_eq!(
+            cluster.persistent.current_term, 1,
+            "stepping down must not touch the term"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ClientCommandResult::LeadershipLost)
+        ));
         assert_eq!(cluster.known_leader, None);
     }
 
@@ -2669,7 +2861,11 @@ mod tests {
         );
         cluster.check_quorum();
 
-        assert_eq!(cluster.volatile.role, Role::Follower, "a stale response proves nothing");
+        assert_eq!(
+            cluster.volatile.role,
+            Role::Follower,
+            "a stale response proves nothing"
+        );
     }
 
     #[test]
@@ -2690,14 +2886,20 @@ mod tests {
 
         let (query, mut reply) = read_query("k");
         cluster.handle_client_query(query);
-        assert_eq!(cluster.heartbeat_seq, 2, "the read must start a fresh round");
+        assert_eq!(
+            cluster.heartbeat_seq, 2,
+            "the read must start a fresh round"
+        );
         cluster.complete_ready_reads();
         assert!(reply.try_recv().is_err(), "nobody has answered round 2 yet");
 
         // A late answer to the OLD round 1 proves nothing about this moment.
         cluster.handle_rpc(2, append_ack(1, 1, true, 1));
         cluster.complete_ready_reads();
-        assert!(reply.try_recv().is_err(), "an answer to an earlier round must not count");
+        assert!(
+            reply.try_recv().is_err(),
+            "an answer to an earlier round must not count"
+        );
 
         // Node 2 answers round 2: the leader plus node 2 is a majority of 3.
         cluster.handle_rpc(2, append_ack(1, 2, true, 1));
@@ -2747,12 +2949,18 @@ mod tests {
         // which only began after round 2 had already been sent.
         cluster.handle_rpc(2, append_ack(1, 2, true, 1));
         cluster.complete_ready_reads();
-        assert!(matches!(first_reply.try_recv(), Ok(QueryResult::Value(None))));
+        assert!(matches!(
+            first_reply.try_recv(),
+            Ok(QueryResult::Value(None))
+        ));
         assert!(second_reply.try_recv().is_err());
 
         cluster.handle_rpc(2, append_ack(1, 3, true, 1));
         cluster.complete_ready_reads();
-        assert!(matches!(second_reply.try_recv(), Ok(QueryResult::Value(None))));
+        assert!(matches!(
+            second_reply.try_recv(),
+            Ok(QueryResult::Value(None))
+        ));
     }
 
     #[test]
@@ -2767,7 +2975,9 @@ mod tests {
         cluster.handle_client_query(query);
         cluster.complete_ready_reads();
 
-        assert!(matches!(reply.try_recv(), Ok(QueryResult::Value(Some(v))) if v == b"hello".to_vec()));
+        assert!(
+            matches!(reply.try_recv(), Ok(QueryResult::Value(Some(v))) if v == b"hello".to_vec())
+        );
     }
 
     #[test]
@@ -2780,7 +2990,10 @@ mod tests {
         cluster.handle_rpc(2, higher_term_response(7));
 
         assert_eq!(cluster.volatile.role, Role::Follower);
-        assert!(matches!(reply.try_recv(), Ok(QueryResult::NotLeader { leader_hint: None })));
+        assert!(matches!(
+            reply.try_recv(),
+            Ok(QueryResult::NotLeader { leader_hint: None })
+        ));
     }
 
     #[test]
@@ -2792,7 +3005,12 @@ mod tests {
 
         cluster.handle_rpc(2, append_request(5, 2, 0, 0, vec![]));
 
-        assert!(matches!(reply.try_recv(), Ok(QueryResult::NotLeader { leader_hint: Some(2) })));
+        assert!(matches!(
+            reply.try_recv(),
+            Ok(QueryResult::NotLeader {
+                leader_hint: Some(2)
+            })
+        ));
     }
 
     #[test]
@@ -2806,7 +3024,10 @@ mod tests {
         cluster.check_quorum();
 
         assert_eq!(cluster.volatile.role, Role::Follower);
-        assert!(matches!(reply.try_recv(), Ok(QueryResult::NotLeader { leader_hint: None })));
+        assert!(matches!(
+            reply.try_recv(),
+            Ok(QueryResult::NotLeader { leader_hint: None })
+        ));
     }
 
     #[test]
@@ -2818,17 +3039,22 @@ mod tests {
         // Deposed by a vote request: nothing tells us who the new leader is.
         cluster.handle_rpc(3, vote_request(9, 3));
 
-        assert_eq!(cluster.known_leader, None, "must not send clients back to ourselves");
+        assert_eq!(
+            cluster.known_leader, None,
+            "must not send clients back to ourselves"
+        );
     }
 
     #[test]
     fn local_read_mode_answers_immediately_without_any_confirmation() {
         let dir = TestDir::new();
-        let (mut cluster, _outputs) =
-            make_cluster_with_mode(dir.path(), &[2, 3], ReadMode::Local);
+        let (mut cluster, _outputs) = make_cluster_with_mode(dir.path(), &[2, 3], ReadMode::Local);
         cluster.persistent.current_term = 1;
         cluster.become_leader();
-        cluster.kv_store.apply(&Command::Put { key: "k".into(), value: b"v".to_vec() });
+        cluster.kv_store.apply(&Command::Put {
+            key: "k".into(),
+            value: b"v".to_vec(),
+        });
 
         let (query, mut reply) = read_query("k");
         cluster.handle_client_query(query);
@@ -2903,8 +3129,9 @@ mod tests {
         let syncs_before = cluster.persistence.wal_sync_count();
         let round_before = cluster.heartbeat_seq;
 
-        let batch: Vec<ClientCommand> =
-            (0..10).map(|i| put_command(&format!("k{i}"), "v")).collect();
+        let batch: Vec<ClientCommand> = (0..10)
+            .map(|i| put_command(&format!("k{i}"), "v"))
+            .collect();
         cluster.handle_client_commands(batch);
 
         assert_eq!(cluster.log.last_index(), 11, "no-op plus ten writes");
@@ -2914,7 +3141,11 @@ mod tests {
             1,
             "ten writes must share a single fsync"
         );
-        assert_eq!(cluster.heartbeat_seq - round_before, 1, "and a single replication round");
+        assert_eq!(
+            cluster.heartbeat_seq - round_before,
+            1,
+            "and a single replication round"
+        );
     }
 
     #[test]
@@ -2925,7 +3156,8 @@ mod tests {
         cluster.become_leader();
         drain(&mut outputs, 2);
 
-        cluster.handle_client_commands((0..3).map(|i| put_command(&format!("k{i}"), "v")).collect());
+        cluster
+            .handle_client_commands((0..3).map(|i| put_command(&format!("k{i}"), "v")).collect());
 
         // Everything the leader appended is already on disk by the time the
         // replication messages exist.
@@ -2933,7 +3165,8 @@ mod tests {
         assert_eq!(on_disk.len(), 4, "no-op plus three writes");
         let sent = drain(&mut outputs, 2);
         assert!(
-            sent.iter().any(|m| matches!(m, RpcMessage::AppendEntries(r) if r.entries.len() == 4)),
+            sent.iter()
+                .any(|m| matches!(m, RpcMessage::AppendEntries(r) if r.entries.len() == 4)),
             "the one replication message carries the whole batch, got {sent:?}"
         );
     }
@@ -2977,8 +3210,14 @@ mod tests {
 
         cluster.handle_client_commands(vec![first, second]);
 
-        assert!(matches!(first_rx.try_recv(), Ok(ClientCommandResult::NotLeader { .. })));
-        assert!(matches!(second_rx.try_recv(), Ok(ClientCommandResult::NotLeader { .. })));
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(ClientCommandResult::NotLeader { .. })
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(ClientCommandResult::NotLeader { .. })
+        ));
         assert_eq!(cluster.persistence.wal_sync_count(), syncs_before);
     }
 
@@ -2991,8 +3230,16 @@ mod tests {
 
         let batch = collect_batch(0u32, &mut rx, 4);
 
-        assert_eq!(batch, vec![0, 1, 2, 3], "capped at the batch limit, in arrival order");
-        assert_eq!(rx.try_recv().unwrap(), 4, "the rest stays queued for the next batch");
+        assert_eq!(
+            batch,
+            vec![0, 1, 2, 3],
+            "capped at the batch limit, in arrival order"
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            4,
+            "the rest stays queued for the next batch"
+        );
     }
 
     #[test]
@@ -3012,7 +3259,11 @@ mod tests {
             (0..5).map(|i| read_query(&format!("k{i}"))).unzip();
         cluster.handle_client_queries(queries);
 
-        assert_eq!(cluster.heartbeat_seq - round_before, 1, "one round for five reads");
+        assert_eq!(
+            cluster.heartbeat_seq - round_before,
+            1,
+            "one round for five reads"
+        );
         assert_eq!(cluster.pending_reads.len(), 5);
 
         cluster.handle_rpc(2, append_ack(1, cluster.heartbeat_seq, true, 1));
@@ -3025,13 +3276,17 @@ mod tests {
     // ---- backpressure -------------------------------------------------------
 
     fn small_limits(capacity: usize) -> Limits {
-        Limits { channel_capacity: capacity, max_batch: 128 }
+        Limits {
+            channel_capacity: capacity,
+            max_batch: 128,
+        }
     }
 
     #[test]
     fn writes_beyond_the_in_flight_limit_are_turned_away_immediately() {
         let dir = TestDir::new();
-        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(3));
+        let (mut cluster, _outputs) =
+            make_cluster_with_limits(dir.path(), &[2, 3], small_limits(3));
         cluster.persistent.current_term = 1;
         cluster.become_leader();
 
@@ -3046,10 +3301,17 @@ mod tests {
         cluster.handle_client_commands(batch);
 
         assert_eq!(cluster.pending_commands.len(), 3, "only 3 are held");
-        assert_eq!(cluster.log.last_index() - log_before, 3, "and only 3 reached the log");
+        assert_eq!(
+            cluster.log.last_index() - log_before,
+            3,
+            "and only 3 reached the log"
+        );
         for (i, mut reply) in replies.into_iter().enumerate() {
             if i < 3 {
-                assert!(reply.try_recv().is_err(), "write {i} is accepted and waiting");
+                assert!(
+                    reply.try_recv().is_err(),
+                    "write {i} is accepted and waiting"
+                );
             } else {
                 assert!(
                     matches!(reply.try_recv(), Ok(ClientCommandResult::Overloaded)),
@@ -3062,7 +3324,8 @@ mod tests {
     #[test]
     fn a_refused_write_leaves_nothing_behind_in_the_log() {
         let dir = TestDir::new();
-        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
+        let (mut cluster, _outputs) =
+            make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
         cluster.persistent.current_term = 1;
         cluster.become_leader();
         cluster.handle_client_command(put_command("accepted", "1"));
@@ -3072,9 +3335,16 @@ mod tests {
         let (cmd, mut reply) = put_command_with_receiver("refused", "2");
         cluster.handle_client_command(cmd);
 
-        assert!(matches!(reply.try_recv(), Ok(ClientCommandResult::Overloaded)));
+        assert!(matches!(
+            reply.try_recv(),
+            Ok(ClientCommandResult::Overloaded)
+        ));
         assert_eq!(cluster.log.last_index(), log_before, "nothing was logged");
-        assert_eq!(cluster.persistence.wal_sync_count(), syncs_before, "and nothing was synced");
+        assert_eq!(
+            cluster.persistence.wal_sync_count(),
+            syncs_before,
+            "and nothing was synced"
+        );
     }
 
     #[test]
@@ -3098,11 +3368,13 @@ mod tests {
     #[test]
     fn reads_beyond_the_in_flight_limit_are_turned_away_immediately() {
         let dir = TestDir::new();
-        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(2));
+        let (mut cluster, _outputs) =
+            make_cluster_with_limits(dir.path(), &[2, 3], small_limits(2));
         cluster.persistent.current_term = 1;
         cluster.become_leader();
 
-        let (queries, replies): (Vec<_>, Vec<_>) = (0..4).map(|i| read_query(&format!("k{i}"))).unzip();
+        let (queries, replies): (Vec<_>, Vec<_>) =
+            (0..4).map(|i| read_query(&format!("k{i}"))).unzip();
         cluster.handle_client_queries(queries);
 
         assert_eq!(cluster.pending_reads.len(), 2);
@@ -3117,7 +3389,8 @@ mod tests {
     #[test]
     fn a_full_peer_queue_drops_messages_instead_of_blocking_the_node() {
         let dir = TestDir::new();
-        let (mut cluster, mut outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(2));
+        let (mut cluster, mut outputs) =
+            make_cluster_with_limits(dir.path(), &[2, 3], small_limits(2));
         cluster.persistent.current_term = 1;
 
         // Nobody reads node 2's queue, so it holds 2 messages and the rest do not fit.
@@ -3135,7 +3408,8 @@ mod tests {
     #[test]
     fn a_leader_whose_followers_cannot_keep_up_still_makes_progress_locally() {
         let dir = TestDir::new();
-        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
+        let (mut cluster, _outputs) =
+            make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
         cluster.persistent.current_term = 1;
         cluster.become_leader();
 
@@ -3145,13 +3419,18 @@ mod tests {
         }
 
         assert!(cluster.dropped_messages > 0, "excess messages were dropped");
-        assert_eq!(cluster.volatile.role, Role::Leader, "the node itself was never stalled");
+        assert_eq!(
+            cluster.volatile.role,
+            Role::Leader,
+            "the node itself was never stalled"
+        );
     }
 
     #[test]
     fn dropped_messages_and_disk_syncs_are_reported_in_the_snapshot() {
         let dir = TestDir::new();
-        let (mut cluster, _outputs) = make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
+        let (mut cluster, _outputs) =
+            make_cluster_with_limits(dir.path(), &[2, 3], small_limits(1));
         cluster.persistent.current_term = 1;
         cluster.become_leader();
         for _ in 0..5 {
@@ -3196,7 +3475,9 @@ mod tests {
     /// What this node has sent to `peer` over a connection it opened itself.
     fn drain_connection(connections: &Connections, peer: NodeId) -> Vec<RpcMessage> {
         let mut guard = connections.lock().unwrap();
-        let rx = guard.get_mut(&peer).unwrap_or_else(|| panic!("no connection to node {peer}"));
+        let rx = guard
+            .get_mut(&peer)
+            .unwrap_or_else(|| panic!("no connection to node {peer}"));
         let mut messages = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             messages.push(msg);
@@ -3210,7 +3491,10 @@ mod tests {
     }
 
     fn add(id: NodeId) -> MembershipChange {
-        MembershipChange::Add { id, addr: format!("node{id}:7000") }
+        MembershipChange::Add {
+            id,
+            addr: format!("node{id}:7000"),
+        }
     }
 
     fn remove(id: NodeId) -> MembershipChange {
@@ -3230,7 +3514,10 @@ mod tests {
 
     fn ack(cluster: &mut Cluster, from: NodeId, match_index: u64) {
         let term = cluster.persistent.current_term;
-        cluster.handle_rpc(from, append_ack(term, cluster.heartbeat_seq, true, match_index));
+        cluster.handle_rpc(
+            from,
+            append_ack(term, cluster.heartbeat_seq, true, match_index),
+        );
         settle(cluster);
     }
 
@@ -3277,9 +3564,19 @@ mod tests {
         let mut cluster = build_cluster(&dir, &[2, 3]);
         cluster.persistent.current_term = 1;
         cluster.become_leader(); // no-op at index 1, not yet committed
-        assert_eq!(rejected(request_change(&mut cluster, add(4))), AdminRejection::NotReady);
-        assert_eq!(rejected(request_change(&mut cluster, remove(3))), AdminRejection::NotReady);
-        assert_eq!(cluster.log.last_index(), 1, "a refused change must log nothing");
+        assert_eq!(
+            rejected(request_change(&mut cluster, add(4))),
+            AdminRejection::NotReady
+        );
+        assert_eq!(
+            rejected(request_change(&mut cluster, remove(3))),
+            AdminRejection::NotReady
+        );
+        assert_eq!(
+            cluster.log.last_index(),
+            1,
+            "a refused change must log nothing"
+        );
 
         ack(&mut cluster, 2, 1); // the no-op commits
         let receiver = request_change(&mut cluster, add(4));
@@ -3299,11 +3596,16 @@ mod tests {
 
         assert!(cluster.learners.contains_key(&4));
         assert_eq!(members(&cluster), vec![1, 2, 3], "not a voter yet");
-        assert_eq!(config_entry_commands(&cluster).len(), 0, "nothing logged yet");
+        assert_eq!(
+            config_entry_commands(&cluster).len(),
+            0,
+            "nothing logged yet"
+        );
         assert!(receiver.try_recv().is_err(), "the caller is still waiting");
         let sent = drain_connection(&connections, 4);
         assert!(
-            sent.iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))),
+            sent.iter()
+                .any(|m| matches!(m, RpcMessage::AppendEntries(_))),
             "the learner is sent the log: {sent:?}"
         );
     }
@@ -3340,11 +3642,21 @@ mod tests {
 
         assert_eq!(
             config_entry_commands(&cluster),
-            vec![Command::AddNode { id: 4, addr: "node4:7000".into() }]
+            vec![Command::AddNode {
+                id: 4,
+                addr: "node4:7000".into()
+            }]
         );
-        assert_eq!(members(&cluster), vec![1, 2, 3, 4], "in effect on append, before commit");
+        assert_eq!(
+            members(&cluster),
+            vec![1, 2, 3, 4],
+            "in effect on append, before commit"
+        );
         assert!(cluster.learners.is_empty(), "no longer a learner");
-        assert_eq!(cluster.volatile.commit_index, 1, "the entry itself is not committed yet");
+        assert_eq!(
+            cluster.volatile.commit_index, 1,
+            "the entry itself is not committed yet"
+        );
         assert!(receiver.try_recv().is_err(), "still waiting for the commit");
     }
 
@@ -3383,7 +3695,10 @@ mod tests {
         cluster.handle_client_command(put);
         ack(&mut cluster, 4, 2); // the learner has it; no voting member besides the leader does
 
-        assert_eq!(cluster.volatile.commit_index, 1, "a learner's copy is not a vote");
+        assert_eq!(
+            cluster.volatile.commit_index, 1,
+            "a learner's copy is not a vote"
+        );
     }
 
     #[test]
@@ -3398,10 +3713,16 @@ mod tests {
 
         age_all_acks(&mut cluster);
         // Only the learner (not a member) answers now; members 2 and 3 are silent.
-        cluster.leader_state.record_ack(4, std::time::Instant::now());
+        cluster
+            .leader_state
+            .record_ack(4, std::time::Instant::now());
         cluster.check_quorum();
 
-        assert_eq!(cluster.volatile.role, Role::Follower, "check-quorum ignores learners");
+        assert_eq!(
+            cluster.volatile.role,
+            Role::Follower,
+            "check-quorum ignores learners"
+        );
     }
 
     #[test]
@@ -3414,12 +3735,21 @@ mod tests {
 
         let _first = request_change(&mut cluster, add(4));
         // While the new node is catching up...
-        assert_eq!(rejected(request_change(&mut cluster, add(5))), AdminRejection::ChangeInProgress);
-        assert_eq!(rejected(request_change(&mut cluster, remove(3))), AdminRejection::ChangeInProgress);
+        assert_eq!(
+            rejected(request_change(&mut cluster, add(5))),
+            AdminRejection::ChangeInProgress
+        );
+        assert_eq!(
+            rejected(request_change(&mut cluster, remove(3))),
+            AdminRejection::ChangeInProgress
+        );
 
         // ...and while its entry is committing.
         ack(&mut cluster, 4, 1);
-        assert_eq!(rejected(request_change(&mut cluster, add(5))), AdminRejection::ChangeInProgress);
+        assert_eq!(
+            rejected(request_change(&mut cluster, add(5))),
+            AdminRejection::ChangeInProgress
+        );
 
         // Once it has committed, the next change is allowed.
         ack(&mut cluster, 2, 2);
@@ -3434,12 +3764,21 @@ mod tests {
         let dir = TestDir::new();
         let mut cluster = settled_leader(&dir);
         let before = cluster.log.last_index();
-        assert_eq!(rejected(request_change(&mut cluster, add(2))), AdminRejection::AlreadyMember);
-        assert_eq!(rejected(request_change(&mut cluster, remove(9))), AdminRejection::NotMember);
+        assert_eq!(
+            rejected(request_change(&mut cluster, add(2))),
+            AdminRejection::AlreadyMember
+        );
+        assert_eq!(
+            rejected(request_change(&mut cluster, remove(9))),
+            AdminRejection::NotMember
+        );
         assert_eq!(
             rejected(request_change(
                 &mut cluster,
-                MembershipChange::Add { id: 4, addr: "  ".into() }
+                MembershipChange::Add {
+                    id: 4,
+                    addr: "  ".into()
+                }
             )),
             AdminRejection::BadAddress
         );
@@ -3454,7 +3793,10 @@ mod tests {
         cluster.begin_election(); // a one-node cluster elects itself
         settle(&mut cluster);
         assert_eq!(cluster.volatile.role, Role::Leader);
-        assert_eq!(rejected(request_change(&mut cluster, remove(1))), AdminRejection::LastMember);
+        assert_eq!(
+            rejected(request_change(&mut cluster, remove(1))),
+            AdminRejection::LastMember
+        );
     }
 
     #[test]
@@ -3488,13 +3830,17 @@ mod tests {
         let _receiver = request_change(&mut cluster, remove(3));
         let sent = drain(&mut outputs, 3);
         assert!(
-            sent.iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))),
+            sent.iter()
+                .any(|m| matches!(m, RpcMessage::AppendEntries(_))),
             "so the removed node can learn it was removed"
         );
         assert!(cluster.peer_outboxes.contains_key(&3));
 
         ack(&mut cluster, 2, 2); // commits and applies the removal
-        assert!(!cluster.peer_outboxes.contains_key(&3), "forgotten once the removal committed");
+        assert!(
+            !cluster.peer_outboxes.contains_key(&3),
+            "forgotten once the removal committed"
+        );
         assert!(!cluster.leader_state.match_index.contains_key(&3));
     }
 
@@ -3505,7 +3851,11 @@ mod tests {
         let mut receiver = request_change(&mut cluster, remove(1));
 
         assert_eq!(members(&cluster), vec![2, 3]);
-        assert_eq!(cluster.volatile.role, Role::Leader, "it keeps leading until the change commits");
+        assert_eq!(
+            cluster.volatile.role,
+            Role::Leader,
+            "it keeps leading until the change commits"
+        );
 
         // The leader's own copy does not count: it is no longer a voter. One of two
         // remaining members is not a majority of them.
@@ -3519,7 +3869,11 @@ mod tests {
             Ok(AdminResult::Applied { members }) => assert_eq!(members, vec![2, 3]),
             other => panic!("expected Applied, got {other:?}"),
         }
-        assert_eq!(cluster.volatile.role, Role::Follower, "handed over once committed");
+        assert_eq!(
+            cluster.volatile.role,
+            Role::Follower,
+            "handed over once committed"
+        );
     }
 
     #[test]
@@ -3534,13 +3888,11 @@ mod tests {
                 2,
                 0,
                 0,
-                vec![
-                    LogEntry {
-                        term: 1,
-                        index: 1,
-                        command: Command::RemoveNode { id: 1 }.encode().unwrap(),
-                    },
-                ],
+                vec![LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: Command::RemoveNode { id: 1 }.encode().unwrap(),
+                }],
             ),
         );
         assert_eq!(members(&cluster), vec![2, 3]);
@@ -3564,19 +3916,43 @@ mod tests {
         let add4 = LogEntry {
             term: 1,
             index: 2,
-            command: Command::AddNode { id: 4, addr: "node4:7000".into() }.encode().unwrap(),
+            command: Command::AddNode {
+                id: 4,
+                addr: "node4:7000".into(),
+            }
+            .encode()
+            .unwrap(),
         };
-        let noop = LogEntry { term: 1, index: 1, command: Command::NoOp.encode().unwrap() };
+        let noop = LogEntry {
+            term: 1,
+            index: 1,
+            command: Command::NoOp.encode().unwrap(),
+        };
         cluster.handle_rpc(2, append_request(1, 2, 0, 0, vec![noop, add4]));
 
-        assert_eq!(members(&cluster), vec![1, 2, 3, 4], "in effect though not committed");
-        assert!(cluster.peer_outboxes.contains_key(&4), "and the new member is dialled");
+        assert_eq!(
+            members(&cluster),
+            vec![1, 2, 3, 4],
+            "in effect though not committed"
+        );
+        assert!(
+            cluster.peer_outboxes.contains_key(&4),
+            "and the new member is dialled"
+        );
         assert!(connections.lock().unwrap().contains_key(&4));
 
         // A new leader's log disagrees from index 2 on: the change never happened.
-        let replacement = LogEntry { term: 2, index: 2, command: Command::NoOp.encode().unwrap() };
+        let replacement = LogEntry {
+            term: 2,
+            index: 2,
+            command: Command::NoOp.encode().unwrap(),
+        };
         cluster.handle_rpc(3, append_request(2, 3, 1, 1, vec![replacement]));
-        assert_eq!(members(&cluster), vec![1, 2, 3], "a truncated change stops counting");
+        assert_eq!(
+            members(&cluster),
+            vec![1, 2, 3],
+            "a truncated change stops counting"
+        );
     }
 
     #[test]
@@ -3585,13 +3961,20 @@ mod tests {
         {
             let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
             let entries = vec![
-                LogEntry { term: 1, index: 1, command: Command::NoOp.encode().unwrap() },
+                LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: Command::NoOp.encode().unwrap(),
+                },
                 LogEntry {
                     term: 1,
                     index: 2,
-                    command: Command::AddNode { id: 4, addr: "node4:7000".into() }
-                        .encode()
-                        .unwrap(),
+                    command: Command::AddNode {
+                        id: 4,
+                        addr: "node4:7000".into(),
+                    }
+                    .encode()
+                    .unwrap(),
                 },
                 LogEntry {
                     term: 1,
@@ -3606,8 +3989,14 @@ mod tests {
         // Restarted with the ORIGINAL peer list: the log, not the environment, wins.
         let (restarted, _outputs, connections) = make_cluster_recording(dir.path(), &[2, 3]);
         assert_eq!(members(&restarted), vec![1, 2, 4]);
-        assert!(connections.lock().unwrap().contains_key(&4), "dials the member it learned of");
-        assert!(!restarted.peer_outboxes.contains_key(&3), "and drops the one removed");
+        assert!(
+            connections.lock().unwrap().contains_key(&4),
+            "dials the member it learned of"
+        );
+        assert!(
+            !restarted.peer_outboxes.contains_key(&3),
+            "and drops the one removed"
+        );
     }
 
     #[test]
@@ -3621,7 +4010,10 @@ mod tests {
         cluster.handle_rpc(9, vote_request(7, 9));
         cluster.handle_rpc(9, pre_vote_request(8, 9));
 
-        assert_eq!(cluster.persistent.current_term, 3, "a stranger cannot bump our term");
+        assert_eq!(
+            cluster.persistent.current_term, 3,
+            "a stranger cannot bump our term"
+        );
         assert_eq!(cluster.persistent.voted_for, None, "nor spend our vote");
         let _ = &mut outputs; // replies to node 9 go nowhere: it has no connection
     }
@@ -3655,7 +4047,10 @@ mod tests {
         );
         match drain(&mut outputs, 3).pop() {
             Some(RpcMessage::PreVoteResponse(resp)) => {
-                assert!(!resp.vote_granted, "a removed node must not be granted a pre-vote")
+                assert!(
+                    !resp.vote_granted,
+                    "a removed node must not be granted a pre-vote"
+                )
             }
             other => panic!("expected a pre-vote answer, got {other:?}"),
         }
@@ -3695,7 +4090,10 @@ mod tests {
 
         assert_eq!(rejected(receiver), AdminRejection::CatchUpFailed);
         assert!(cluster.learners.is_empty());
-        assert!(!cluster.peer_outboxes.contains_key(&4), "its connection is dropped");
+        assert!(
+            !cluster.peer_outboxes.contains_key(&4),
+            "its connection is dropped"
+        );
         assert_eq!(cluster.log.last_index(), before, "nothing was logged");
 
         // The slot is free again.
@@ -3733,7 +4131,10 @@ mod tests {
 
         cluster.handle_rpc(2, higher_term_response(5));
 
-        assert!(matches!(receiver.try_recv(), Ok(AdminResult::LeadershipLost)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AdminResult::LeadershipLost)
+        ));
         assert!(cluster.learners.is_empty());
         assert!(!cluster.peer_outboxes.contains_key(&4));
         assert!(cluster.pending_admin.is_none());
@@ -3746,7 +4147,10 @@ mod tests {
         cluster.begin_election();
         settle(&mut cluster);
         assert_eq!(cluster.volatile.role, Role::Leader);
-        assert_eq!(cluster.volatile.commit_index, 1, "a lone node commits its own no-op");
+        assert_eq!(
+            cluster.volatile.commit_index, 1,
+            "a lone node commits its own no-op"
+        );
 
         let mut receiver = request_change(&mut cluster, add(2));
         ack(&mut cluster, 2, 1); // caught up: AddNode appended, members {1,2}, quorum 2
@@ -3756,7 +4160,10 @@ mod tests {
 
         ack(&mut cluster, 2, 2);
         assert_eq!(cluster.volatile.commit_index, 2);
-        assert!(matches!(receiver.try_recv(), Ok(AdminResult::Applied { .. })));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AdminResult::Applied { .. })
+        ));
     }
 
     #[test]
@@ -3780,13 +4187,25 @@ mod tests {
     /// Writes a storage directory as a node leaves it after compaction: entries
     /// 1..=`last_index` (each `Put k{i} = v{i}` in term 1), a snapshot of the state
     /// through `base_index` carrying `membership`, and the log trimmed to match.
-    fn write_snapshot_fixture(dir: &Path, base_index: u64, last_index: u64, membership: Membership) {
+    fn write_snapshot_fixture(
+        dir: &Path,
+        base_index: u64,
+        last_index: u64,
+        membership: Membership,
+    ) {
         let mut persistence = Persistence::open(dir).unwrap().persistence;
         let mut state = KvStore::new();
         for i in 1..=last_index {
-            let command = Command::Put { key: format!("k{i}"), value: format!("v{i}").into_bytes() };
+            let command = Command::Put {
+                key: format!("k{i}"),
+                value: format!("v{i}").into_bytes(),
+            };
             persistence
-                .append(&LogEntry { term: 1, index: i, command: command.encode().unwrap() })
+                .append(&LogEntry {
+                    term: 1,
+                    index: i,
+                    command: command.encode().unwrap(),
+                })
                 .unwrap();
             if i <= base_index {
                 state.apply(&command);
@@ -3815,11 +4234,26 @@ mod tests {
         let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
 
         assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 7));
-        assert_eq!(cluster.log.len(), 2, "only the two entries after the snapshot are held");
-        assert_eq!((cluster.volatile.commit_index, cluster.volatile.last_applied), (5, 5));
-        assert_eq!(value_of(&cluster, "k5"), Some(b"v5".to_vec()), "state came from the snapshot");
+        assert_eq!(
+            cluster.log.len(),
+            2,
+            "only the two entries after the snapshot are held"
+        );
+        assert_eq!(
+            (cluster.volatile.commit_index, cluster.volatile.last_applied),
+            (5, 5)
+        );
+        assert_eq!(
+            value_of(&cluster, "k5"),
+            Some(b"v5".to_vec()),
+            "state came from the snapshot"
+        );
         assert_eq!(value_of(&cluster, "k1"), Some(b"v1".to_vec()));
-        assert_eq!(value_of(&cluster, "k6"), None, "entries after it are not committed yet");
+        assert_eq!(
+            value_of(&cluster, "k6"),
+            None,
+            "entries after it are not committed yet"
+        );
 
         // Once a leader says they are committed they are applied on top.
         cluster.handle_rpc(2, append_request_committing(1, 2, 7, 1, vec![], 7));
@@ -3837,7 +4271,14 @@ mod tests {
         let snapshots = cluster.snapshot_tx.subscribe();
         cluster.publish_snapshot();
         let snapshot = snapshots.borrow().clone();
-        assert_eq!((snapshot.commit_index, snapshot.last_applied, snapshot.log_len), (5, 5, 5));
+        assert_eq!(
+            (
+                snapshot.commit_index,
+                snapshot.last_applied,
+                snapshot.log_len
+            ),
+            (5, 5, 5)
+        );
     }
 
     #[test]
@@ -3856,8 +4297,14 @@ mod tests {
         // The environment still says {1,2,3}: node 3 was removed and 4 added since.
         let (cluster, _outputs, connections) = make_cluster_recording(dir.path(), &[2, 3]);
         assert_eq!(members(&cluster), vec![1, 2, 4]);
-        assert!(connections.lock().unwrap().contains_key(&4), "dials the member it learned of");
-        assert!(!cluster.peer_outboxes.contains_key(&3), "and drops the one that was removed");
+        assert!(
+            connections.lock().unwrap().contains_key(&4),
+            "dials the member it learned of"
+        );
+        assert!(
+            !cluster.peer_outboxes.contains_key(&3),
+            "and drops the one that was removed"
+        );
     }
 
     #[test]
@@ -3870,15 +4317,22 @@ mod tests {
                 .append(&LogEntry {
                     term: 1,
                     index: 4,
-                    command: Command::AddNode { id: 4, addr: "node4:7000".into() }
-                        .encode()
-                        .unwrap(),
+                    command: Command::AddNode {
+                        id: 4,
+                        addr: "node4:7000".into(),
+                    }
+                    .encode()
+                    .unwrap(),
                 })
                 .unwrap();
         }
         let (cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
         assert_eq!(members(&cluster), vec![1, 2, 3, 4]);
-        assert_eq!(cluster.history.len(), 1, "only the entry after the snapshot is tracked");
+        assert_eq!(
+            cluster.history.len(),
+            1,
+            "only the entry after the snapshot is tracked"
+        );
     }
 
     #[test]
@@ -3898,8 +4352,15 @@ mod tests {
         // The leader believes this node is only at index 2 and resends 3..=9.
         let entries: Vec<LogEntry> = (3..=9)
             .map(|i| {
-                let command = Command::Put { key: format!("k{i}"), value: format!("v{i}").into_bytes() };
-                LogEntry { term: 1, index: i, command: command.encode().unwrap() }
+                let command = Command::Put {
+                    key: format!("k{i}"),
+                    value: format!("v{i}").into_bytes(),
+                };
+                LogEntry {
+                    term: 1,
+                    index: i,
+                    command: command.encode().unwrap(),
+                }
             })
             .collect();
         cluster.handle_rpc(2, append_request_committing(1, 2, 2, 1, entries, 9));
@@ -3919,7 +4380,11 @@ mod tests {
         // duplicates of 6 and 7 and nothing from before the snapshot.
         let recovered = Persistence::open(dir.path()).unwrap();
         assert_eq!(
-            recovered.entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+            recovered
+                .entries
+                .iter()
+                .map(|e| e.index)
+                .collect::<Vec<_>>(),
             vec![6, 7, 8, 9]
         );
     }
@@ -3939,14 +4404,25 @@ mod tests {
         ack(&mut cluster, 2, 7);
         assert!(matches!(rx.try_recv(), Ok(ClientCommandResult::Applied(_))));
         assert_eq!(value_of(&cluster, "new"), Some(b"value".to_vec()));
-        assert_eq!(value_of(&cluster, "k3"), Some(b"v3".to_vec()), "snapshot state is intact");
+        assert_eq!(
+            value_of(&cluster, "k3"),
+            Some(b"v3".to_vec()),
+            "snapshot state is intact"
+        );
     }
 
     // ---- taking snapshots and trimming the log ---------------------------------
 
     fn put_log_entry(index: u64, term: Term) -> LogEntry {
-        let command = Command::Put { key: format!("k{index}"), value: format!("v{index}").into_bytes() };
-        LogEntry { term, index, command: command.encode().unwrap() }
+        let command = Command::Put {
+            key: format!("k{index}"),
+            value: format!("v{index}").into_bytes(),
+        };
+        LogEntry {
+            term,
+            index,
+            command: command.encode().unwrap(),
+        }
     }
 
     /// A follower (leader is node 2, term 1) that has been told entries `from..=to`
@@ -3954,12 +4430,19 @@ mod tests {
     fn follower_applies(cluster: &mut Cluster, from: u64, to: u64) {
         let entries: Vec<LogEntry> = (from..=to).map(|i| put_log_entry(i, 1)).collect();
         let prev_term = if from > 1 { 1 } else { 0 };
-        cluster.handle_rpc(2, append_request_committing(1, 2, from - 1, prev_term, entries, to));
+        cluster.handle_rpc(
+            2,
+            append_request_committing(1, 2, from - 1, prev_term, entries, to),
+        );
         settle(cluster);
     }
 
     fn wal_indices(dir: &Path) -> Vec<u64> {
-        storage::Wal::replay(dir.join(storage::WAL_FILE)).unwrap().iter().map(|e| e.index).collect()
+        storage::Wal::replay(dir.join(storage::WAL_FILE))
+            .unwrap()
+            .iter()
+            .map(|e| e.index)
+            .collect()
     }
 
     fn snapshots_on(cluster: &Cluster) -> ClusterSnapshot {
@@ -4000,14 +4483,27 @@ mod tests {
 
         assert_eq!(cluster.persistence.snapshot_base(), 5);
         assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 5));
-        assert!(wal_indices(dir.path()).is_empty(), "the file shrank to nothing");
+        assert!(
+            wal_indices(dir.path()).is_empty(),
+            "the file shrank to nothing"
+        );
         let published = snapshots_on(&cluster);
-        assert_eq!((published.snapshot_index, published.log_base, published.snapshots_taken), (5, 5, 1));
+        assert_eq!(
+            (
+                published.snapshot_index,
+                published.log_base,
+                published.snapshots_taken
+            ),
+            (5, 5, 1)
+        );
 
         let (metadata, state) = storage::load_snapshot(dir.path().join(storage::SNAPSHOT_FILE))
             .unwrap()
             .expect("the snapshot is on disk");
-        assert_eq!((metadata.last_included_index, metadata.last_included_term), (5, 1));
+        assert_eq!(
+            (metadata.last_included_index, metadata.last_included_term),
+            (5, 1)
+        );
         assert_eq!(state.get("k5"), Some(&b"v5".to_vec()));
         assert_eq!(state.len(), 5);
         assert_eq!(metadata.membership.ids().collect::<Vec<_>>(), vec![1, 2, 3]);
@@ -4037,17 +4533,34 @@ mod tests {
             follower_applies(&mut cluster, 7, 8);
         }
         let (mut cluster, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
-        assert_eq!(cluster.persistence.snapshot_base(), 6, "the snapshot taken at 6");
-        assert_eq!((cluster.volatile.last_applied, cluster.log.last_index()), (6, 8));
+        assert_eq!(
+            cluster.persistence.snapshot_base(),
+            6,
+            "the snapshot taken at 6"
+        );
+        assert_eq!(
+            (cluster.volatile.last_applied, cluster.log.last_index()),
+            (6, 8)
+        );
         for key in ["k1", "k6"] {
-            assert!(cluster.kv_store.get(key).is_some(), "{key} came from the snapshot");
+            assert!(
+                cluster.kv_store.get(key).is_some(),
+                "{key} came from the snapshot"
+            );
         }
-        assert!(cluster.kv_store.get("k7").is_none(), "7 and 8 are replayed once committed");
+        assert!(
+            cluster.kv_store.get("k7").is_none(),
+            "7 and 8 are replayed once committed"
+        );
 
         cluster.handle_rpc(2, append_request_committing(1, 2, 8, 1, vec![], 8));
         settle(&mut cluster);
         assert_eq!(cluster.kv_store.get("k8"), Some(&b"v8".to_vec()));
-        assert_eq!(cluster.kv_store.len(), 8, "every write, none lost, none doubled");
+        assert_eq!(
+            cluster.kv_store.len(),
+            8,
+            "every write, none lost, none doubled"
+        );
     }
 
     #[test]
@@ -4059,13 +4572,27 @@ mod tests {
             let add4 = LogEntry {
                 term: 1,
                 index: 2,
-                command: Command::AddNode { id: 4, addr: "node4:7000".into() }.encode().unwrap(),
+                command: Command::AddNode {
+                    id: 4,
+                    addr: "node4:7000".into(),
+                }
+                .encode()
+                .unwrap(),
             };
-            let entries = vec![put_log_entry(1, 1), add4, put_log_entry(3, 1), put_log_entry(4, 1)];
+            let entries = vec![
+                put_log_entry(1, 1),
+                add4,
+                put_log_entry(3, 1),
+                put_log_entry(4, 1),
+            ];
             cluster.handle_rpc(2, append_request_committing(1, 2, 0, 0, entries, 4));
             settle(&mut cluster);
             assert_eq!(cluster.persistence.snapshot_base(), 4);
-            assert_eq!(members(&cluster), vec![1, 2, 3, 4], "unchanged by trimming the log");
+            assert_eq!(
+                members(&cluster),
+                vec![1, 2, 3, 4],
+                "unchanged by trimming the log"
+            );
         }
         // The entry that added node 4 is gone from the log; only the snapshot knows.
         assert!(wal_indices(dir.path()).is_empty());
@@ -4088,12 +4615,24 @@ mod tests {
         }
         ack(&mut cluster, 2, 3); // 1 and 2 are a majority: committed and applied through 3
 
-        assert_eq!(cluster.persistence.snapshot_base(), 3, "a snapshot is taken regardless");
-        assert_eq!(cluster.log.base_index(), 0, "but node 3 has confirmed nothing: keep it all");
+        assert_eq!(
+            cluster.persistence.snapshot_base(),
+            3,
+            "a snapshot is taken regardless"
+        );
+        assert_eq!(
+            cluster.log.base_index(),
+            0,
+            "but node 3 has confirmed nothing: keep it all"
+        );
         assert_eq!(wal_indices(dir.path()).len(), 3);
 
         ack(&mut cluster, 3, 2); // node 3 catches up part of the way
-        assert_eq!(cluster.log.base_index(), 2, "trimmed exactly as far as the slowest peer");
+        assert_eq!(
+            cluster.log.base_index(),
+            2,
+            "trimmed exactly as far as the slowest peer"
+        );
 
         ack(&mut cluster, 3, 3);
         assert_eq!(cluster.log.base_index(), 3);
@@ -4116,7 +4655,11 @@ mod tests {
         ack(&mut cluster, 2, 3);
         ack(&mut cluster, 3, 3);
         assert_eq!(cluster.persistence.snapshot_base(), 3);
-        assert_eq!(cluster.log.base_index(), 0, "the learner could not be sent trimmed entries");
+        assert_eq!(
+            cluster.log.base_index(),
+            0,
+            "the learner could not be sent trimmed entries"
+        );
     }
 
     #[test]
@@ -4135,7 +4678,10 @@ mod tests {
         assert_eq!(cluster.kv_store.len(), 4);
 
         // Not retried on every event, only once another threshold's worth is applied.
-        assert_eq!(cluster.snapshot_retry_after, 6, "backs off for another threshold's worth");
+        assert_eq!(
+            cluster.snapshot_retry_after, 6,
+            "backs off for another threshold's worth"
+        );
         follower_applies(&mut cluster, 5, 5);
         assert_eq!(cluster.snapshots_taken, 0);
 
@@ -4154,7 +4700,12 @@ mod tests {
             let add4 = LogEntry {
                 term: 1,
                 index: 5,
-                command: Command::AddNode { id: 4, addr: "node4:7000".into() }.encode().unwrap(),
+                command: Command::AddNode {
+                    id: 4,
+                    addr: "node4:7000".into(),
+                }
+                .encode()
+                .unwrap(),
             };
             let mut entries: Vec<LogEntry> = (1..=4).map(|i| put_log_entry(i, 1)).collect();
             entries.push(add4);
@@ -4225,10 +4776,12 @@ mod tests {
     ) -> Vec<u8> {
         let mut state = KvStore::new();
         for (key, value) in keys {
-            state.apply(&Command::Put { key: key.to_string(), value: value.as_bytes().to_vec() });
+            state.apply(&Command::Put {
+                key: key.to_string(),
+                value: value.as_bytes().to_vec(),
+            });
         }
-        let membership =
-            Membership::new(members.iter().map(|(id, addr)| (*id, addr.to_string())));
+        let membership = Membership::new(members.iter().map(|(id, addr)| (*id, addr.to_string())));
         storage::encode_snapshot(
             &storage::SnapshotMetadata {
                 last_included_index: index,
@@ -4279,7 +4832,15 @@ mod tests {
             let end = (offset + chunk).min(bytes.len());
             cluster.handle_rpc(
                 2,
-                chunk_from_leader(1, index, snap_term, offset as u64, total, &bytes[offset..end], end == bytes.len()),
+                chunk_from_leader(
+                    1,
+                    index,
+                    snap_term,
+                    offset as u64,
+                    total,
+                    &bytes[offset..end],
+                    end == bytes.len(),
+                ),
             );
             let responses = install_responses(outputs, 2);
             let last = responses.last().cloned().expect("every chunk is answered");
@@ -4306,19 +4867,26 @@ mod tests {
         cluster.broadcast_append_entries();
 
         assert!(
-            drain(&mut outputs, 2).iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))),
+            drain(&mut outputs, 2)
+                .iter()
+                .any(|m| matches!(m, RpcMessage::AppendEntries(_))),
             "the caught-up peer is still sent entries"
         );
         let sent = drain(&mut outputs, 3);
         assert!(
-            !sent.iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))),
+            !sent
+                .iter()
+                .any(|m| matches!(m, RpcMessage::AppendEntries(_))),
             "and nothing with a gap in front of it goes to the lagging one"
         );
         let chunks = install_requests(sent);
         assert_eq!(chunks.len(), 1);
         let file = std::fs::read(dir.path().join(storage::SNAPSHOT_FILE)).unwrap();
         let chunk = &chunks[0];
-        assert_eq!((chunk.last_included_index, chunk.last_included_term), (5, 1));
+        assert_eq!(
+            (chunk.last_included_index, chunk.last_included_term),
+            (5, 1)
+        );
         assert_eq!((chunk.term, chunk.leader_id, chunk.offset), (2, 1, 0));
         assert_eq!(chunk.total_len, file.len() as u64);
         assert_eq!(chunk.data, file, "the snapshot file itself, byte for byte");
@@ -4327,7 +4895,9 @@ mod tests {
         // A peer exactly at the snapshot point can still be served entries.
         cluster.leader_state.next_index.insert(3, 6);
         cluster.broadcast_append_entries();
-        assert!(drain(&mut outputs, 3).iter().any(|m| matches!(m, RpcMessage::AppendEntries(_))));
+        assert!(drain(&mut outputs, 3)
+            .iter()
+            .any(|m| matches!(m, RpcMessage::AppendEntries(_))));
     }
 
     #[test]
@@ -4342,7 +4912,10 @@ mod tests {
         drain(&mut outputs, 3);
         cluster.broadcast_append_entries();
         let first = install_requests(drain(&mut outputs, 3));
-        assert_eq!((first[0].offset, first[0].data.len(), first[0].done), (0, 16, false));
+        assert_eq!(
+            (first[0].offset, first[0].data.len(), first[0].done),
+            (0, 16, false)
+        );
 
         // The follower took it: the next piece goes out at once.
         cluster.handle_rpc(3, install_answer(2, 16, false, 5));
@@ -4351,7 +4924,10 @@ mod tests {
 
         // The same answer again (to a duplicate) must not send anything more.
         cluster.handle_rpc(3, install_answer(2, 16, false, 5));
-        assert!(drain(&mut outputs, 3).is_empty(), "duplicates must not multiply the traffic");
+        assert!(
+            drain(&mut outputs, 3).is_empty(),
+            "duplicates must not multiply the traffic"
+        );
 
         // A lost piece is simply sent again on the next heartbeat tick.
         cluster.broadcast_append_entries();
@@ -4410,7 +4986,15 @@ mod tests {
 
         cluster.handle_rpc(3, install_answer(2, 9999, true, 3)); // some older transfer
         assert_eq!(cluster.snapshot_sends[&3].offset(), 0);
-        assert_eq!(cluster.leader_state.match_index.get(&3).copied().unwrap_or(0), 0);
+        assert_eq!(
+            cluster
+                .leader_state
+                .match_index
+                .get(&3)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
     }
 
     #[test]
@@ -4442,12 +5026,21 @@ mod tests {
             settle(&mut cluster);
         }
         let compacted_to = cluster.log.base_index();
-        assert!(compacted_to > 0, "a lone node trims as soon as it has a snapshot");
+        assert!(
+            compacted_to > 0,
+            "a lone node trims as soon as it has a snapshot"
+        );
 
         // No longer refused.
         let mut receiver = request_change(&mut cluster, add(2));
-        assert!(cluster.learners.contains_key(&2), "the new node is taken on as a learner");
-        assert!(receiver.try_recv().is_err(), "and the request is still in progress");
+        assert!(
+            cluster.learners.contains_key(&2),
+            "the new node is taken on as a learner"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "and the request is still in progress"
+        );
 
         // It starts empty, so it rejects the first entries it is sent...
         let term = cluster.persistent.current_term;
@@ -4465,15 +5058,27 @@ mod tests {
         cluster.broadcast_append_entries();
         let chunks = install_requests(drain_connection(&connections, 2));
         assert!(!chunks.is_empty(), "the learner is sent the snapshot");
-        assert_eq!(chunks[0].last_included_index, cluster.persistence.snapshot_base());
+        assert_eq!(
+            chunks[0].last_included_index,
+            cluster.persistence.snapshot_base()
+        );
 
         // It installs it, catches up on what follows, and is admitted.
-        cluster.handle_rpc(2, install_answer(term, 1, true, chunks[0].last_included_index));
+        cluster.handle_rpc(
+            2,
+            install_answer(term, 1, true, chunks[0].last_included_index),
+        );
         settle(&mut cluster);
         let last = cluster.log.last_index();
         ack(&mut cluster, 2, last);
-        assert_eq!(members(&cluster), vec![1, 2], "promoted once it had caught up");
-        assert!(config_entry_commands(&cluster).iter().any(|c| matches!(c, Command::AddNode { id: 2, .. })));
+        assert_eq!(
+            members(&cluster),
+            vec![1, 2],
+            "promoted once it had caught up"
+        );
+        assert!(config_entry_commands(&cluster)
+            .iter()
+            .any(|c| matches!(c, Command::AddNode { id: 2, .. })));
     }
 
     #[test]
@@ -4489,15 +5094,30 @@ mod tests {
         let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 9, 1, 25);
 
         let (last, earlier) = answers.split_last().unwrap();
-        assert!(earlier.iter().all(|a| !a.installed), "not installed before the last piece");
-        assert!(earlier.windows(2).all(|w| w[1].next_offset > w[0].next_offset));
+        assert!(
+            earlier.iter().all(|a| !a.installed),
+            "not installed before the last piece"
+        );
+        assert!(earlier
+            .windows(2)
+            .all(|w| w[1].next_offset > w[0].next_offset));
         assert!(last.installed);
         assert_eq!(cluster.kv_store.get("alpha"), Some(&b"1".to_vec()));
         assert_eq!(cluster.kv_store.get("beta"), Some(&b"2".to_vec()));
         assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (9, 9));
-        assert_eq!((cluster.volatile.commit_index, cluster.volatile.last_applied), (9, 9));
-        assert_eq!(members(&cluster), vec![1, 2, 3, 4], "membership comes with the snapshot");
-        assert!(connections.lock().unwrap().contains_key(&4), "and node 4 is dialled");
+        assert_eq!(
+            (cluster.volatile.commit_index, cluster.volatile.last_applied),
+            (9, 9)
+        );
+        assert_eq!(
+            members(&cluster),
+            vec![1, 2, 3, 4],
+            "membership comes with the snapshot"
+        );
+        assert!(
+            connections.lock().unwrap().contains_key(&4),
+            "and node 4 is dialled"
+        );
         assert_eq!(cluster.persistence.snapshot_base(), 9);
         assert_eq!(cluster.snapshots_installed, 1);
         assert!(cluster.incoming_snapshot.is_none());
@@ -4508,7 +5128,10 @@ mod tests {
         assert_eq!(restarted.volatile.last_applied, 9);
         assert_eq!(restarted.kv_store.get("alpha"), Some(&b"1".to_vec()));
         assert_eq!(members(&restarted), vec![1, 2, 3, 4]);
-        assert_eq!(std::fs::read(dir.path().join(storage::SNAPSHOT_FILE)).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(dir.path().join(storage::SNAPSHOT_FILE)).unwrap(),
+            bytes
+        );
     }
 
     #[test]
@@ -4519,14 +5142,29 @@ mod tests {
         cluster.handle_rpc(2, append_request_committing(1, 2, 0, 0, entries, 0));
         drain(&mut outputs, 2);
 
-        let bytes = snapshot_bytes(5, 1, &[(1, ""), (2, ""), (3, "")], &[("from-snapshot", "yes")]);
+        let bytes = snapshot_bytes(
+            5,
+            1,
+            &[(1, ""), (2, ""), (3, "")],
+            &[("from-snapshot", "yes")],
+        );
         let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 5, 1, 10_000);
 
         assert!(answers.last().unwrap().installed);
-        assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 8), "6..=8 are kept");
+        assert_eq!(
+            (cluster.log.base_index(), cluster.log.last_index()),
+            (5, 8),
+            "6..=8 are kept"
+        );
         assert_eq!(cluster.volatile.commit_index, 5);
-        assert!(cluster.kv_store.get("from-snapshot").is_some(), "state is the snapshot's");
-        assert!(cluster.kv_store.get("k6").is_none(), "entries after it are not applied yet");
+        assert!(
+            cluster.kv_store.get("from-snapshot").is_some(),
+            "state is the snapshot's"
+        );
+        assert!(
+            cluster.kv_store.get("k6").is_none(),
+            "entries after it are not applied yet"
+        );
         assert_eq!(wal_indices(dir.path()), vec![6, 7, 8]);
     }
 
@@ -4539,13 +5177,25 @@ mod tests {
         drain(&mut outputs, 2);
 
         // The snapshot says entry 5 was written in term 2; ours was term 1.
-        let bytes = snapshot_bytes(5, 2, &[(1, ""), (2, ""), (3, "")], &[("from-snapshot", "yes")]);
+        let bytes = snapshot_bytes(
+            5,
+            2,
+            &[(1, ""), (2, ""), (3, "")],
+            &[("from-snapshot", "yes")],
+        );
         let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 5, 2, 10_000);
 
         assert!(answers.last().unwrap().installed);
-        assert_eq!((cluster.log.base_index(), cluster.log.last_index()), (5, 5), "nothing after it");
+        assert_eq!(
+            (cluster.log.base_index(), cluster.log.last_index()),
+            (5, 5),
+            "nothing after it"
+        );
         assert!(wal_indices(dir.path()).is_empty());
-        assert!(cluster.kv_store.get("k1").is_none(), "the old state is gone");
+        assert!(
+            cluster.kv_store.get("k1").is_none(),
+            "the old state is gone"
+        );
     }
 
     #[test]
@@ -4560,9 +5210,19 @@ mod tests {
         // leader does not waste the rest of the transfer.
         let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 5, 1, 10);
 
-        assert_eq!(answers.len(), 1, "the leader is told at the first piece, not the last");
-        assert!(answers[0].installed, "told it has everything, so the leader moves on");
-        assert!(cluster.kv_store.get("old").is_none(), "its own newer state is untouched");
+        assert_eq!(
+            answers.len(),
+            1,
+            "the leader is told at the first piece, not the last"
+        );
+        assert!(
+            answers[0].installed,
+            "told it has everything, so the leader moves on"
+        );
+        assert!(
+            cluster.kv_store.get("old").is_none(),
+            "its own newer state is untouched"
+        );
         assert!(cluster.kv_store.get("k7").is_some());
         assert_eq!(cluster.volatile.last_applied, 7);
         assert_eq!(cluster.snapshots_installed, 0);
@@ -4577,7 +5237,10 @@ mod tests {
         cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 0, total, &bytes[..20], false));
         assert_eq!(install_responses(&mut outputs, 2)[0].next_offset, 20);
 
-        cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 40, total, &bytes[40..50], false));
+        cluster.handle_rpc(
+            2,
+            chunk_from_leader(1, 9, 1, 40, total, &bytes[40..50], false),
+        );
         let answer = install_responses(&mut outputs, 2).remove(0);
         assert_eq!((answer.next_offset, answer.installed), (20, false));
 
@@ -4605,7 +5268,12 @@ mod tests {
     fn a_corrupted_snapshot_is_not_installed() {
         let dir = TestDir::new();
         let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
-        let mut bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1"), ("b", "2")]);
+        let mut bytes = snapshot_bytes(
+            9,
+            1,
+            &[(1, ""), (2, ""), (3, "")],
+            &[("a", "1"), ("b", "2")],
+        );
         let middle = bytes.len() - 3;
         bytes[middle] ^= 0xFF;
         let answers = send_snapshot(&mut cluster, &mut outputs, &bytes, 9, 1, 30);
@@ -4614,9 +5282,15 @@ mod tests {
         assert!(!last.installed);
         assert_eq!(last.next_offset, 0, "and the leader is told to start over");
         assert!(cluster.kv_store.is_empty());
-        assert_eq!((cluster.log.base_index(), cluster.volatile.last_applied), (0, 0));
+        assert_eq!(
+            (cluster.log.base_index(), cluster.volatile.last_applied),
+            (0, 0)
+        );
         assert_eq!(cluster.persistence.snapshot_base(), 0);
-        assert!(!dir.path().join(storage::SNAPSHOT_FILE).exists(), "nothing was written");
+        assert!(
+            !dir.path().join(storage::SNAPSHOT_FILE).exists(),
+            "nothing was written"
+        );
     }
 
     #[test]
@@ -4637,7 +5311,10 @@ mod tests {
         let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
         cluster.persistent.current_term = 3;
         let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
-        cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 0, bytes.len() as u64, &bytes, true));
+        cluster.handle_rpc(
+            2,
+            chunk_from_leader(1, 9, 1, 0, bytes.len() as u64, &bytes, true),
+        );
         let answer = install_responses(&mut outputs, 2).remove(0);
         assert_eq!((answer.term, answer.installed), (3, false));
         assert!(cluster.kv_store.is_empty());
@@ -4650,11 +5327,17 @@ mod tests {
         let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
         forget_leader_contact(&mut cluster);
         let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
-        cluster.handle_rpc(2, chunk_from_leader(4, 9, 1, 0, bytes.len() as u64, &bytes[..10], false));
+        cluster.handle_rpc(
+            2,
+            chunk_from_leader(4, 9, 1, 0, bytes.len() as u64, &bytes[..10], false),
+        );
         drain(&mut outputs, 2);
 
         assert_eq!(cluster.known_leader, Some(2));
-        assert_eq!(cluster.persistent.current_term, 4, "the leader's newer term is adopted");
+        assert_eq!(
+            cluster.persistent.current_term, 4,
+            "the leader's newer term is adopted"
+        );
         assert!(cluster.volatile.last_heartbeat.elapsed() < Duration::from_millis(500));
         // So a pre-vote against that leader is denied while the transfer is going on.
         cluster.handle_rpc(3, pre_vote_request(5, 3));
@@ -4670,7 +5353,15 @@ mod tests {
         let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
         cluster.handle_rpc(
             2,
-            chunk_from_leader(1, 9, 1, 0, raft_core::MAX_SNAPSHOT_BYTES + 1, &[1, 2, 3], false),
+            chunk_from_leader(
+                1,
+                9,
+                1,
+                0,
+                raft_core::MAX_SNAPSHOT_BYTES + 1,
+                &[1, 2, 3],
+                false,
+            ),
         );
         let answer = install_responses(&mut outputs, 2).remove(0);
         assert_eq!((answer.next_offset, answer.installed), (0, false));
@@ -4684,13 +5375,19 @@ mod tests {
         let first = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("old-leader", "1")]);
         let second = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("new-leader", "1")]);
         // Half of one snapshot arrives...
-        cluster.handle_rpc(2, chunk_from_leader(1, 9, 1, 0, first.len() as u64, &first[..30], false));
+        cluster.handle_rpc(
+            2,
+            chunk_from_leader(1, 9, 1, 0, first.len() as u64, &first[..30], false),
+        );
         drain(&mut outputs, 2);
         // ...then a transfer starts from the beginning (a different leader, say).
         let answers = send_snapshot(&mut cluster, &mut outputs, &second, 9, 1, 40);
         assert!(answers.last().unwrap().installed);
         assert!(cluster.kv_store.get("new-leader").is_some());
-        assert!(cluster.kv_store.get("old-leader").is_none(), "nothing of the first leaks in");
+        assert!(
+            cluster.kv_store.get("old-leader").is_none(),
+            "nothing of the first leaks in"
+        );
     }
 
     #[test]
@@ -4699,11 +5396,17 @@ mod tests {
         {
             let (mut cluster, mut outputs) = make_cluster_in(dir.path(), &[2, 3]);
             let bytes = snapshot_bytes(9, 1, &[(1, ""), (2, ""), (3, "")], &[("a", "1")]);
-            cluster.handle_rpc(2, chunk_from_leader(6, 9, 1, 0, bytes.len() as u64, &bytes[..10], false));
+            cluster.handle_rpc(
+                2,
+                chunk_from_leader(6, 9, 1, 0, bytes.len() as u64, &bytes[..10], false),
+            );
             drain(&mut outputs, 2);
         }
         let (restarted, _outputs) = make_cluster_in(dir.path(), &[2, 3]);
-        assert_eq!(restarted.persistent.current_term, 6, "acknowledged, so it must survive a crash");
+        assert_eq!(
+            restarted.persistent.current_term, 6,
+            "acknowledged, so it must survive a crash"
+        );
     }
 
     #[test]
@@ -4722,7 +5425,13 @@ mod tests {
 
         cluster.handle_rpc(3, install_answer(2, 16, false, 5));
 
-        assert!(cluster.leader_state.last_ack.contains_key(&3), "the answer proves it is reachable");
-        assert!(cluster.leader_state.ack_seq.contains_key(&3), "and names the round it answered");
+        assert!(
+            cluster.leader_state.last_ack.contains_key(&3),
+            "the answer proves it is reachable"
+        );
+        assert!(
+            cluster.leader_state.ack_seq.contains_key(&3),
+            "and names the round it answered"
+        );
     }
 }

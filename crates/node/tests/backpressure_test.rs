@@ -7,9 +7,7 @@
 mod common;
 
 use common::TestCluster;
-use node::cluster::{
-    ClientCommand, ClientCommandResult, ClientQuery, ClusterSnapshot,
-};
+use node::cluster::{ClientCommand, ClientCommandResult, ClientQuery, ClusterSnapshot};
 use node::config::Limits;
 use node::metrics_api::{router, AppState};
 use std::net::SocketAddr;
@@ -22,7 +20,9 @@ use tokio::sync::{mpsc, watch};
 /// Minimal HTTP/1.1 client over a raw socket. Returns (status, the whole raw
 /// response) so tests can inspect headers as well as the body.
 async fn http(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("server should accept connections");
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("server should accept connections");
     let body = body.unwrap_or("");
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
@@ -68,7 +68,11 @@ fn idle_snapshot() -> ClusterSnapshot {
 /// "full" is easy to reach. Returns the receiving ends so a test can drain them.
 async fn stuck_api(
     timeout: Duration,
-) -> (SocketAddr, mpsc::Receiver<ClientCommand>, mpsc::Receiver<ClientQuery>) {
+) -> (
+    SocketAddr,
+    mpsc::Receiver<ClientCommand>,
+    mpsc::Receiver<ClientQuery>,
+) {
     let (command_tx, command_rx) = mpsc::channel(1);
     let (query_tx, query_rx) = mpsc::channel(1);
     let (admin_tx, _admin_rx) = mpsc::channel(1);
@@ -104,9 +108,18 @@ async fn a_full_write_queue_is_turned_away_with_503_and_retry_after() {
     let started = std::time::Instant::now();
     let (status, raw) = http(addr, "PUT", "/kv/b", Some(PUT_BODY)).await;
     assert_eq!(status, 503, "{raw}");
-    assert!(raw.to_lowercase().contains("retry-after: 1"), "must tell the client to back off: {raw}");
-    assert!(raw.contains("\"outcome_unknown\":false"), "a refused request took no effect: {raw}");
-    assert!(started.elapsed() < Duration::from_millis(300), "refusal must be immediate");
+    assert!(
+        raw.to_lowercase().contains("retry-after: 1"),
+        "must tell the client to back off: {raw}"
+    );
+    assert!(
+        raw.contains("\"outcome_unknown\":false"),
+        "a refused request took no effect: {raw}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "refusal must be immediate"
+    );
 
     // The first one eventually times out, as before.
     let (status, _) = first.await.unwrap();
@@ -116,7 +129,10 @@ async fn a_full_write_queue_is_turned_away_with_503_and_retry_after() {
     // into the queue (and then times out like the first), not refused.
     assert!(command_rx.recv().await.is_some());
     let (status, raw) = http(addr, "PUT", "/kv/c", Some(PUT_BODY)).await;
-    assert_eq!(status, 504, "accepted this time, so it waits for an answer: {raw}");
+    assert_eq!(
+        status, 504,
+        "accepted this time, so it waits for an answer: {raw}"
+    );
 }
 
 #[tokio::test]
@@ -142,8 +158,14 @@ async fn health_is_not_affected_by_a_full_request_queue() {
 
     let (status, raw) = http(addr, "GET", "/health", None).await;
 
-    assert_eq!(status, 200, "an operator must still be able to see what is wrong: {raw}");
-    assert!(raw.contains("\"wal_syncs\":0") && raw.contains("\"dropped_messages\":0"), "{raw}");
+    assert_eq!(
+        status, 200,
+        "an operator must still be able to see what is wrong: {raw}"
+    );
+    assert!(
+        raw.contains("\"wal_syncs\":0") && raw.contains("\"dropped_messages\":0"),
+        "{raw}"
+    );
 }
 
 /// Group commit under real load: hundreds of writes queued together are made
@@ -161,7 +183,9 @@ async fn many_queued_writes_share_a_few_disk_syncs() {
 
     assert_eq!(results.len(), WRITES);
     assert!(
-        results.iter().all(|r| matches!(r, ClientCommandResult::Applied(_))),
+        results
+            .iter()
+            .all(|r| matches!(r, ClientCommandResult::Applied(_))),
         "every queued write must still be applied"
     );
     let syncs = cluster.snapshot(leader).wal_syncs - syncs_before;
@@ -184,7 +208,10 @@ async fn many_queued_writes_share_a_few_disk_syncs() {
 async fn a_leader_that_cannot_commit_refuses_writes_beyond_its_limit() {
     let cluster = TestCluster::start_with_limits(
         &[1, 2, 3],
-        Limits { channel_capacity: 4, max_batch: 128 },
+        Limits {
+            channel_capacity: 4,
+            max_batch: 128,
+        },
     );
     let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
     cluster.isolate(leader);
@@ -213,15 +240,20 @@ async fn a_leader_that_cannot_commit_refuses_writes_beyond_its_limit() {
             .await
             .expect("held writes must be answered when leadership is lost")
             .unwrap();
-        assert!(matches!(result, ClientCommandResult::LeadershipLost), "got {result:?}");
+        assert!(
+            matches!(result, ClientCommandResult::LeadershipLost),
+            "got {result:?}"
+        );
     }
 
     // And the cluster recovers: after the partition heals, writes flow again.
     cluster.heal();
     cluster
-        .wait_until(Duration::from_secs(5), "a single leader after healing", |c| {
-            c.leaders().len() == 1
-        })
+        .wait_until(
+            Duration::from_secs(5),
+            "a single leader after healing",
+            |c| c.leaders().len() == 1,
+        )
         .await;
     let leader = cluster.leaders()[0];
     assert!(matches!(
@@ -237,7 +269,11 @@ async fn a_leader_that_cannot_commit_refuses_writes_beyond_its_limit() {
 async fn a_node_that_died_mid_write_restarts_and_catches_up() {
     let mut cluster = TestCluster::start(&[1, 2, 3]);
     let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
-    let follower = cluster.live_ids().into_iter().find(|&id| id != leader).unwrap();
+    let follower = cluster
+        .live_ids()
+        .into_iter()
+        .find(|&id| id != leader)
+        .unwrap();
     for i in 0..5 {
         assert!(matches!(
             cluster.put(leader, &format!("k{i}"), "v").await,
@@ -245,9 +281,11 @@ async fn a_node_that_died_mid_write_restarts_and_catches_up() {
         ));
     }
     cluster
-        .wait_until(Duration::from_secs(5), "follower to replicate everything", |c| {
-            c.snapshot(follower).log_len == c.snapshot(leader).log_len
-        })
+        .wait_until(
+            Duration::from_secs(5),
+            "follower to replicate everything",
+            |c| c.snapshot(follower).log_len == c.snapshot(leader).log_len,
+        )
         .await;
     let log_len = cluster.snapshot(leader).log_len;
 
@@ -267,13 +305,23 @@ async fn a_node_that_died_mid_write_restarts_and_catches_up() {
             .write_all(&torn)
             .unwrap();
     }
-    assert!(Wal::replay(cluster.wal_path(follower)).is_err(), "the log really is torn");
+    assert!(
+        Wal::replay(cluster.wal_path(follower)).is_err(),
+        "the log really is torn"
+    );
 
     cluster.restart(follower).await;
 
     // It started, recovered every complete record, and the log is clean again.
-    assert_eq!(cluster.snapshot(follower).log_len, log_len, "all complete records recovered");
-    assert_eq!(Wal::replay(cluster.wal_path(follower)).unwrap().len() as u64, log_len);
+    assert_eq!(
+        cluster.snapshot(follower).log_len,
+        log_len,
+        "all complete records recovered"
+    );
+    assert_eq!(
+        Wal::replay(cluster.wal_path(follower)).unwrap().len() as u64,
+        log_len
+    );
 
     // And it rejoins normally.
     assert!(matches!(
@@ -281,8 +329,10 @@ async fn a_node_that_died_mid_write_restarts_and_catches_up() {
         ClientCommandResult::Applied(_)
     ));
     cluster
-        .wait_until(Duration::from_secs(5), "restarted follower to catch up", |c| {
-            c.snapshot(follower).log_len == c.snapshot(leader).log_len
-        })
+        .wait_until(
+            Duration::from_secs(5),
+            "restarted follower to catch up",
+            |c| c.snapshot(follower).log_len == c.snapshot(leader).log_len,
+        )
         .await;
 }

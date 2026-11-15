@@ -1,7 +1,7 @@
 use crate::log::Log;
 use crate::membership::Membership;
 use crate::messages::{PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse};
-use crate::state::{NodeId, PersistentState, VolatileState, Role};
+use crate::state::{NodeId, PersistentState, Role, VolatileState};
 use rand::Rng;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -18,7 +18,10 @@ pub struct ElectionTimeoutConfig {
 
 impl Default for ElectionTimeoutConfig {
     fn default() -> Self {
-        Self { min: Duration::from_millis(150), max: Duration::from_millis(300) }
+        Self {
+            min: Duration::from_millis(150),
+            max: Duration::from_millis(300),
+        }
     }
 }
 
@@ -49,7 +52,10 @@ impl VoteTally {
     pub fn new(self_id: NodeId, membership: &Membership) -> Self {
         let mut votes_received = HashSet::new();
         votes_received.insert(self_id); // a candidate always votes for itself
-        Self { votes_received, members: membership.clone() }
+        Self {
+            votes_received,
+            members: membership.clone(),
+        }
     }
 
     pub fn record_vote(&mut self, voter: NodeId) {
@@ -103,7 +109,10 @@ pub fn handle_request_vote(
     // Stale term: reject outright, tell the candidate our (higher) term so it
     // can step down out of its own stale candidacy.
     if req.term < persistent.current_term {
-        return RequestVoteResponse { term: persistent.current_term, vote_granted: false };
+        return RequestVoteResponse {
+            term: persistent.current_term,
+            vote_granted: false,
+        };
     }
 
     // Newer term: we must update ours and revert to Follower before considering
@@ -119,15 +128,21 @@ pub fn handle_request_vote(
         Some(voted) if voted != req.candidate_id
     );
 
-    let candidate_log_up_to_date = (req.last_log_term, req.last_log_index)
-        >= (log.last_term(), log.last_index());
+    let candidate_log_up_to_date =
+        (req.last_log_term, req.last_log_index) >= (log.last_term(), log.last_index());
 
     if !already_voted_for_other && candidate_log_up_to_date {
         persistent.voted_for = Some(req.candidate_id);
         volatile.last_heartbeat = std::time::Instant::now(); // granting a vote counts as contact
-        RequestVoteResponse { term: persistent.current_term, vote_granted: true }
+        RequestVoteResponse {
+            term: persistent.current_term,
+            vote_granted: true,
+        }
     } else {
-        RequestVoteResponse { term: persistent.current_term, vote_granted: false }
+        RequestVoteResponse {
+            term: persistent.current_term,
+            vote_granted: false,
+        }
     }
 }
 
@@ -156,8 +171,8 @@ pub fn handle_pre_vote(
     req: &PreVoteRequest,
     leader_active: bool,
 ) -> PreVoteResponse {
-    let candidate_log_up_to_date = (req.last_log_term, req.last_log_index)
-        >= (log.last_term(), log.last_index());
+    let candidate_log_up_to_date =
+        (req.last_log_term, req.last_log_index) >= (log.last_term(), log.last_index());
 
     let granted = req.term > persistent.current_term && candidate_log_up_to_date && !leader_active;
 
@@ -208,8 +223,18 @@ mod tests {
     #[test]
     fn rejects_second_vote_in_same_term() {
         let (mut persistent, mut volatile, log) = fresh_state();
-        let req1 = RequestVoteRequest { term: 1, candidate_id: 2, last_log_index: 0, last_log_term: 0 };
-        let req2 = RequestVoteRequest { term: 1, candidate_id: 3, last_log_index: 0, last_log_term: 0 };
+        let req1 = RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let req2 = RequestVoteRequest {
+            term: 1,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
 
         let resp1 = handle_request_vote(&mut persistent, &mut volatile, &log, &req1);
         let resp2 = handle_request_vote(&mut persistent, &mut volatile, &log, &req2);
@@ -249,7 +274,10 @@ mod tests {
         let mut tally = VoteTally::new(1, &Membership::of_ids([1, 2, 3]));
         tally.record_vote(8);
         tally.record_vote(9);
-        assert!(!tally.has_majority(), "1 member vote out of 3 plus two outsiders");
+        assert!(
+            !tally.has_majority(),
+            "1 member vote out of 3 plus two outsiders"
+        );
         tally.record_vote(2);
         assert!(tally.has_majority());
     }
@@ -271,8 +299,18 @@ mod tests {
 
     // ---- pre-vote -----------------------------------------------------------
 
-    fn pre_vote(term: u64, candidate_id: NodeId, last_log_index: u64, last_log_term: u64) -> PreVoteRequest {
-        PreVoteRequest { term, candidate_id, last_log_index, last_log_term }
+    fn pre_vote(
+        term: u64,
+        candidate_id: NodeId,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> PreVoteRequest {
+        PreVoteRequest {
+            term,
+            candidate_id,
+            last_log_index,
+            last_log_term,
+        }
     }
 
     #[test]
@@ -288,7 +326,10 @@ mod tests {
     fn pre_vote_is_denied_while_a_leader_is_active() {
         let (persistent, _, log) = fresh_state();
         let resp = handle_pre_vote(&persistent, &log, &pre_vote(1, 2, 0, 0), true);
-        assert!(!resp.vote_granted, "a healthy leader must not be disrupted by a rejoining node");
+        assert!(
+            !resp.vote_granted,
+            "a healthy leader must not be disrupted by a rejoining node"
+        );
     }
 
     #[test]
@@ -330,11 +371,22 @@ mod tests {
         // Promise node 2 a pre-vote for term 1...
         let pre = handle_pre_vote(&persistent, &log, &pre_vote(1, 2, 0, 0), false);
         assert!(pre.vote_granted);
-        assert_eq!(persistent.voted_for, None, "a pre-vote must not record a vote");
-        assert_eq!(persistent.current_term, 0, "a pre-vote must not change the term");
+        assert_eq!(
+            persistent.voted_for, None,
+            "a pre-vote must not record a vote"
+        );
+        assert_eq!(
+            persistent.current_term, 0,
+            "a pre-vote must not change the term"
+        );
 
         // ...the real vote for term 1 is still free, and can go to a different node.
-        let real = RequestVoteRequest { term: 1, candidate_id: 3, last_log_index: 0, last_log_term: 0 };
+        let real = RequestVoteRequest {
+            term: 1,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
         assert!(handle_request_vote(&mut persistent, &mut volatile, &log, &real).vote_granted);
     }
 }

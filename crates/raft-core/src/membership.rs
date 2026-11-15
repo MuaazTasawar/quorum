@@ -15,7 +15,9 @@ pub struct Membership {
 
 impl Membership {
     pub fn new(members: impl IntoIterator<Item = (NodeId, String)>) -> Self {
-        Self { members: members.into_iter().collect() }
+        Self {
+            members: members.into_iter().collect(),
+        }
     }
 
     /// A membership of the given ids with no addresses. Handy where only the
@@ -59,7 +61,9 @@ impl Membership {
     /// removed nodes) and repeated ids are ignored.
     pub fn count_members(&self, ids: impl IntoIterator<Item = NodeId>) -> usize {
         let mut seen = std::collections::BTreeSet::new();
-        ids.into_iter().filter(|id| self.contains(*id) && seen.insert(*id)).count()
+        ids.into_iter()
+            .filter(|id| self.contains(*id) && seen.insert(*id))
+            .count()
     }
 
     /// True if `ids` contain a majority of the members.
@@ -117,14 +121,17 @@ pub struct ConfigHistory {
 
 impl ConfigHistory {
     pub fn new(base: Membership) -> Self {
-        Self { base, changes: Vec::new() }
+        Self {
+            base,
+            changes: Vec::new(),
+        }
     }
 
     /// Notes that the log entry at `index` carries `change`. Entries must be
     /// recorded in log order.
     pub fn record(&mut self, index: u64, change: ConfigChange) {
         debug_assert!(
-            self.changes.last().map_or(true, |(last, _)| *last < index),
+            self.changes.last().is_none_or(|(last, _)| *last < index),
             "configuration entries must be recorded in log order"
         );
         self.changes.push((index, change));
@@ -183,7 +190,10 @@ mod tests {
     use super::*;
 
     fn add(id: NodeId) -> ConfigChange {
-        ConfigChange::Add { id, addr: format!("node{id}:7000") }
+        ConfigChange::Add {
+            id,
+            addr: format!("node{id}:7000"),
+        }
     }
 
     fn remove(id: NodeId) -> ConfigChange {
@@ -307,8 +317,16 @@ mod tests {
         history.record(5, add(4));
         history.record(9, remove(1));
         history.compact_through(5);
-        assert_eq!(history.len(), 1, "only the change after the snapshot remains");
-        assert_eq!(ids(&history.current()), vec![2, 3, 4], "the answer does not change");
+        assert_eq!(
+            history.len(),
+            1,
+            "only the change after the snapshot remains"
+        );
+        assert_eq!(
+            ids(&history.current()),
+            vec![2, 3, 4],
+            "the answer does not change"
+        );
         assert_eq!(ids(&history.membership_at(5)), vec![1, 2, 3, 4]);
         // A truncation of the surviving entry now reverts to the SNAPSHOT's membership.
         history.truncate_from(9);

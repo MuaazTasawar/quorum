@@ -1,6 +1,6 @@
 use crate::messages::InstallSnapshotRequest;
-use crate::state::{LeaderState, NodeId, PersistentState, Term, VolatileState};
 use crate::state::Role;
+use crate::state::{LeaderState, NodeId, PersistentState, Term, VolatileState};
 use std::sync::Arc;
 
 /// The largest snapshot a node will agree to receive. A transfer that announces more
@@ -24,7 +24,12 @@ pub struct SnapshotSender {
 
 impl SnapshotSender {
     pub fn new(last_included_index: u64, last_included_term: Term, data: Arc<Vec<u8>>) -> Self {
-        Self { last_included_index, last_included_term, data, offset: 0 }
+        Self {
+            last_included_index,
+            last_included_term,
+            data,
+            offset: 0,
+        }
     }
 
     pub fn last_included_index(&self) -> u64 {
@@ -104,11 +109,20 @@ pub struct SnapshotAssembler {
 
 impl SnapshotAssembler {
     /// Starts receiving a snapshot, or `None` if its announced size is refused.
-    pub fn start(last_included_index: u64, last_included_term: Term, total_len: u64) -> Option<Self> {
+    pub fn start(
+        last_included_index: u64,
+        last_included_term: Term,
+        total_len: u64,
+    ) -> Option<Self> {
         if total_len > MAX_SNAPSHOT_BYTES {
             return None;
         }
-        Some(Self { last_included_index, last_included_term, total_len, buffer: Vec::new() })
+        Some(Self {
+            last_included_index,
+            last_included_term,
+            total_len,
+            buffer: Vec::new(),
+        })
     }
 
     /// True if this assembler is receiving the snapshot `request` belongs to.
@@ -173,7 +187,11 @@ pub fn apply_snapshot_installed(
     follower_id: NodeId,
     last_included_index: u64,
 ) {
-    let known_match = leader_state.match_index.get(&follower_id).copied().unwrap_or(0);
+    let known_match = leader_state
+        .match_index
+        .get(&follower_id)
+        .copied()
+        .unwrap_or(0);
     let new_match = known_match.max(last_included_index);
     leader_state.match_index.insert(follower_id, new_match);
     leader_state.next_index.insert(follower_id, new_match + 1);
@@ -223,7 +241,10 @@ mod tests {
         let chunk = sender.next_chunk(64, 1, 1, 0);
         assert!(chunk.done && chunk.data.is_empty() && chunk.offset == 0);
         let mut assembler = SnapshotAssembler::start(1, 1, 0).unwrap();
-        assert_eq!(assembler.accept(0, &[], true), ChunkOutcome::Complete(vec![]));
+        assert_eq!(
+            assembler.accept(0, &[], true),
+            ChunkOutcome::Complete(vec![])
+        );
     }
 
     #[test]
@@ -238,8 +259,14 @@ mod tests {
     fn a_repeated_acknowledgement_does_not_ask_for_another_send() {
         let mut sender = SnapshotSender::new(1, 1, bytes(100));
         assert!(sender.acknowledge(30));
-        assert!(!sender.acknowledge(30), "a duplicate answer must not multiply the traffic");
-        assert!(sender.acknowledge(0), "a follower that lost its progress sends us back");
+        assert!(
+            !sender.acknowledge(30),
+            "a duplicate answer must not multiply the traffic"
+        );
+        assert!(
+            sender.acknowledge(0),
+            "a follower that lost its progress sends us back"
+        );
         assert_eq!(sender.offset(), 0);
     }
 
@@ -253,8 +280,14 @@ mod tests {
     #[test]
     fn a_repeated_chunk_is_not_stored_twice() {
         let mut assembler = SnapshotAssembler::start(1, 1, 100).unwrap();
-        assert_eq!(assembler.accept(0, &[1; 30], false), ChunkOutcome::Accepted { next_offset: 30 });
-        assert_eq!(assembler.accept(0, &[1; 30], false), ChunkOutcome::Misaligned { expected: 30 });
+        assert_eq!(
+            assembler.accept(0, &[1; 30], false),
+            ChunkOutcome::Accepted { next_offset: 30 }
+        );
+        assert_eq!(
+            assembler.accept(0, &[1; 30], false),
+            ChunkOutcome::Misaligned { expected: 30 }
+        );
         assert_eq!(assembler.received(), 30);
     }
 
@@ -262,7 +295,10 @@ mod tests {
     fn a_chunk_that_skips_ahead_is_refused_and_says_where_to_continue() {
         let mut assembler = SnapshotAssembler::start(1, 1, 100).unwrap();
         assembler.accept(0, &[1; 30], false);
-        assert_eq!(assembler.accept(60, &[1; 10], false), ChunkOutcome::Misaligned { expected: 30 });
+        assert_eq!(
+            assembler.accept(60, &[1; 10], false),
+            ChunkOutcome::Misaligned { expected: 30 }
+        );
     }
 
     #[test]
@@ -296,25 +332,36 @@ mod tests {
 
     #[test]
     fn a_stale_leaders_snapshot_is_refused_and_changes_nothing() {
-        let mut persistent = PersistentState::default();
-        persistent.current_term = 5;
-        persistent.voted_for = Some(3);
+        let mut persistent = PersistentState {
+            current_term: 5,
+            voted_for: Some(3),
+        };
         let mut volatile = VolatileState::new();
         assert_eq!(accept_leader_term(&mut persistent, &mut volatile, 4), None);
-        assert_eq!((persistent.current_term, persistent.voted_for), (5, Some(3)));
+        assert_eq!(
+            (persistent.current_term, persistent.voted_for),
+            (5, Some(3))
+        );
     }
 
     #[test]
     fn a_newer_leaders_snapshot_moves_the_term_and_clears_the_vote() {
-        let mut persistent = PersistentState::default();
-        persistent.current_term = 5;
-        persistent.voted_for = Some(3);
+        let mut persistent = PersistentState {
+            current_term: 5,
+            voted_for: Some(3),
+        };
         let mut volatile = VolatileState::new();
         volatile.role = Role::Candidate;
-        assert_eq!(accept_leader_term(&mut persistent, &mut volatile, 6), Some(true));
+        assert_eq!(
+            accept_leader_term(&mut persistent, &mut volatile, 6),
+            Some(true)
+        );
         assert_eq!((persistent.current_term, persistent.voted_for), (6, None));
         assert_eq!(volatile.role, Role::Follower);
-        assert_eq!(accept_leader_term(&mut persistent, &mut volatile, 6), Some(false));
+        assert_eq!(
+            accept_leader_term(&mut persistent, &mut volatile, 6),
+            Some(false)
+        );
     }
 
     #[test]
@@ -325,6 +372,10 @@ mod tests {
         apply_snapshot_installed(&mut state, 2, 40);
         assert_eq!((state.match_index[&2], state.next_index[&2]), (40, 41));
         apply_snapshot_installed(&mut state, 2, 10);
-        assert_eq!((state.match_index[&2], state.next_index[&2]), (40, 41), "never backwards");
+        assert_eq!(
+            (state.match_index[&2], state.next_index[&2]),
+            (40, 41),
+            "never backwards"
+        );
     }
 }

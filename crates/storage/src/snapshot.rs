@@ -145,7 +145,10 @@ fn verified_payload(bytes: &[u8]) -> Result<&[u8], SnapshotError> {
     let expected_crc = u32::from_le_bytes(bytes[16..20].try_into().expect("4 bytes"));
     let payload = &bytes[HEADER_LEN..];
     if payload.len() as u64 != expected_len {
-        return Err(SnapshotError::Truncated { expected: expected_len, found: payload.len() as u64 });
+        return Err(SnapshotError::Truncated {
+            expected: expected_len,
+            found: payload.len() as u64,
+        });
     }
     if crc32(payload) != expected_crc {
         return Err(SnapshotError::ChecksumMismatch);
@@ -200,7 +203,10 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             let dir = std::env::temp_dir().join(format!("quorum-snap-{nanos}-{n}"));
             std::fs::create_dir_all(&dir).unwrap();
@@ -231,9 +237,15 @@ mod tests {
 
     fn state() -> KvStore {
         let mut store = KvStore::new();
-        store.apply(&Command::Put { key: "alpha".into(), value: b"1".to_vec() });
+        store.apply(&Command::Put {
+            key: "alpha".into(),
+            value: b"1".to_vec(),
+        });
         // A value that is not valid UTF-8 must survive untouched.
-        store.apply(&Command::Put { key: "bin".into(), value: vec![0, 159, 146, 150, 255] });
+        store.apply(&Command::Put {
+            key: "bin".into(),
+            value: vec![0, 159, 146, 150, 255],
+        });
         store
     }
 
@@ -248,7 +260,9 @@ mod tests {
         let dir = TestDir::new();
         save_snapshot(dir.path(), metadata(42, 3), &state()).unwrap();
 
-        let (loaded, store) = load_snapshot(dir.path()).unwrap().expect("a snapshot exists");
+        let (loaded, store) = load_snapshot(dir.path())
+            .unwrap()
+            .expect("a snapshot exists");
         assert_eq!(loaded, metadata(42, 3));
         assert_eq!(store.len(), 2);
         assert_eq!(store.get("alpha"), Some(&b"1".to_vec()));
@@ -278,7 +292,10 @@ mod tests {
         save_snapshot(dir.path(), metadata(1, 1), &state()).unwrap();
         let bytes = std::fs::read(dir.path()).unwrap();
         assert_eq!(&bytes[..4], b"QSNP");
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), SNAPSHOT_FORMAT_VERSION);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            SNAPSHOT_FORMAT_VERSION
+        );
     }
 
     #[test]
@@ -300,10 +317,20 @@ mod tests {
     #[test]
     fn a_file_that_is_not_a_snapshot_is_refused() {
         let dir = TestDir::new();
-        std::fs::write(dir.path(), b"definitely not a snapshot, but longer than a header").unwrap();
-        assert!(matches!(load_snapshot(dir.path()), Err(SnapshotError::BadMagic)));
+        std::fs::write(
+            dir.path(),
+            b"definitely not a snapshot, but longer than a header",
+        )
+        .unwrap();
+        assert!(matches!(
+            load_snapshot(dir.path()),
+            Err(SnapshotError::BadMagic)
+        ));
         std::fs::write(dir.path(), b"tiny").unwrap();
-        assert!(matches!(load_snapshot(dir.path()), Err(SnapshotError::BadMagic)));
+        assert!(matches!(
+            load_snapshot(dir.path()),
+            Err(SnapshotError::BadMagic)
+        ));
     }
 
     #[test]
@@ -314,7 +341,10 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
         std::fs::write(dir.path(), &bytes).unwrap();
-        assert!(matches!(load_snapshot(dir.path()), Err(SnapshotError::ChecksumMismatch)));
+        assert!(matches!(
+            load_snapshot(dir.path()),
+            Err(SnapshotError::ChecksumMismatch)
+        ));
     }
 
     #[test]
@@ -323,7 +353,10 @@ mod tests {
         save_snapshot(dir.path(), metadata(7, 1), &state()).unwrap();
         let bytes = std::fs::read(dir.path()).unwrap();
         std::fs::write(dir.path(), &bytes[..bytes.len() - 5]).unwrap();
-        assert!(matches!(load_snapshot(dir.path()), Err(SnapshotError::Truncated { .. })));
+        assert!(matches!(
+            load_snapshot(dir.path()),
+            Err(SnapshotError::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -345,9 +378,18 @@ mod tests {
         let mut bytes = encode_snapshot(&metadata(9, 2), &state()).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x40;
-        assert!(matches!(peek_snapshot_metadata(&bytes), Err(SnapshotError::ChecksumMismatch)));
-        assert!(matches!(decode_snapshot(&bytes), Err(SnapshotError::ChecksumMismatch)));
-        assert!(matches!(decode_snapshot(&bytes[..10]), Err(SnapshotError::BadMagic)));
+        assert!(matches!(
+            peek_snapshot_metadata(&bytes),
+            Err(SnapshotError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            decode_snapshot(&bytes),
+            Err(SnapshotError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            decode_snapshot(&bytes[..10]),
+            Err(SnapshotError::BadMagic)
+        ));
     }
 
     #[test]
@@ -355,7 +397,11 @@ mod tests {
         let dir = TestDir::new();
         let bytes = encode_snapshot(&metadata(12, 3), &state()).unwrap();
         write_snapshot_bytes(dir.path(), &bytes).unwrap();
-        assert_eq!(std::fs::read(dir.path()).unwrap(), bytes, "byte for byte what was received");
+        assert_eq!(
+            std::fs::read(dir.path()).unwrap(),
+            bytes,
+            "byte for byte what was received"
+        );
         let (loaded, _) = load_snapshot(dir.path()).unwrap().unwrap();
         assert_eq!(loaded.last_included_index, 12);
     }

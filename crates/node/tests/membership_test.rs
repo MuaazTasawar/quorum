@@ -23,7 +23,9 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 /// Minimal HTTP/1.1 client over a raw socket: (status, whole raw response).
 async fn http(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("server should accept connections");
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("server should accept connections");
     let body = body.unwrap_or("");
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
@@ -71,7 +73,15 @@ async fn change(cluster: &TestCluster, change: MembershipChange, among: &[NodeId
 }
 
 async fn add(cluster: &TestCluster, id: NodeId, among: &[NodeId]) -> AdminResult {
-    change(cluster, MembershipChange::Add { id, addr: format!("node{id}:7000") }, among).await
+    change(
+        cluster,
+        MembershipChange::Add {
+            id,
+            addr: format!("node{id}:7000"),
+        },
+        among,
+    )
+    .await
 }
 
 async fn remove(cluster: &TestCluster, id: NodeId, among: &[NodeId]) -> AdminResult {
@@ -87,7 +97,10 @@ async fn write(cluster: &TestCluster, among: &[NodeId], key: &str, value: &str) 
         if let ClientCommandResult::Applied(_) = cluster.put(leader, key, value).await {
             return;
         }
-        assert!(tokio::time::Instant::now() < deadline, "could not write {key} in time");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "could not write {key} in time"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -100,7 +113,10 @@ async fn read(cluster: &TestCluster, among: &[NodeId], key: &str) -> Option<Vec<
         if let QueryResult::Value(value) = cluster.get(leader, key).await {
             return value;
         }
-        assert!(tokio::time::Instant::now() < deadline, "could not read {key} in time");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "could not read {key} in time"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -109,9 +125,11 @@ async fn wait_for_members(cluster: &TestCluster, nodes: &[NodeId], expected: &[N
     let nodes = nodes.to_vec();
     let expected = expected.to_vec();
     cluster
-        .wait_until(SETTLE, &format!("nodes {nodes:?} to agree the members are {expected:?}"), |c| {
-            nodes.iter().all(|&id| c.members_of(id) == expected)
-        })
+        .wait_until(
+            SETTLE,
+            &format!("nodes {nodes:?} to agree the members are {expected:?}"),
+            |c| nodes.iter().all(|&id| c.members_of(id) == expected),
+        )
         .await;
 }
 
@@ -121,7 +139,13 @@ async fn a_new_node_catches_up_is_admitted_and_then_carries_real_weight() {
     let all = [1, 2, 3, 4];
     cluster.wait_for_leader(SETTLE).await;
     for i in 0..25 {
-        write(&cluster, &[1, 2, 3], &format!("key-{i}"), &format!("value-{i}")).await;
+        write(
+            &cluster,
+            &[1, 2, 3],
+            &format!("key-{i}"),
+            &format!("value-{i}"),
+        )
+        .await;
     }
 
     cluster.start_joiner(4);
@@ -168,10 +192,17 @@ async fn a_node_waiting_to_join_never_elects_itself() {
 
     let snapshot = cluster.snapshot(4);
     assert_eq!(snapshot.role, "Follower");
-    assert_eq!(snapshot.current_term, 0, "it has not even started an election");
+    assert_eq!(
+        snapshot.current_term, 0,
+        "it has not even started an election"
+    );
     assert_eq!(cluster.leaders(), vec![leader]);
     assert_eq!(cluster.snapshot(leader).current_term, term_before);
-    assert_eq!(cluster.members_of(4), vec![1, 2, 3], "and it knows it is not a member");
+    assert_eq!(
+        cluster.members_of(4),
+        vec![1, 2, 3],
+        "and it knows it is not a member"
+    );
 }
 
 #[tokio::test]
@@ -203,14 +234,21 @@ async fn a_leader_can_remove_itself_and_the_others_carry_on_undisturbed() {
     let cluster = TestCluster::start(&[1, 2, 3]);
     let old_leader = cluster.wait_for_leader(SETTLE).await;
     write(&cluster, &[1, 2, 3], "k", "v").await;
-    let others: Vec<NodeId> = [1, 2, 3].into_iter().filter(|&id| id != old_leader).collect();
+    let others: Vec<NodeId> = [1, 2, 3]
+        .into_iter()
+        .filter(|&id| id != old_leader)
+        .collect();
 
     let result = cluster.remove_member(old_leader, old_leader).await;
     assert_eq!(applied(&result), Some(others.clone()), "{result:?}");
 
     let new_leader = cluster.wait_for_leader_among(&others, SETTLE).await;
     assert_ne!(new_leader, old_leader);
-    assert_eq!(cluster.snapshot(old_leader).role, "Follower", "it handed over");
+    assert_eq!(
+        cluster.snapshot(old_leader).role,
+        "Follower",
+        "it handed over"
+    );
 
     write(&cluster, &others, "k2", "v2").await;
     assert_eq!(read(&cluster, &others, "k").await, Some(b"v".to_vec()));
@@ -218,7 +256,11 @@ async fn a_leader_can_remove_itself_and_the_others_carry_on_undisturbed() {
     // The departed node must not keep campaigning against the cluster it left.
     let term = cluster.snapshot(new_leader).current_term;
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(cluster.snapshot(new_leader).current_term, term, "no election churn");
+    assert_eq!(
+        cluster.snapshot(new_leader).current_term,
+        term,
+        "no election churn"
+    );
     assert_eq!(cluster.leaders(), vec![new_leader]);
     assert_eq!(cluster.members_of(old_leader), others);
 }
@@ -235,7 +277,11 @@ async fn a_removed_node_that_never_heard_of_it_cannot_disrupt_the_cluster() {
     cluster.isolate(removed);
     let result = remove(&cluster, removed, &kept).await;
     assert!(applied(&result).is_some(), "{result:?}");
-    assert_eq!(cluster.members_of(removed), vec![1, 2, 3], "still thinks it is a member");
+    assert_eq!(
+        cluster.members_of(removed),
+        vec![1, 2, 3],
+        "still thinks it is a member"
+    );
     let term = cluster.snapshot(leader).current_term;
 
     // It comes back and, finding no leader, keeps trying to start elections.
@@ -243,7 +289,11 @@ async fn a_removed_node_that_never_heard_of_it_cannot_disrupt_the_cluster() {
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     assert_eq!(cluster.leaders(), vec![leader], "the leader is undisturbed");
-    assert_eq!(cluster.snapshot(leader).current_term, term, "no term inflation");
+    assert_eq!(
+        cluster.snapshot(leader).current_term,
+        term,
+        "no term inflation"
+    );
     write(&cluster, &kept, "still", "working").await;
 }
 
@@ -289,7 +339,10 @@ async fn a_node_that_never_answers_is_abandoned_and_the_cluster_is_unharmed() {
     );
     assert_eq!(cluster.members_of(1), vec![1, 2, 3]);
     let leader = cluster.wait_for_leader(SETTLE).await;
-    assert!(cluster.snapshot(leader).learners.is_empty(), "the learner was dropped");
+    assert!(
+        cluster.snapshot(leader).learners.is_empty(),
+        "the learner was dropped"
+    );
     write(&cluster, &[1, 2, 3], "still", "fine").await;
 
     // And the slot is free: a real node can be added afterwards.
@@ -308,7 +361,10 @@ async fn a_slow_new_node_cannot_stall_writes_while_it_catches_up() {
     let leader_for_add = leader;
     let adding = cluster.change_membership(
         leader_for_add,
-        MembershipChange::Add { id: 4, addr: "node4:7000".to_string() },
+        MembershipChange::Add {
+            id: 4,
+            addr: "node4:7000".to_string(),
+        },
     );
     let writing = async {
         for i in 0..20 {
@@ -356,9 +412,20 @@ async fn writes_keep_flowing_through_a_grow_and_a_shrink() {
 
     let members = [1, 3, 4];
     wait_for_members(&cluster, &members, &members).await;
-    assert_eq!(cluster.leaders().iter().filter(|id| members.contains(id)).count(), 1);
+    assert_eq!(
+        cluster
+            .leaders()
+            .iter()
+            .filter(|id| members.contains(id))
+            .count(),
+        1
+    );
     let keys = acknowledged.lock().unwrap().clone();
-    assert!(keys.len() > 30, "most writes should have gone through, got {}", keys.len());
+    assert!(
+        keys.len() > 30,
+        "most writes should have gone through, got {}",
+        keys.len()
+    );
     for key in keys {
         assert_eq!(
             read(&cluster, &members, &key).await,
@@ -417,7 +484,10 @@ async fn the_admin_api_adds_and_removes_members_over_http() {
     .await;
     assert_eq!(status, 200);
     assert!(body.contains("\"is_leader\":false"), "{body}");
-    assert!(body.contains(&format!("\"leader_hint\":{leader}")), "{body}");
+    assert!(
+        body.contains(&format!("\"leader_hint\":{leader}")),
+        "{body}"
+    );
 
     cluster.start_joiner(4);
     let (status, body) = http(
@@ -445,8 +515,13 @@ async fn the_admin_api_adds_and_removes_members_over_http() {
     assert!(body.contains("\"outcome_unknown\":false"), "{body}");
 
     // A missing address is a bad request.
-    let (status, _) =
-        http(leader_http, "POST", "/admin/members", Some(r#"{"id":9,"addr":""}"#)).await;
+    let (status, _) = http(
+        leader_http,
+        "POST",
+        "/admin/members",
+        Some(r#"{"id":9,"addr":""}"#),
+    )
+    .await;
     assert_eq!(status, 400);
 
     // Removal.

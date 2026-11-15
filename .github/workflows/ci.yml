@@ -31,15 +31,14 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked --no-fail-fast
 
-      # Non-blocking until the codebase has been through rustfmt/clippy once.
-      # Remove `continue-on-error` to make these hard gates.
+      # Hard gates. Run `cargo fmt --all` before committing. If a new stable toolchain
+      # adds a lint that breaks CI on code that has not changed, fix the lint (or add
+      # `continue-on-error: true` back to the Clippy step while you do).
       - name: Format check
         run: cargo fmt --all -- --check
-        continue-on-error: true
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true
 
   docker:
     name: Docker image builds

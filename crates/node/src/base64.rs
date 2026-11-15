@@ -7,12 +7,24 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 pub fn encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -40,7 +52,8 @@ fn sextet(byte: u8) -> Option<u32> {
 
 pub fn decode(text: &str) -> Result<Vec<u8>, DecodeError> {
     let bytes = text.as_bytes();
-    if bytes.len() % 4 != 0 {
+    // A multiple of four (written with a mask so it builds on older toolchains too).
+    if bytes.len() & 3 != 0 {
         return Err(DecodeError::BadLength);
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -95,7 +108,11 @@ mod tests {
     fn it_matches_the_rfc_vectors_both_ways() {
         for (plain, encoded) in VECTORS {
             assert_eq!(encode(plain.as_bytes()), encoded, "encoding {plain:?}");
-            assert_eq!(decode(encoded).unwrap(), plain.as_bytes(), "decoding {encoded:?}");
+            assert_eq!(
+                decode(encoded).unwrap(),
+                plain.as_bytes(),
+                "decoding {encoded:?}"
+            );
         }
     }
 
@@ -126,21 +143,37 @@ mod tests {
         assert_eq!(decode("Zm9!"), Err(DecodeError::BadCharacter(3)));
         assert_eq!(decode("Zm 9"), Err(DecodeError::BadCharacter(2)));
         assert_eq!(decode("Zm9v\n"), Err(DecodeError::BadLength));
-        assert_eq!(decode("-_-_"), Err(DecodeError::BadCharacter(0)), "URL-safe is not standard");
+        assert_eq!(
+            decode("-_-_"),
+            Err(DecodeError::BadCharacter(0)),
+            "URL-safe is not standard"
+        );
     }
 
     #[test]
     fn padding_must_be_exactly_where_it_belongs() {
         assert_eq!(decode("Z==="), Err(DecodeError::BadPadding));
-        assert_eq!(decode("Zg==Zg=="), Err(DecodeError::BadPadding), "padding in the middle");
-        assert_eq!(decode("=Zg="), Err(DecodeError::BadCharacter(0)), "a leading = is not a character");
+        assert_eq!(
+            decode("Zg==Zg=="),
+            Err(DecodeError::BadPadding),
+            "padding in the middle"
+        );
+        assert_eq!(
+            decode("=Zg="),
+            Err(DecodeError::BadCharacter(0)),
+            "a leading = is not a character"
+        );
     }
 
     #[test]
     fn non_canonical_trailing_bits_are_refused() {
         // "Zh==" would also decode to "f" if the spare bits were ignored.
         assert_eq!(decode("Zh=="), Err(DecodeError::BadPadding));
-        assert_eq!(decode("Zm9="), Err(DecodeError::BadPadding), "spare bits are not zero");
+        assert_eq!(
+            decode("Zm9="),
+            Err(DecodeError::BadPadding),
+            "spare bits are not zero"
+        );
         assert_eq!(decode("Zm8=").unwrap(), b"fo");
     }
 }

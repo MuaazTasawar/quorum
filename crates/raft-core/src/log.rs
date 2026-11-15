@@ -72,10 +72,14 @@ impl Log {
     /// from `base_index + 1`.
     pub fn from_parts(base_index: u64, base_term: Term, entries: Vec<LogEntry>) -> Self {
         debug_assert!(
-            entries.first().map_or(true, |e| e.index == base_index + 1),
+            entries.first().is_none_or(|e| e.index == base_index + 1),
             "entries must continue straight after the snapshot point"
         );
-        Self { base_index, base_term, entries }
+        Self {
+            base_index,
+            base_term,
+            entries,
+        }
     }
 
     /// Index of the last entry folded into the snapshot; 0 if the log was never compacted.
@@ -104,11 +108,17 @@ impl Log {
     }
 
     pub fn last_index(&self) -> u64 {
-        self.entries.last().map(|e| e.index).unwrap_or(self.base_index)
+        self.entries
+            .last()
+            .map(|e| e.index)
+            .unwrap_or(self.base_index)
     }
 
     pub fn last_term(&self) -> Term {
-        self.entries.last().map(|e| e.term).unwrap_or(self.base_term)
+        self.entries
+            .last()
+            .map(|e| e.term)
+            .unwrap_or(self.base_term)
     }
 
     /// The entry at `index`, if it is still held. Entries at or below `base_index`
@@ -135,7 +145,11 @@ impl Log {
     /// Appends a new entry created locally by this node as leader.
     pub fn append(&mut self, term: Term, command: Vec<u8>) -> u64 {
         let index = self.last_index() + 1;
-        self.entries.push(LogEntry { term, index, command });
+        self.entries.push(LogEntry {
+            term,
+            index,
+            command,
+        });
         index
     }
 
@@ -145,7 +159,10 @@ impl Log {
     /// callers must ensure `from_index > commit_index` before calling this. That
     /// also keeps it above the snapshot point, which is always committed.
     pub fn truncate_and_append(&mut self, from_index: u64, new_entries: Vec<LogEntry>) {
-        debug_assert!(from_index > self.base_index, "cannot truncate into a snapshot");
+        debug_assert!(
+            from_index > self.base_index,
+            "cannot truncate into a snapshot"
+        );
         let keep = from_index.saturating_sub(1).saturating_sub(self.base_index) as usize;
         self.entries.truncate(keep);
         self.entries.extend(new_entries);
@@ -190,7 +207,10 @@ impl Log {
             return Ok(());
         }
         let Some(term) = self.term_at(index) else {
-            return Err(BeyondLog { requested: index, last_index: self.last_index() });
+            return Err(BeyondLog {
+                requested: index,
+                last_index: self.last_index(),
+            });
         };
         let drop_count = (index - self.base_index) as usize;
         self.entries.drain(..drop_count);
@@ -208,7 +228,8 @@ impl Log {
             return SnapshotInstall::Ignored;
         }
         if index <= self.last_index() && self.term_at(index) == Some(term) {
-            self.compact_through(index).expect("the entry was just found in the log");
+            self.compact_through(index)
+                .expect("the entry was just found in the log");
             return SnapshotInstall::KeptSuffix;
         }
         self.entries.clear();
@@ -258,7 +279,11 @@ mod tests {
     fn the_snapshot_point_still_answers_for_its_term_and_for_matching() {
         let mut log = log_of(6);
         log.compact_through(3).unwrap();
-        assert_eq!(log.term_at(3), Some(1), "the snapshot's last entry keeps its term");
+        assert_eq!(
+            log.term_at(3),
+            Some(1),
+            "the snapshot's last entry keeps its term"
+        );
         assert_eq!(log.term_at(2), None, "earlier entries do not");
         assert!(log.matches(3, 1));
         assert!(!log.matches(3, 2));
@@ -270,7 +295,11 @@ mod tests {
         log.compact_through(4).unwrap();
         assert!(log.is_empty());
         assert_eq!((log.last_index(), log.last_term()), (4, 2));
-        assert_eq!(log.append(3, b"next".to_vec()), 5, "numbering continues after the snapshot");
+        assert_eq!(
+            log.append(3, b"next".to_vec()),
+            5,
+            "numbering continues after the snapshot"
+        );
         assert_eq!(log.get(5).unwrap().term, 3);
     }
 
@@ -289,7 +318,13 @@ mod tests {
     #[test]
     fn compacting_past_the_end_of_the_log_is_an_error_and_changes_nothing() {
         let mut log = log_of(3);
-        assert_eq!(log.compact_through(9), Err(BeyondLog { requested: 9, last_index: 3 }));
+        assert_eq!(
+            log.compact_through(9),
+            Err(BeyondLog {
+                requested: 9,
+                last_index: 3
+            })
+        );
         assert_eq!(log.base_index(), 0);
         assert_eq!(log.len(), 3);
     }
@@ -298,7 +333,11 @@ mod tests {
     fn truncation_and_append_work_above_the_snapshot_point() {
         let mut log = log_of(6);
         log.compact_through(3).unwrap();
-        let replacement = vec![LogEntry { term: 5, index: 5, command: b"new".to_vec() }];
+        let replacement = vec![LogEntry {
+            term: 5,
+            index: 5,
+            command: b"new".to_vec(),
+        }];
         log.truncate_and_append(5, replacement);
         assert_eq!(log.last_index(), 5);
         assert_eq!(log.get(4).unwrap().command, b"c4".to_vec());
@@ -313,17 +352,31 @@ mod tests {
         assert_eq!(log.entries_after(4).len(), 2);
         assert!(log.can_send_after(4));
         assert!(log.can_send_after(5));
-        assert!(!log.can_send_after(3), "entry 4 is gone: that follower needs the snapshot");
+        assert!(
+            !log.can_send_after(3),
+            "entry 4 is gone: that follower needs the snapshot"
+        );
     }
 
     #[test]
     fn a_log_rebuilt_from_parts_continues_after_the_snapshot() {
         let tail = vec![
-            LogEntry { term: 2, index: 8, command: b"x".to_vec() },
-            LogEntry { term: 2, index: 9, command: b"y".to_vec() },
+            LogEntry {
+                term: 2,
+                index: 8,
+                command: b"x".to_vec(),
+            },
+            LogEntry {
+                term: 2,
+                index: 9,
+                command: b"y".to_vec(),
+            },
         ];
         let log = Log::from_parts(7, 2, tail);
-        assert_eq!((log.base_index(), log.last_index(), log.last_term()), (7, 9, 2));
+        assert_eq!(
+            (log.base_index(), log.last_index(), log.last_term()),
+            (7, 9, 2)
+        );
         assert_eq!(log.get(8).unwrap().command, b"x".to_vec());
         assert!(log.matches(7, 2));
     }
@@ -331,7 +384,10 @@ mod tests {
     #[test]
     fn installing_a_snapshot_the_log_already_holds_keeps_the_entries_after_it() {
         let mut log = log_of(6);
-        assert_eq!(log.install_snapshot_point(4, 2), SnapshotInstall::KeptSuffix);
+        assert_eq!(
+            log.install_snapshot_point(4, 2),
+            SnapshotInstall::KeptSuffix
+        );
         assert_eq!((log.base_index(), log.last_index()), (4, 6));
         assert_eq!(log.len(), 2);
     }
@@ -340,16 +396,28 @@ mod tests {
     fn installing_a_snapshot_that_disagrees_with_the_log_discards_it_all() {
         let mut log = log_of(6);
         // Same index, different term: this log's entry 4 is not the snapshot's.
-        assert_eq!(log.install_snapshot_point(4, 9), SnapshotInstall::ReplacedLog);
+        assert_eq!(
+            log.install_snapshot_point(4, 9),
+            SnapshotInstall::ReplacedLog
+        );
         assert!(log.is_empty());
-        assert_eq!((log.base_index(), log.base_term(), log.last_index()), (4, 9, 4));
+        assert_eq!(
+            (log.base_index(), log.base_term(), log.last_index()),
+            (4, 9, 4)
+        );
     }
 
     #[test]
     fn installing_a_snapshot_beyond_the_log_replaces_it() {
         let mut log = log_of(3);
-        assert_eq!(log.install_snapshot_point(10, 4), SnapshotInstall::ReplacedLog);
-        assert_eq!((log.base_index(), log.last_index(), log.last_term()), (10, 10, 4));
+        assert_eq!(
+            log.install_snapshot_point(10, 4),
+            SnapshotInstall::ReplacedLog
+        );
+        assert_eq!(
+            (log.base_index(), log.last_index(), log.last_term()),
+            (10, 10, 4)
+        );
     }
 
     #[test]

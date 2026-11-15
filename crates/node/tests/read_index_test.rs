@@ -17,7 +17,9 @@ use tokio::net::TcpStream;
 /// A minimal HTTP/1.1 client over a raw socket (no extra dependencies).
 /// Returns (status code, response body).
 async fn http(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("server should accept connections");
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("server should accept connections");
     let body = body.unwrap_or("");
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
@@ -49,12 +51,19 @@ async fn a_read_returns_the_latest_committed_write() {
     let leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
 
     assert!(applied(&cluster.put(leader, "k", "v1").await));
-    assert!(matches!(cluster.get(leader, "k").await, QueryResult::Value(Some(v)) if v == b"v1".to_vec()));
+    assert!(
+        matches!(cluster.get(leader, "k").await, QueryResult::Value(Some(v)) if v == b"v1".to_vec())
+    );
 
     assert!(applied(&cluster.put(leader, "k", "v2").await));
-    assert!(matches!(cluster.get(leader, "k").await, QueryResult::Value(Some(v)) if v == b"v2".to_vec()));
+    assert!(
+        matches!(cluster.get(leader, "k").await, QueryResult::Value(Some(v)) if v == b"v2".to_vec())
+    );
 
-    assert!(matches!(cluster.get(leader, "never-written").await, QueryResult::Value(None)));
+    assert!(matches!(
+        cluster.get(leader, "never-written").await,
+        QueryResult::Value(None)
+    ));
 }
 
 /// A node that was elected a moment ago has not yet learned what the previous
@@ -65,7 +74,9 @@ async fn a_read_returns_the_latest_committed_write() {
 async fn a_read_on_a_freshly_elected_leader_still_sees_earlier_committed_writes() {
     let mut cluster = TestCluster::start(&[1, 2, 3]);
     let old_leader = cluster.wait_for_leader(Duration::from_secs(2)).await;
-    assert!(applied(&cluster.put(old_leader, "critical", "committed").await));
+    assert!(applied(
+        &cluster.put(old_leader, "critical", "committed").await
+    ));
 
     cluster.crash(old_leader).await;
     let new_leader = cluster.wait_for_leader(Duration::from_secs(5)).await;
@@ -91,7 +102,10 @@ async fn reads_never_go_backwards_across_a_leader_change() {
         }
 
         let result = cluster.put(leader, "counter", &round.to_string()).await;
-        assert!(applied(&result), "round {round}: write should apply, got {result:?}");
+        assert!(
+            applied(&result),
+            "round {round}: write should apply, got {result:?}"
+        );
         let last_acknowledged = round;
 
         match cluster.get(leader, "counter").await {
@@ -127,14 +141,25 @@ async fn a_cut_off_leader_redirects_reads_instead_of_answering_from_stale_state(
     cluster.isolate(leader);
 
     let started = Instant::now();
-    let (status, body) = tokio::time::timeout(Duration::from_secs(5), http(addr, "GET", "/kv/k", None))
-        .await
-        .expect("the read must be answered, not left hanging");
+    let (status, body) =
+        tokio::time::timeout(Duration::from_secs(5), http(addr, "GET", "/kv/k", None))
+            .await
+            .expect("the read must be answered, not left hanging");
 
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains("\"is_leader\":false"), "must redirect, got {body}");
-    assert!(!body.contains("old-value"), "must not leak possibly stale state: {body}");
-    assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+    assert!(
+        body.contains("\"is_leader\":false"),
+        "must redirect, got {body}"
+    );
+    assert!(
+        !body.contains("old-value"),
+        "must not leak possibly stale state: {body}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
 }
 
 /// The opt-out: with `QUORUM_LOCAL_READS=true` the same cut-off leader keeps
@@ -155,5 +180,9 @@ async fn local_read_mode_still_answers_from_a_cut_off_leader() {
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("\"value\":\"local\""), "{body}");
     assert!(body.contains("\"is_leader\":true"), "{body}");
-    assert!(started.elapsed() < Duration::from_millis(200), "took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "took {:?}",
+        started.elapsed()
+    );
 }
