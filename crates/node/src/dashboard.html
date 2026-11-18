@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quorum</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #171d25; --line: #263040; --text: #d7dde5; --dim: #8593a5;
+    --ok: #3fb97a; --warn: #e3a72f; --bad: #e5534b; --info: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center;
+           padding: 14px 20px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 18px; letter-spacing: .5px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim);
+       margin: 24px 20px 8px; }
+  #summary { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; flex: 1; }
+  .pill { padding: 3px 10px; border-radius: 999px; font-weight: 600; font-size: 12px;
+          border: 1px solid currentColor; }
+  .healthy { color: var(--ok); } .degraded { color: var(--warn); }
+  .no-leader, .no-quorum, .unreachable, .error { color: var(--bad); }
+  #notes { color: var(--warn); }
+  form { display: flex; gap: 6px; }
+  input { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+          border-radius: 6px; padding: 6px 10px; width: 340px; max-width: 80vw; }
+  button { background: var(--info); color: #06121f; border: 0; border-radius: 6px;
+           padding: 6px 14px; font-weight: 600; cursor: pointer; }
+  main { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+         gap: 14px; padding: 14px 20px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 12px 14px; }
+  .card.leader { border-color: var(--ok); }
+  .card.down { border-color: var(--bad); opacity: .85; }
+  .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .name { font-weight: 700; font-size: 16px; }
+  .addr { color: var(--dim); font-size: 12px; }
+  .badge { font-weight: 700; font-size: 12px; padding: 2px 8px; border-radius: 4px;
+           background: var(--line); }
+  .badge.leader { background: var(--ok); color: #04130b; }
+  .badge.candidate { background: var(--warn); color: #231800; }
+  .badge.follower { background: #2a3a52; }
+  .badge.down { background: var(--bad); color: #fff; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 10px 0 4px; }
+  dt { color: var(--dim); } dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  dd.warn { color: var(--warn); } dd.bad { color: var(--bad); }
+  svg.spark { width: 100%; height: 28px; display: block; margin-top: 6px; }
+  svg.spark polyline { fill: none; stroke: var(--info); stroke-width: 1.5; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+  th, td { text-align: right; padding: 2px 4px; border-top: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; } th { color: var(--dim); font-weight: 500; }
+  #events { margin: 0 20px 40px; padding: 0; list-style: none; font-size: 13px; }
+  #events li { padding: 3px 0; border-top: 1px solid var(--line); }
+  #events time { color: var(--dim); margin-right: 10px; }
+  .empty { color: var(--dim); padding: 0 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Quorum</h1>
+  <div id="summary"><span id="status" class="pill">loading</span><span id="headline"></span><span id="notes"></span></div>
+  <form id="nodes-form">
+    <input id="nodes-input" aria-label="Nodes to watch" placeholder="host:port, host:port, ...">
+    <button type="submit">Watch</button>
+  </form>
+</header>
+<main id="nodes"></main>
+<h2>Events</h2>
+<ol id="events"></ol>
+<p class="empty" id="events-empty">Nothing has changed since this page was opened.</p>
+<script>
+(function () {
+  "use strict";
+
+  var POLL_MS = 1000, TIMEOUT_MS = 900, HISTORY = 90, MAX_EVENTS = 60, RATE_WINDOW_MS = 5000;
+
+  // ---- pure logic: no DOM, no network (this is what is tested outside a browser) --------
+
+  // "host:port, host2:port" -> unique, valid addresses. Anything that is not a plain
+  // host (with an optional port) is dropped, so the text can never become part of a URL
+  // path, query or another origin.
+  function parseNodes(text) {
+    var seen = {}, out = [];
+    String(text || "").split(/[\s,]+/).forEach(function (part) {
+      if (/^[A-Za-z0-9._-]+(:\d{1,5})?$/.test(part) && !seen[part]) {
+        seen[part] = true;
+        out.push(part);
+      }
+    });
+    return out;
+  }
+
+  // A node the page was served by is asked relatively (no cross-origin request at all).
+  function nodeUrl(addr, ownHost) {
+    return addr === ownHost ? "/health" : "http://" + addr + "/health";
+  }
+
+  // Commits per second over the last RATE_WINDOW_MS of history, or null if unknown.
+  function commitRate(history) {
+    if (!history || history.length < 2) { return null; }
+    var newest = history[history.length - 1], oldest = newest;
+    for (var i = history.length - 2; i >= 0; i--) {
+      if (newest.t - history[i].t > RATE_WINDOW_MS) { break; }
+      oldest = history[i];
+    }
+    var seconds = (newest.t - oldest.t) / 1000;
+    if (seconds <= 0) { return null; }
+    return Math.max(0, newest.commit - oldest.commit) / seconds;
+  }
+
+  // states: [{addr, ok, snap}]. Reduces them to one verdict about the cluster.
+  function summarize(states) {
+    var up = states.filter(function (s) { return s.ok && s.snap; });
+    var out = { status: "healthy", headline: "", notes: [], leaders: [], term: 0,
+                reachable: up.length, total: states.length, quorum: 0 };
+    if (up.length === 0) {
+      out.status = "unreachable";
+      out.headline = "No node can be reached";
+      return out;
+    }
+    var claimants = up.filter(function (s) { return s.snap.role === "Leader"; });
+    up.forEach(function (s) { out.term = Math.max(out.term, s.snap.current_term); });
+    // A node that says it leads in a term the cluster has moved past is stale: it will
+    // step down as soon as it hears the newer term, and it is not the leader to report.
+    var leaders = claimants.filter(function (s) { return s.snap.current_term === out.term; });
+    var stale = claimants.filter(function (s) { return s.snap.current_term < out.term; });
+    out.leaders = leaders.map(function (s) { return s.snap.node_id; });
+
+    var members = 0;
+    (leaders.length ? leaders : up).forEach(function (s) {
+      members = Math.max(members, (s.snap.members || []).length);
+    });
+    out.quorum = Math.floor(members / 2) + 1;
+
+    var byTerm = {};
+    leaders.forEach(function (s) {
+      (byTerm[s.snap.current_term] = byTerm[s.snap.current_term] || []).push(s.snap.node_id);
+    });
+    var split = false;
+    Object.keys(byTerm).forEach(function (term) {
+      if (byTerm[term].length > 1) {
+        split = true;
+        out.notes.push("TWO LEADERS IN TERM " + term + ": nodes " + byTerm[term].join(", "));
+      }
+    });
+    if (stale.length) {
+      out.notes.push("node " + stale.map(function (s) { return s.snap.node_id; }).join(", ") +
+                     " still thinks it leads (older term)");
+    }
+
+    if (split) {
+      out.status = "error";
+      out.headline = "Inconsistent: more than one leader in the same term";
+    } else if (leaders.length === 0) {
+      out.status = "no-leader";
+      out.headline = "No leader (term " + out.term + ")";
+    } else if (up.length < out.quorum) {
+      out.status = "no-quorum";
+      out.headline = "Only " + up.length + " of " + out.quorum + " nodes needed for a majority are reachable";
+    } else if (up.length < states.length) {
+      out.status = "degraded";
+      out.headline = "Leader: node " + out.leaders[0] + " (term " + out.term + "), " +
+                     up.length + " of " + states.length + " nodes reachable";
+    } else {
+      out.headline = "Leader: node " + out.leaders[0] + " (term " + out.term + "), all " +
+                     states.length + " nodes reachable";
+    }
+    return out;
+  }
+
+  // What changed between two polls, as sentences. prev/next: {addr: {ok, snap}}.
+  function diffEvents(prev, next) {
+    var events = [];
+    Object.keys(next).forEach(function (addr) {
+      var a = prev[addr], b = next[addr];
+      if (!a) { return; }
+      var name = b.snap ? "node " + b.snap.node_id : (a.snap ? "node " + a.snap.node_id : addr);
+      if (a.ok && !b.ok) { events.push(name + " (" + addr + ") became unreachable"); }
+      if (!a.ok && b.ok) { events.push(name + " (" + addr + ") is reachable again"); }
+      if (a.ok && b.ok && a.snap && b.snap) {
+        if (a.snap.role !== b.snap.role) {
+          events.push(name + ": " + a.snap.role + " \u2192 " + b.snap.role +
+                      " (term " + b.snap.current_term + ")");
+        } else if (a.snap.current_term !== b.snap.current_term) {
+          events.push(name + " moved to term " + b.snap.current_term);
+        }
+        var am = (a.snap.members || []).join(","), bm = (b.snap.members || []).join(",");
+        if (am !== bm) { events.push(name + ": members are now [" + bm + "]"); }
+        if (b.snap.snapshots_installed > a.snap.snapshots_installed) {
+          events.push(name + " installed a snapshot from the leader");
+        }
+      }
+    });
+    return events;
+  }
+
+  var api = { parseNodes: parseNodes, nodeUrl: nodeUrl, commitRate: commitRate,
+              summarize: summarize, diffEvents: diffEvents };
+  if (typeof window !== "undefined") { window.QuorumDashboard = api; }
+  if (typeof document === "undefined" || !document.getElementById("nodes")) { return; }
+
+  // ---- the page ---------------------------------------------------------------------
+
+  var ownHost = location.host;
+  var nodes = [], state = {}, history = {}, started = Date.now();
+  var $ = function (id) { return document.getElementById(id); };
+
+  // Every element is built with createElement/textContent: the values shown come from
+  // other machines and must never be interpreted as markup.
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (text !== undefined && text !== null) { node.textContent = String(text); }
+    return node;
+  }
+
+  function row(dl, label, value, level) {
+    dl.appendChild(el("dt", "", label));
+    dl.appendChild(el("dd", level || "", value));
+  }
+
+  function spark(points) {
+    var NS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("class", "spark");
+    svg.setAttribute("viewBox", "0 0 120 28");
+    svg.setAttribute("preserveAspectRatio", "none");
+    if (points.length > 1) {
+      var lo = points[0], hi = points[points.length - 1], span = Math.max(1, hi - lo);
+      var path = points.map(function (v, i) {
+        return (i / (points.length - 1) * 120).toFixed(1) + "," + (26 - (v - lo) / span * 24).toFixed(1);
+      }).join(" ");
+      var line = document.createElementNS(NS, "polyline");
+      line.setAttribute("points", path);
+      svg.appendChild(line);
+    }
+    return svg;
+  }
+
+  function card(addr) {
+    var s = state[addr], snap = s && s.snap;
+    var root = el("section", "card");
+    var head = el("div", "head");
+    var title = el("div");
+    title.appendChild(el("span", "name", snap ? "Node " + snap.node_id : addr));
+    title.appendChild(document.createTextNode(" "));
+    title.appendChild(el("span", "addr", addr));
+    head.appendChild(title);
+
+    if (!s || !s.ok || !snap) {
+      root.className = "card down";
+      head.appendChild(el("span", "badge down", s ? "unreachable" : "waiting"));
+      root.appendChild(head);
+      return root;
+    }
+    var role = snap.role.toLowerCase();
+    if (role === "leader") { root.className = "card leader"; }
+    head.appendChild(el("span", "badge " + role, snap.role));
+    root.appendChild(head);
+
+    var dl = el("dl");
+    var lag = Math.max(0, snap.commit_index - snap.last_applied);
+    var rate = commitRate(history[addr]);
+    row(dl, "Term", snap.current_term);
+    row(dl, "Commit / applied", snap.commit_index + " / " + snap.last_applied, lag > 50 ? "warn" : "");
+    row(dl, "Log (last index, base)", snap.log_len + ", " + snap.log_base);
+    row(dl, "Snapshot at", snap.snapshot_index);
+    row(dl, "Members", "[" + (snap.members || []).join(", ") + "]");
+    if ((snap.learners || []).length) { row(dl, "Learners", "[" + snap.learners.join(", ") + "]", "warn"); }
+    row(dl, "Commits / s", rate === null ? "\u2013" : rate.toFixed(1));
+    row(dl, "Log syncs", snap.wal_syncs);
+    row(dl, "Dropped messages", snap.dropped_messages, snap.dropped_messages > 0 ? "warn" : "");
+    row(dl, "Elections started / won / lost",
+        snap.elections_started + " / " + snap.leader_elections_won + " / " + snap.leadership_lost);
+    row(dl, "Snapshots taken / installed", snap.snapshots_taken + " / " + snap.snapshots_installed);
+    root.appendChild(dl);
+
+    root.appendChild(spark((history[addr] || []).map(function (p) { return p.commit; })));
+
+    if ((snap.peers || []).length) {
+      var table = el("table");
+      var hr = el("tr");
+      ["Peer", "Match", "Lag", "Last ack", ""].forEach(function (h) { hr.appendChild(el("th", "", h)); });
+      table.appendChild(hr);
+      snap.peers.forEach(function (p) {
+        var tr = el("tr");
+        var behind = Math.max(0, snap.log_len - p.match_index);
+        tr.appendChild(el("td", "", "node " + p.id));
+        tr.appendChild(el("td", "", p.match_index));
+        tr.appendChild(el("td", behind > 100 ? "bad" : "", behind));
+        tr.appendChild(el("td", "", p.millis_since_ack === null ? "never" : p.millis_since_ack + " ms"));
+        tr.appendChild(el("td", "", (p.snapshot_transfer ? "snapshot " : "") + (p.learner ? "learner" : "")));
+        table.appendChild(tr);
+      });
+      root.appendChild(table);
+    }
+    return root;
+  }
+
+  function render() {
+    var list = nodes.map(function (a) { return state[a] || { addr: a, ok: false, snap: null }; });
+    var sum = summarize(list);
+    var status = $("status");
+    status.textContent = sum.status.replace("-", " ");
+    status.className = "pill " + sum.status;
+    $("headline").textContent = sum.headline;
+    $("notes").textContent = sum.notes.join(" \u00b7 ");
+
+    var main = $("nodes");
+    while (main.firstChild) { main.removeChild(main.firstChild); }
+    nodes.forEach(function (addr) { main.appendChild(card(addr)); });
+  }
+
+  function addEvents(messages) {
+    var list = $("events");
+    messages.forEach(function (m) {
+      var li = el("li");
+      li.appendChild(el("time", "", new Date().toLocaleTimeString()));
+      li.appendChild(document.createTextNode(m));
+      list.insertBefore(li, list.firstChild);
+    });
+    while (list.children.length > MAX_EVENTS) { list.removeChild(list.lastChild); }
+    $("events-empty").style.display = list.children.length ? "none" : "";
+  }
+
+  async function poll(addr) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, TIMEOUT_MS);
+    try {
+      var r = await fetch(nodeUrl(addr, ownHost), { signal: ctl.signal, cache: "no-store" });
+      if (!r.ok) { throw new Error("HTTP " + r.status); }
+      return { addr: addr, ok: true, snap: await r.json(), at: Date.now() };
+    } catch (e) {
+      return { addr: addr, ok: false, snap: state[addr] ? state[addr].snap : null, at: Date.now() };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function tick(generation) {
+    var results = await Promise.all(nodes.map(poll));
+    if (generation !== started) { return; }
+    var prev = state, next = {};
+    results.forEach(function (r) {
+      next[r.addr] = r;
+      if (r.ok && r.snap) {
+        var h = history[r.addr] = history[r.addr] || [];
+        h.push({ t: r.at, commit: r.snap.commit_index });
+        if (h.length > HISTORY) { h.shift(); }
+      }
+    });
+    addEvents(diffEvents(prev, next));
+    state = next;
+    render();
+    setTimeout(function () { tick(generation); }, POLL_MS);
+  }
+
+  function watch(list) {
+    nodes = list.length ? list : [ownHost];
+    state = {}; history = {};
+    started = Date.now();
+    $("nodes-input").value = nodes.join(", ");
+    var url = new URL(location.href);
+    url.searchParams.set("nodes", nodes.join(","));
+    history_replace(url);
+    render();
+    tick(started);
+  }
+
+  function history_replace(url) {
+    try { window.history.replaceState(null, "", url); } catch (e) { /* not essential */ }
+  }
+
+  $("nodes-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    watch(parseNodes($("nodes-input").value));
+  });
+  watch(parseNodes(new URL(location.href).searchParams.get("nodes")));
+})();
+</script>
+</body>
+</html>

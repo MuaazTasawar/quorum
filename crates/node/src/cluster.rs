@@ -14,6 +14,7 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{NodeConfig, ReadMode};
+use crate::metrics::Histogram;
 
 /// A write command submitted by a client. `respond_to` is resolved once the
 /// command's log entry is actually committed and applied - not when it's
@@ -147,7 +148,7 @@ impl std::fmt::Display for AdminRejection {
 
 /// Read-only view of cluster state, published after every event-loop
 /// iteration for the dashboard to stream over WebSocket.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ClusterSnapshot {
     pub node_id: NodeId,
     pub role: String,
@@ -175,6 +176,34 @@ pub struct ClusterSnapshot {
     pub snapshots_taken: u64,
     /// Snapshots this process has received from a leader and installed.
     pub snapshots_installed: u64,
+    /// Elections this node has started since it started.
+    pub elections_started: u64,
+    /// Times this node has become leader.
+    pub leader_elections_won: u64,
+    /// Times this node has stopped being leader.
+    pub leadership_lost: u64,
+    /// How long writing entries to the log (including the flush) has taken.
+    pub wal_append: Histogram,
+    /// How long writing snapshots has taken.
+    pub snapshot_write: Histogram,
+    /// Replication progress of every other node, as seen by a leader (empty otherwise).
+    pub peers: Vec<PeerSnapshot>,
+}
+
+/// How far one other node has got, from the leader's point of view.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PeerSnapshot {
+    pub id: NodeId,
+    /// Highest log index known to be on that node.
+    pub match_index: u64,
+    /// The next entry the leader will send it.
+    pub next_index: u64,
+    /// How long ago it last answered; `None` if it never has since this leader took over.
+    pub millis_since_ack: Option<u64>,
+    /// True while the leader is sending it a snapshot.
+    pub snapshot_transfer: bool,
+    /// True if it is being brought up to date and is not yet a voting member.
+    pub learner: bool,
 }
 
 pub struct ClusterHandle {
@@ -302,6 +331,11 @@ pub struct Cluster {
     snapshots_taken: u64,
     /// Snapshots received from a leader and installed since this process started.
     snapshots_installed: u64,
+    elections_started: u64,
+    leader_elections_won: u64,
+    leadership_lost: u64,
+    wal_append: Histogram,
+    snapshot_write: Histogram,
     /// Leader only: the snapshot being sent to each follower that needs one, and how
     /// far it has got.
     snapshot_sends: HashMap<NodeId, SnapshotSender>,
@@ -398,6 +432,7 @@ impl Cluster {
             log_base: base_index,
             snapshots_taken: 0,
             snapshots_installed: 0,
+            ..ClusterSnapshot::default()
         });
 
         let mut cluster = Self {
@@ -425,6 +460,11 @@ impl Cluster {
             connector,
             snapshots_taken: 0,
             snapshots_installed: 0,
+            elections_started: 0,
+            leader_elections_won: 0,
+            leadership_lost: 0,
+            wal_append: Histogram::default(),
+            snapshot_write: Histogram::default(),
             snapshot_sends: HashMap::new(),
             snapshot_cache: None,
             incoming_snapshot: None,
@@ -528,6 +568,8 @@ impl Cluster {
     /// true now, so the client is redirected like any other request to a follower.
     /// Without this, a deposed leader would leave its clients waiting forever.
     fn abort_pending_requests(&mut self) {
+        // Only ever reached when this node has just stopped being leader.
+        self.leadership_lost += 1;
         if !self.pending_commands.is_empty() {
             info!(
                 pending = self.pending_commands.len(),
@@ -688,11 +730,17 @@ impl Cluster {
                 if let Some(from_index) = effect.truncated_from {
                     persist_must(self.persistence.truncate_from(from_index), "log truncate");
                 }
-                // One fsync for the whole batch, however many entries it carries.
+                // One fsync for the whole batch, however many entries it carries. A
+                // heartbeat carries none and writes nothing, so it is not timed: its
+                // near-zero "duration" would swamp the real appends in the histogram.
+                let started = Instant::now();
                 persist_must(
                     self.persistence.append_batch(&effect.appended),
                     "log append",
                 );
+                if !effect.appended.is_empty() {
+                    self.wal_append.observe(started.elapsed());
+                }
 
                 // A configuration entry is in effect as soon as it is in the log,
                 // and one that was truncated away must stop counting.
@@ -773,7 +821,9 @@ impl Cluster {
     /// the WAL. Used for entries this node creates itself as leader.
     fn append_to_wal(&mut self, index: u64) {
         if let Some(entry) = self.log.get(index) {
+            let started = Instant::now();
             persist_must(self.persistence.append(entry), "log append");
+            self.wal_append.observe(started.elapsed());
         }
     }
 
@@ -900,6 +950,7 @@ impl Cluster {
     }
 
     fn begin_election(&mut self) {
+        self.elections_started += 1;
         self.pre_vote = None;
         let req = start_election(
             &mut self.persistent,
@@ -935,6 +986,7 @@ impl Cluster {
     }
 
     fn become_leader(&mut self) {
+        self.leader_elections_won += 1;
         info!(term = self.persistent.current_term, "became leader");
         self.volatile.role = Role::Leader;
         self.known_leader = Some(self.config.id);
@@ -1327,7 +1379,9 @@ impl Cluster {
 
         // Durable BEFORE anything is replicated or counted toward a majority.
         let new_entries = self.log.entries_after(first - 1);
+        let started = Instant::now();
         persist_must(self.persistence.append_batch(&new_entries), "log append");
+        self.wal_append.observe(started.elapsed());
 
         self.broadcast_append_entries();
 
@@ -1471,6 +1525,7 @@ impl Cluster {
             .save_snapshot_only(metadata, &self.kv_store)
         {
             Ok(()) => {
+                self.snapshot_write.observe(started.elapsed());
                 self.snapshots_taken += 1;
                 info!(
                     index,
@@ -1886,7 +1941,43 @@ impl Cluster {
             log_base: self.log.base_index(),
             snapshots_taken: self.snapshots_taken,
             snapshots_installed: self.snapshots_installed,
+            elections_started: self.elections_started,
+            leader_elections_won: self.leader_elections_won,
+            leadership_lost: self.leadership_lost,
+            wal_append: self.wal_append.clone(),
+            snapshot_write: self.snapshot_write.clone(),
+            peers: self.peer_snapshots(),
         });
+    }
+
+    /// Replication progress of every other node, if this node is the leader.
+    fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
+        if self.volatile.role != Role::Leader {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let mut ids: Vec<NodeId> = self
+            .membership
+            .ids()
+            .chain(self.learners.keys().copied())
+            .filter(|&id| id != self.config.id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(|id| PeerSnapshot {
+                id,
+                match_index: self.leader_state.match_index.get(&id).copied().unwrap_or(0),
+                next_index: self.leader_state.next_index.get(&id).copied().unwrap_or(0),
+                millis_since_ack: self
+                    .leader_state
+                    .last_ack
+                    .get(&id)
+                    .map(|at| now.saturating_duration_since(*at).as_millis() as u64),
+                snapshot_transfer: self.snapshot_sends.contains_key(&id),
+                learner: self.learners.contains_key(&id),
+            })
+            .collect()
     }
 }
 

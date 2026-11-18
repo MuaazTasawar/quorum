@@ -17,3 +17,5 @@ crates/*/target
 .vscode/
 .DS_Store
 Thumbs.db
+
+*.log

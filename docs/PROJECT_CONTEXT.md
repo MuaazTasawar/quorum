@@ -121,8 +121,32 @@ full suite twice, new suites five times stable; real 3-process run (SDK example,
 distinct, 400/413/415/421/404 as designed, old JSON client unchanged, SDK works after kill -9 of the leader).
 Cargo.lock changed (client -> storage, node dev-dep -> client): commit it, CI uses --locked.
 
+## Phase 24 (done): observability
+Full catalog, scrape config, alert rules and dashboard notes: docs/observability.md.
+- GET /metrics: Prometheus text 0.0.4 (node/metrics.rs renders; ClusterSnapshot carries the data). Gauges for role (one-hot),
+  is_leader, term, commit/applied/last-log/log-base/snapshot indexes, apply lag, members, learners; counters for wal syncs, dropped
+  peer messages, snapshots taken/installed, elections started/won, leadership lost; histograms (14 latency buckets) for WAL append,
+  snapshot write and HTTP latency; http_requests_total{route,method,code}; leader-only per-peer gauges.
+- The HTTP middleware labels by the route TEMPLATE (MatchedPath), "unmatched" otherwise, unknown methods become OTHER: clients
+  cannot create series. CORS (`*`) only on GET /health and GET /metrics.
+- GET /dashboard: one self-contained page (CSP: nothing external, no framing, no forms), polls each node's /health from the
+  browser; `?nodes=host:port,...` (regex-validated). Pure logic is exposed as window.QuorumDashboard.
+- Bugs found by verification and fixed in this phase: (1) the dashboard reported a lone stale leader (older term than the rest of
+  the cluster) as a healthy leader of the newest term; it is now shown as stale and the cluster as having no current leader.
+  (2) the follower AppendEntries path timed heartbeats (no entries, no write) as WAL appends: followers showed 589 observations
+  against 201 fsyncs and the near-zero samples would have hidden slow fsyncs in the quantiles; only batches with entries are timed.
+- Tests: node/tests/observability_test.rs (9 tests: strict exposition parser, values vs /health, one leader, peers, election
+  counters over a leader change, snapshot metrics, keys never create series, CORS/CSP, heartbeats not timed);
+  node/tests/dashboard_logic.js (30 checks on the real dashboard.html in a Node vm; run by CI); 13 new node unit tests.
+- Verified: 32 mutation checks (21 Rust, 11 JS) all killed; 25 idle + 15 CPU-contended repeat runs of the new tests, 0 failures;
+  real 3-process cluster over TCP (load, leader kill + restart): scrapes accepted by the prometheus_client text parser, counters
+  right across the failover; every metric named in the alert rules exists in a real scrape.
+- NOT verified: the dashboard was never rendered in a real browser (its DOM/polling code is only syntax-checked and its pure
+  functions tested); the alert rules were checked for YAML validity and metric names but never loaded into Prometheus/promtool;
+  no slow-fsync shim run (the change does not alter what is written or when).
+
 ## Remaining plan
-24 observability (Prometheus /metrics, dashboard) | 25 security (TLS, auth, certgen) | 26 chaos CLI v2 + Docker volumes
+25 security (TLS, auth, certgen) | 26 chaos CLI v2 + Docker volumes
 27 deterministic simulation + linearizability checker | then regenerate the README.
 
 ## How we work
@@ -158,8 +182,14 @@ Cargo.lock changed (client -> storage, node dev-dep -> client): commit it, CI us
 - Shell checks of acknowledgements must require "applied":true: a not-leader redirect is HTTP 200 with is_leader:false, and a dead connection is an empty body.
 - Wire format changes (new RPC fields) need all nodes rebuilt together; WAL/command encodings only append variants.
 
+- A mutation harness that is killed mid-run leaves the mutated file in place: always diff the tree against a backup afterwards.
+- `pkill -f`/`pgrep -f` match the calling shell's own command line (it killed the shell once, and once reported a finished job as running): use `pkill -x node` or look in /proc.
+- Never point two git worktrees at one CARGO_TARGET_DIR: the two builds of the same crate contaminated each other (spurious E0560).
+- Process-local counters reset on restart; use rate()/increase(). Leader-only per-peer metrics move with leadership.
+
 ## Known limitations (roadmap)
 A dead member pins the leader's log until it is removed; snapshot work runs inside the event loop (writing, decoding a received one,
 and the leader reading the file all stall it in proportion to state size + fsync); a snapshot is held fully in memory while being sent or
 received (1 GiB cap) and a transfer interrupted by a restart starts over; transfer is stop-and-wait (one chunk per round trip);
 WAL has no per-record checksums; no TLS/auth; the SDK has no request de-duplication (hence no automatic retry of unknown writes); chaos CLI is Windows and 3-node only.
+No directory lock on STORAGE_DIR: a second process started on the same directory recovers (opens) the WAL before it fails to bind its ports. The dashboard's rendering has never been viewed in a browser.

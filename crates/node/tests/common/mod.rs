@@ -468,6 +468,7 @@ impl TestCluster {
             request_timeout,
             admin_timeout: request_timeout * 10,
             max_value_bytes,
+            http_metrics: Default::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

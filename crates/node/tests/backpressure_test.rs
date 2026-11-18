@@ -61,6 +61,7 @@ fn idle_snapshot() -> ClusterSnapshot {
         log_base: 0,
         snapshots_taken: 0,
         snapshots_installed: 0,
+        ..ClusterSnapshot::default()
     }
 }
 
@@ -86,6 +87,7 @@ async fn stuck_api(
         request_timeout: timeout,
         admin_timeout: timeout * 10,
         max_value_bytes: node::config::DEFAULT_MAX_VALUE_BYTES,
+        http_metrics: Default::default(),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

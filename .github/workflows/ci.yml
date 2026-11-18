@@ -31,6 +31,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked --no-fail-fast
 
+      - name: Dashboard logic tests
+        run: node crates/node/tests/dashboard_logic.js
+
       # Hard gates. Run `cargo fmt --all` before committing. If a new stable toolchain
       # adds a lint that breaks CI on code that has not changed, fix the lint (or add
       # `continue-on-error: true` back to the Clippy step while you do).

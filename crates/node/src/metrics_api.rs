@@ -4,16 +4,19 @@ use crate::cluster::{
     ClusterSnapshot, MembershipChange, QueryResult,
 };
 use crate::errors::AppError;
+use crate::metrics::HttpMetrics;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, PathRejection};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use storage::Command;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -33,6 +36,8 @@ pub struct AppState {
     pub admin_timeout: Duration,
     /// Largest value, in bytes, a write may carry.
     pub max_value_bytes: usize,
+    /// What the HTTP layer has seen, for `/metrics`.
+    pub http_metrics: Arc<HttpMetrics>,
 }
 
 impl AppState {
@@ -45,6 +50,7 @@ impl AppState {
             request_timeout,
             admin_timeout: request_timeout * ADMIN_TIMEOUT_FACTOR,
             max_value_bytes: crate::config::DEFAULT_MAX_VALUE_BYTES,
+            http_metrics: Arc::new(HttpMetrics::default()),
         }
     }
 
@@ -65,6 +71,8 @@ fn body_limit(max_value_bytes: usize) -> usize {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .route("/dashboard", get(dashboard))
         .route("/kv/{key}", get(get_key))
         .route("/kv/{key}", put(put_key))
         .route("/kv/{key}", delete(delete_key))
@@ -72,11 +80,80 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/members/{id}", delete(remove_member))
         .route("/ws", get(ws_handler))
         .layer(DefaultBodyLimit::max(body_limit(state.max_value_bytes)))
+        .layer(middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state)
+}
+
+/// Routes whose answer is read-only state about the node, which a dashboard served by
+/// ANOTHER node must be able to read. Nothing that changes data is ever opened up.
+fn is_cross_origin_readable(route: &str) -> bool {
+    matches!(route, "/health" | "/metrics")
+}
+
+/// Counts and times every request under its route TEMPLATE (`/kv/{key}`, not the key a
+/// client happened to use, which would give every key its own series), and lets other
+/// origins read the read-only endpoints.
+async fn observe(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "unmatched".to_string(), |p| p.as_str().to_string());
+    let started = Instant::now();
+
+    let mut response = next.run(request).await;
+
+    state.http_metrics.record(
+        &route,
+        method.as_str(),
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    if method == axum::http::Method::GET && is_cross_origin_readable(&route) {
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+    }
+    response
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.snapshot_rx.borrow().clone())
+}
+
+/// Prometheus scrape endpoint.
+async fn metrics(State(state): State<AppState>) -> Response {
+    let snapshot = state.snapshot_rx.borrow().clone();
+    let body = crate::metrics::render(&snapshot, &state.http_metrics.snapshot());
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// The cluster dashboard: one self-contained page that polls the nodes' `/health`.
+async fn dashboard() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            // The page runs only its own inline script, loads nothing from anywhere,
+            // may be fetched from any node (connect-src), and cannot be framed.
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+                 connect-src *; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        include_str!("dashboard.html"),
+    )
+        .into_response()
 }
 
 /// Queues a request for the cluster without ever waiting for room. A full queue
