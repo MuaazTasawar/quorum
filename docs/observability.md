@@ -133,6 +133,11 @@ groups:
         annotations: {summary: "More than 5% of key requests are failing with 5xx"}
 ```
 
+If `QuorumLeadershipChurn` fires together with `QuorumSlowWalAppend`, the disk is too slow for the election timeout (a leader
+that is flushing sends no heartbeats): move `QUORUM_STORAGE_DIR` to faster storage or raise `QUORUM_ELECTION_TIMEOUT_MS`
+(default 1000; it should stay well above the p99 of `quorum_wal_append_duration_seconds`). The node logs the timing it runs on
+at startup (`election timing`).
+
 A dead voting member pins the leader's log until it is removed (a known limitation), so `QuorumPeerSilent` is
 also the early warning for log growth.
 

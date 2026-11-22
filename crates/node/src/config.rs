@@ -1,4 +1,4 @@
-use raft_core::{Membership, NodeId};
+use raft_core::{ElectionTimeoutConfig, Membership, NodeId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,6 +14,16 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(3000);
 /// catches up (wrong address, crashed, far too slow) must not be able to hold the
 /// single membership-change slot forever.
 pub const DEFAULT_CATCH_UP_TIMEOUT: Duration = Duration::from_millis(20_000);
+
+/// The shortest time a follower waits for its leader before it starts an election; it waits a
+/// random time between this and twice this. The leader sends heartbeats at a quarter of it.
+///
+/// It has to be comfortably longer than the slowest disk flush a node will ever do, because a
+/// node that is busy flushing sends no heartbeats and answers no one: with a timeout shorter
+/// than a flush, a write burst on a slow disk makes followers elect a new leader again and
+/// again. 1 s is the common default for this (etcd uses it); lower it only for fast storage
+/// where quick failover matters more.
+pub const DEFAULT_ELECTION_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Snapshot after this many applied entries, by default. A snapshot bounds the disk the
 /// log uses and the time a restart spends replaying it; a follower or new node that has
@@ -100,6 +110,9 @@ pub struct NodeConfig {
     pub join: bool,
     /// How long a joining node gets to catch up before the leader abandons it.
     pub catch_up_timeout: Duration,
+    /// How long a follower waits for its leader before it starts an election, and how often
+    /// the leader sends heartbeats (derived from it). See [`DEFAULT_ELECTION_TIMEOUT`].
+    pub election_timeout: ElectionTimeoutConfig,
     /// Take a snapshot once this many entries have been applied since the last one.
     /// 0 turns snapshots, and with them log compaction, off.
     pub snapshot_threshold: u64,
@@ -141,6 +154,10 @@ impl NodeConfig {
     ///                                     existing cluster, PEERS lists its members)
     ///   QUORUM_CATCH_UP_TIMEOUT_MS=20000 (optional; how long a joining node gets
     ///                                     to catch up with the leader)
+    ///   QUORUM_ELECTION_TIMEOUT_MS=1000  (optional; 50..=60000. A follower waits this long
+    ///                                     (to twice this) for its leader before electing;
+    ///                                     heartbeats are sent at a quarter of it. Keep it well
+    ///                                     above the slowest disk flush on the machine)
     ///   QUORUM_SNAPSHOT_THRESHOLD=10000  (optional; snapshot after this many applied
     ///                                     entries; 0 = never)
     ///   QUORUM_SNAPSHOT_CHUNK_BYTES=65536 (optional; size of each piece of a snapshot
@@ -175,6 +192,9 @@ impl NodeConfig {
         let catch_up_timeout =
             parse_catch_up_timeout(std::env::var("QUORUM_CATCH_UP_TIMEOUT_MS").ok().as_deref())?;
 
+        let election_timeout =
+            parse_election_timeout(std::env::var("QUORUM_ELECTION_TIMEOUT_MS").ok().as_deref())?;
+
         let snapshot_threshold = parse_count(
             "QUORUM_SNAPSHOT_THRESHOLD",
             std::env::var("QUORUM_SNAPSHOT_THRESHOLD").ok().as_deref(),
@@ -204,6 +224,7 @@ impl NodeConfig {
             limits,
             join,
             catch_up_timeout,
+            election_timeout,
             snapshot_threshold,
             snapshot_chunk_bytes: snapshot_chunk_bytes as usize,
             snapshot_retain,
@@ -323,6 +344,25 @@ pub fn parse_catch_up_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
     Ok(Duration::from_millis(millis))
 }
 
+/// Parses `QUORUM_ELECTION_TIMEOUT_MS`, defaulting to [`DEFAULT_ELECTION_TIMEOUT`].
+///
+/// Below 50 ms the heartbeat (a quarter of it) would be a few milliseconds, which no network or
+/// scheduler can keep; above a minute a dead leader would go unreplaced for far too long.
+pub fn parse_election_timeout(raw: Option<&str>) -> anyhow::Result<ElectionTimeoutConfig> {
+    let Some(raw) = raw else {
+        return Ok(ElectionTimeoutConfig::from_min(DEFAULT_ELECTION_TIMEOUT));
+    };
+    let millis: u64 = raw.trim().parse().map_err(|_| {
+        anyhow::anyhow!("QUORUM_ELECTION_TIMEOUT_MS must be a whole number, got {raw:?}")
+    })?;
+    if !(50..=60_000).contains(&millis) {
+        anyhow::bail!("QUORUM_ELECTION_TIMEOUT_MS must be between 50 and 60000, got {millis}");
+    }
+    Ok(ElectionTimeoutConfig::from_min(Duration::from_millis(
+        millis,
+    )))
+}
+
 /// Reads `QUORUM_REQUEST_TIMEOUT_MS` (milliseconds), defaulting to
 /// [`DEFAULT_REQUEST_TIMEOUT`].
 pub fn request_timeout_from_env() -> anyhow::Result<Duration> {
@@ -347,6 +387,31 @@ pub fn parse_request_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn election_timeout_defaults_to_one_second_up_to_two() {
+        let cfg = parse_election_timeout(None).unwrap();
+        assert_eq!(cfg.min, Duration::from_millis(1000));
+        assert_eq!(cfg.max, Duration::from_millis(2000));
+        assert_eq!(cfg.heartbeat_interval(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn election_timeout_parses_milliseconds_and_trims() {
+        let cfg = parse_election_timeout(Some(" 400 ")).unwrap();
+        assert_eq!(cfg.min, Duration::from_millis(400));
+        assert_eq!(cfg.max, Duration::from_millis(800));
+    }
+
+    #[test]
+    fn election_timeout_rejects_nonsense_and_out_of_range_values() {
+        for bad in ["", "soon", "-5", "1.5", "0", "49", "60001", "99999999"] {
+            assert!(parse_election_timeout(Some(bad)).is_err(), "{bad:?}");
+        }
+        // The limits themselves are allowed.
+        assert!(parse_election_timeout(Some("50")).is_ok());
+        assert!(parse_election_timeout(Some("60000")).is_ok());
+    }
 
     #[test]
     fn request_timeout_defaults_when_unset() {
@@ -471,6 +536,7 @@ mod tests {
             limits: Limits::default(),
             join,
             catch_up_timeout: DEFAULT_CATCH_UP_TIMEOUT,
+            election_timeout: ElectionTimeoutConfig::default(),
             snapshot_threshold: 0,
             snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES as usize,
             snapshot_retain: DEFAULT_SNAPSHOT_RETAIN,

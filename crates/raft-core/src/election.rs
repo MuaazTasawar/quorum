@@ -26,6 +26,18 @@ impl Default for ElectionTimeoutConfig {
 }
 
 impl ElectionTimeoutConfig {
+    /// Timeouts drawn from `min` up to twice `min`: the same 1:2 spread as the paper's
+    /// 150-300 ms, so one number is enough to configure it.
+    pub fn from_min(min: Duration) -> Self {
+        Self { min, max: min * 2 }
+    }
+
+    /// How often a leader sends heartbeats: a quarter of the shortest election timeout, so
+    /// a follower hears from a healthy leader several times before it could give up on it.
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.min / 4
+    }
+
     pub fn random_timeout(&self) -> Duration {
         let min_ms = self.min.as_millis() as u64;
         let max_ms = self.max.as_millis() as u64;
@@ -185,6 +197,30 @@ pub fn handle_pre_vote(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn from_min_spreads_the_timeout_between_min_and_twice_min() {
+        let cfg = ElectionTimeoutConfig::from_min(Duration::from_millis(1000));
+        assert_eq!(cfg.min, Duration::from_millis(1000));
+        assert_eq!(cfg.max, Duration::from_millis(2000));
+        for _ in 0..200 {
+            let t = cfg.random_timeout();
+            assert!(t >= cfg.min && t <= cfg.max, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn the_heartbeat_is_a_quarter_of_the_shortest_timeout() {
+        assert_eq!(
+            ElectionTimeoutConfig::from_min(Duration::from_millis(1000)).heartbeat_interval(),
+            Duration::from_millis(250)
+        );
+        // The default keeps its historical 37.5 ms heartbeat.
+        assert_eq!(
+            ElectionTimeoutConfig::default().heartbeat_interval(),
+            Duration::from_micros(37_500)
+        );
+    }
+
     use super::*;
 
     fn fresh_state() -> (PersistentState, VolatileState, Log) {

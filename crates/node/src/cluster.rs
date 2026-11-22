@@ -413,7 +413,7 @@ impl Cluster {
         let (command_tx, command_rx) = mpsc::channel(capacity);
         let (query_tx, query_rx) = mpsc::channel(capacity);
         let (admin_tx, admin_rx) = mpsc::channel(capacity);
-        let election_timeout = ElectionTimeoutConfig::default();
+        let election_timeout = config.election_timeout;
         let election_deadline = Instant::now() + election_timeout.random_timeout();
 
         let (snapshot_tx, snapshot_rx) = watch::channel(ClusterSnapshot {
@@ -497,7 +497,7 @@ impl Cluster {
     /// otherwise followers time out and start needless elections even while
     /// a healthy leader is alive. A quarter of the minimum is a conservative margin.
     fn heartbeat_interval(&self) -> Duration {
-        self.election_timeout.min / 4
+        self.election_timeout.heartbeat_interval()
     }
 
     pub async fn run(mut self) {
@@ -2067,6 +2067,24 @@ mod tests {
         limits: Limits,
         connector: PeerConnector,
     ) -> (Cluster, Outputs) {
+        make_cluster_timed(
+            dir,
+            peer_ids,
+            read_mode,
+            limits,
+            connector,
+            ElectionTimeoutConfig::default(),
+        )
+    }
+
+    fn make_cluster_timed(
+        dir: &Path,
+        peer_ids: &[NodeId],
+        read_mode: ReadMode,
+        limits: Limits,
+        connector: PeerConnector,
+        election_timeout: ElectionTimeoutConfig,
+    ) -> (Cluster, Outputs) {
         let peers = peer_ids.iter().map(|&id| (id, String::new())).collect();
         let config = NodeConfig {
             id: 1,
@@ -2078,6 +2096,7 @@ mod tests {
             limits,
             join: false,
             catch_up_timeout: crate::config::DEFAULT_CATCH_UP_TIMEOUT,
+            election_timeout,
             snapshot_threshold: 0,
             snapshot_chunk_bytes: crate::config::DEFAULT_SNAPSHOT_CHUNK_BYTES as usize,
             snapshot_retain: 0,
@@ -2691,6 +2710,37 @@ mod tests {
     }
 
     // ---- pre-vote -----------------------------------------------------------
+
+    #[test]
+    fn the_configured_election_timeout_is_the_one_the_cluster_runs_on() {
+        let dir = TestDir::new();
+        let timing = ElectionTimeoutConfig::from_min(Duration::from_millis(1200));
+        let before = Instant::now();
+        let (cluster, _outputs) = make_cluster_timed(
+            dir.path(),
+            &[2, 3],
+            ReadMode::Linearizable,
+            Limits::default(),
+            discarding_connector(),
+            timing,
+        );
+        assert_eq!(cluster.election_timeout.min, Duration::from_millis(1200));
+        assert_eq!(cluster.election_timeout.max, Duration::from_millis(2400));
+        // The first deadline is drawn from the configured range, not the 150-300 ms default.
+        let wait = cluster.election_deadline.duration_since(before);
+        assert!(wait >= Duration::from_millis(1200), "{wait:?}");
+        assert!(wait <= Duration::from_millis(2500), "{wait:?}");
+        // And the leader's heartbeat follows it.
+        assert_eq!(cluster.heartbeat_interval(), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn the_default_cluster_still_uses_the_fast_range_the_tests_rely_on() {
+        let dir = TestDir::new();
+        let cluster = build_cluster(&dir, &[2, 3]);
+        assert_eq!(cluster.election_timeout.min, Duration::from_millis(150));
+        assert_eq!(cluster.election_timeout.max, Duration::from_millis(300));
+    }
 
     #[test]
     fn an_election_timeout_starts_a_pre_vote_and_changes_no_state() {

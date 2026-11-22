@@ -246,6 +246,9 @@ impl TestCluster {
             limits: self.limits,
             join: self.joiners.contains(&id),
             catch_up_timeout: self.catch_up_timeout,
+            // Tests keep the fast 150-300 ms range: their disks are quick and a failover
+            // that takes a second would make every cluster test slower for no reason.
+            election_timeout: raft_core::ElectionTimeoutConfig::default(),
             snapshot_threshold: self.snapshot_threshold,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
             snapshot_retain: self.snapshot_retain,

@@ -16,7 +16,7 @@ Repo: github.com/MuaazTasawar/quorum. Windows + PowerShell workflow. Rust worksp
 15 request lifecycle: 503/504 + outcome_unknown (ed57b76) | 16 pre-vote + check-quorum (2615889) + fix 5232505
 17 linearizable reads / ReadIndex (138eae5) | 18 backpressure + group commit + torn-WAL recovery (7a0af30)
 State at 7a0af30: 189 tests, 0 warnings (259 after Phase 19). HTTP: PUT/GET/DELETE /kv/{key}, GET /health, GET /ws.
-Settings: QUORUM_NODE_ID, LISTEN_ADDR, METRICS_ADDR, PEERS, STORAGE_DIR, REQUEST_TIMEOUT_MS, LOCAL_READS, CHANNEL_CAPACITY, MAX_BATCH, JOIN, CATCH_UP_TIMEOUT_MS, SNAPSHOT_THRESHOLD, SNAPSHOT_RETAIN.
+Settings: QUORUM_NODE_ID, LISTEN_ADDR, METRICS_ADDR, PEERS, STORAGE_DIR, REQUEST_TIMEOUT_MS, LOCAL_READS, CHANNEL_CAPACITY, MAX_BATCH, JOIN, CATCH_UP_TIMEOUT_MS, SNAPSHOT_THRESHOLD, SNAPSHOT_RETAIN, ELECTION_TIMEOUT_MS (default 1000; see Phase 24.1).
 
 ## Phase 19 (done): membership changes
 Single-server changes through the log. Effective on APPEND, undone if truncated. One change in flight at a time. A new
@@ -145,6 +145,23 @@ Full catalog, scrape config, alert rules and dashboard notes: docs/observability
   functions tested); the alert rules were checked for YAML validity and metric names but never loaded into Prometheus/promtool;
   no slow-fsync shim run (the change does not alter what is written or when).
 
+## Phase 24.1 (done): configurable election timeout, 1 s default
+- Found by running three real nodes on the user's laptop: the repo's drive (E:) is a spinning HDD (25 ms for ONE 4 KB flush,
+  100-900 ms with three nodes flushing at once; the SSD does it in ~2 ms). The election timeout was hard-coded to 150-300 ms, so a
+  leader busy in fsync (it sends no heartbeats while it flushes) was replaced again and again: elections won 6/6/4 per node in 10 s
+  with no client traffic, and writes failed.
+- Reproduced with the LD_PRELOAD fsync shim on real processes, same binary, 250 ms per fsync: old timing 0/40 writes applied, 145
+  elections (term 268); new default 40/40, 1 election (term 1); fast disk 200/200, 1 election.
+- QUORUM_ELECTION_TIMEOUT_MS (50..=60000, default 1000): a follower waits that long to twice that for its leader; the leader's
+  heartbeat is a quarter of it (ElectionTimeoutConfig::from_min / heartbeat_interval in raft-core). Check-quorum uses twice the value.
+  The raft-core default stays 150-300 ms and the test harness uses it explicitly, so tests stay fast.
+- Cost: failover takes ~1.6-1.9 s at the default (measured), ~0.4 s with QUORUM_ELECTION_TIMEOUT_MS=300. A fsync LONGER than the
+  minimum timeout would still cause elections: keep the setting well above the slowest flush on the machine (see slow_wal_append in
+  docs/observability.md: p99 append latency is the number to compare against).
+- Tests: node/tests/startup_config_test.rs (real binary: variable reaches the node, default, bad values refuse to start),
+  config + cluster + raft-core unit tests; 10 mutation checks, all killed.
+- Not done: no jitter beyond the 1:2 spread, no separate heartbeat setting (always min/4), no election-timing gauge in /metrics.
+
 ## Remaining plan
 25 security (TLS, auth, certgen) | 26 chaos CLI v2 + Docker volumes
 27 deterministic simulation + linearizability checker | then regenerate the README.
@@ -185,6 +202,10 @@ Full catalog, scrape config, alert rules and dashboard notes: docs/observability
 - A mutation harness that is killed mid-run leaves the mutated file in place: always diff the tree against a backup afterwards.
 - `pkill -f`/`pgrep -f` match the calling shell's own command line (it killed the shell once, and once reported a finished job as running): use `pkill -x node` or look in /proc.
 - Never point two git worktrees at one CARGO_TARGET_DIR: the two builds of the same crate contaminated each other (spurious E0560).
+- A laptop with an HDD and an SSD: keep the repo's data directory and CARGO_TARGET_DIR on the SSD (C:). Run test clusters with
+  QUORUM_STORAGE_DIR under %TEMP%. Measure first: a 4 KB write+flush loop shows the disk in seconds (25 ms HDD vs 2 ms SSD here).
+- `sh` (dash) executes the commands it has already parsed BEFORE reporting a later syntax error: a failed multi-line script can have
+  half-run (it applied a mutation once). Check the state after a syntax error; `time (...)` is not valid in dash.
 - Process-local counters reset on restart; use rate()/increase(). Leader-only per-peer metrics move with leadership.
 
 ## Known limitations (roadmap)

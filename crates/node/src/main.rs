@@ -80,6 +80,12 @@ async fn main() -> anyhow::Result<()> {
         timeout_ms = request_timeout.as_millis() as u64,
         "request timeout"
     );
+    tracing::info!(
+        election_timeout_min_ms = config.election_timeout.min.as_millis() as u64,
+        election_timeout_max_ms = config.election_timeout.max.as_millis() as u64,
+        heartbeat_ms = config.election_timeout.heartbeat_interval().as_millis() as u64,
+        "election timing"
+    );
     let (cluster, handle) = Cluster::new(config, recovered, peer_outboxes, inbox_rx, connector);
 
     let max_value_bytes =
