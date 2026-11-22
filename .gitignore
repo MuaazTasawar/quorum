@@ -19,3 +19,6 @@ crates/*/target
 Thumbs.db
 
 *.log
+
+/run-logs/
+*.err
