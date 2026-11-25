@@ -88,6 +88,7 @@ async fn stuck_api(
         admin_timeout: timeout * 10,
         max_value_bytes: node::config::DEFAULT_MAX_VALUE_BYTES,
         http_metrics: Default::default(),
+        auth: Default::default(),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

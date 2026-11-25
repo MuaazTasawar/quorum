@@ -1,3 +1,4 @@
+use crate::auth::{Auth, Decision};
 use crate::base64;
 use crate::cluster::{
     AdminResult, ClientAdmin, ClientCommand, ClientCommandResult, ClientQuery, ClusterHandle,
@@ -38,6 +39,8 @@ pub struct AppState {
     pub max_value_bytes: usize,
     /// What the HTTP layer has seen, for `/metrics`.
     pub http_metrics: Arc<HttpMetrics>,
+    /// Who may call what. Off by default (see `crate::auth`).
+    pub auth: Arc<Auth>,
 }
 
 impl AppState {
@@ -51,7 +54,14 @@ impl AppState {
             admin_timeout: request_timeout * ADMIN_TIMEOUT_FACTOR,
             max_value_bytes: crate::config::DEFAULT_MAX_VALUE_BYTES,
             http_metrics: Arc::new(HttpMetrics::default()),
+            auth: Arc::new(Auth::disabled()),
         }
+    }
+
+    /// Sets who may call what.
+    pub fn with_auth(mut self, auth: Auth) -> Self {
+        self.auth = Arc::new(auth);
+        self
     }
 
     /// Sets the largest value a write may carry.
@@ -79,6 +89,8 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/members", post(add_member))
         .route("/admin/members/{id}", delete(remove_member))
         .route("/ws", get(ws_handler))
+        // Innermost, so a refused request never reaches a handler or has its body read.
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(body_limit(state.max_value_bytes)))
         .layer(middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state)
@@ -88,6 +100,30 @@ pub fn router(state: AppState) -> Router {
 /// ANOTHER node must be able to read. Nothing that changes data is ever opened up.
 fn is_cross_origin_readable(route: &str) -> bool {
     matches!(route, "/health" | "/metrics")
+}
+
+/// Turns away a request whose token is missing, wrong, or too weak for its route (see
+/// `crate::auth`). With authentication off it does nothing at all.
+async fn authenticate(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if !state.auth.enabled() {
+        return next.run(request).await;
+    }
+    let decision = {
+        let route = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or("unmatched", |p| p.as_str());
+        let token = crate::auth::bearer_token(request.headers());
+        state.auth.check(route, request.method(), token)
+    };
+    match decision {
+        Decision::Allow => next.run(request).await,
+        Decision::Unauthorized => AppError::Unauthorized.into_response(),
+        Decision::Forbidden { needed } => AppError::Forbidden {
+            needed: needed.name(),
+        }
+        .into_response(),
+    }
 }
 
 /// Counts and times every request under its route TEMPLATE (`/kv/{key}`, not the key a

@@ -462,6 +462,34 @@ impl TestCluster {
         request_timeout: Duration,
         max_value_bytes: usize,
     ) -> SocketAddr {
+        self.serve_http_full(id, request_timeout, max_value_bytes, Default::default())
+            .await
+    }
+
+    /// Like `serve_http`, with API authentication set to `auth`.
+    pub async fn serve_http_with_auth(
+        &self,
+        id: NodeId,
+        request_timeout: Duration,
+        auth: node::auth::Auth,
+    ) -> SocketAddr {
+        self.serve_http_full(
+            id,
+            request_timeout,
+            node::config::DEFAULT_MAX_VALUE_BYTES,
+            auth,
+        )
+        .await
+    }
+
+    /// Serves HTTP with every knob: the request timeout, the value limit and the API auth.
+    pub async fn serve_http_full(
+        &self,
+        id: NodeId,
+        request_timeout: Duration,
+        max_value_bytes: usize,
+        auth: node::auth::Auth,
+    ) -> SocketAddr {
         let handle = &self.nodes[&id].handle;
         let state = AppState {
             command_tx: handle.command_tx.clone(),
@@ -472,6 +500,7 @@ impl TestCluster {
             admin_timeout: request_timeout * 10,
             max_value_bytes,
             http_metrics: Default::default(),
+            auth: std::sync::Arc::new(auth),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

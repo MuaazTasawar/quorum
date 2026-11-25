@@ -56,6 +56,13 @@ pub enum AppError {
     /// retry once the reason has gone.
     #[error("{0}")]
     MembershipRejected(AdminRejection),
+    /// The request carries no valid API token. Nothing was accepted. A missing token and a
+    /// wrong one get the same answer, so the caller learns nothing from the difference.
+    #[error("missing or invalid API token")]
+    Unauthorized,
+    /// The token is valid but its role is too low for this request. Nothing was accepted.
+    #[error("this token may not do that; it needs the {needed} role")]
+    Forbidden { needed: &'static str },
 }
 
 fn timeout_message(may_have_applied: bool) -> &'static str {
@@ -86,6 +93,8 @@ impl AppError {
             AppError::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             AppError::LeadershipLost => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Forbidden { .. } => StatusCode::FORBIDDEN,
             AppError::MembershipRejected(reason) => match reason {
                 // Not a conflict, just early: the new leader is still settling in.
                 AdminRejection::NotReady => StatusCode::SERVICE_UNAVAILABLE,
@@ -111,6 +120,8 @@ impl AppError {
             | AppError::KeyNotFound
             | AppError::NotLeader { .. }
             | AppError::Overloaded
+            | AppError::Unauthorized
+            | AppError::Forbidden { .. }
             | AppError::MembershipRejected(_) => false,
         }
     }
@@ -144,6 +155,15 @@ impl IntoResponse for AppError {
             error: self.to_string(),
             outcome_unknown: self.outcome_unknown(),
         };
+        if matches!(self, AppError::Unauthorized) {
+            // Tells a client how to authenticate (RFC 9110).
+            return (
+                status,
+                [(header::WWW_AUTHENTICATE, "Bearer realm=\"quorum\"")],
+                Json(body),
+            )
+                .into_response();
+        }
         if retry_after {
             // Tells well-behaved clients to back off instead of hammering a node
             // that is already struggling.
@@ -165,6 +185,26 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_missing_token_is_401_with_a_challenge_and_nothing_was_applied() {
+        let response = AppError::Unauthorized.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer realm=\"quorum\""
+        );
+        let (_, body) = render(AppError::Unauthorized).await;
+        assert!(body.contains("\"outcome_unknown\":false"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_token_that_is_too_weak_is_403_and_names_the_role_it_needs() {
+        let (status, body) = render(AppError::Forbidden { needed: "write" }).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("needs the write role"), "{body}");
+        assert!(body.contains("\"outcome_unknown\":false"), "{body}");
     }
 
     #[tokio::test]

@@ -69,8 +69,9 @@ pub enum ClientError {
     #[error("invalid key: {0}")]
     InvalidKey(String),
     /// The cluster refused the request and will refuse it again unchanged: a bad
-    /// request (400), an oversized value (413), an unsupported content type (415) or a
-    /// conflicting membership change (409). Nothing was applied.
+    /// request (400), an oversized value (413), an unsupported content type (415), a
+    /// conflicting membership change (409), or a missing, wrong or too weak API token (401,
+    /// 403; see [`QuorumClient::with_token`]). Nothing was applied.
     #[error("the cluster rejected the request ({status}): {message}")]
     Rejected { status: u16, message: String },
     /// The request was sent but the cluster did not say whether it took effect; it may
@@ -89,6 +90,10 @@ pub enum ClientError {
     /// `get` was used on a value that is not valid UTF-8. Use `get_bytes`.
     #[error("the value is not valid UTF-8 text; read it with get_bytes")]
     NotUtf8,
+    /// The API token holds characters that cannot be sent in a header. A token is printable
+    /// ASCII without spaces, exactly as written in the node's token file.
+    #[error("the API token holds characters that cannot be sent; use it exactly as written in the token file")]
+    InvalidToken,
 }
 
 /// What an operation asks of the cluster.
@@ -219,10 +224,14 @@ fn classify(op: &Op, raw: &Raw) -> Verdict {
                 message: format!("HTTP {}", raw.status),
             },
         },
-        400 | 404 | 405 | 409 | 413 | 415 | 422 => Verdict::Fatal(ClientError::Rejected {
-            status: raw.status,
-            message: status_text(raw),
-        }),
+        // 401 and 403: no node will accept this token for this request. Trying the next node
+        // or the same one later cannot help, so it is not retried.
+        400 | 401 | 403 | 404 | 405 | 409 | 413 | 415 | 422 => {
+            Verdict::Fatal(ClientError::Rejected {
+                status: raw.status,
+                message: status_text(raw),
+            })
+        }
         other => Verdict::Skip {
             detail: format!("HTTP {other}"),
         },
@@ -272,6 +281,26 @@ pub struct QuorumClient {
     http: reqwest::Client,
     tracker: LeaderTracker,
     config: ClientConfig,
+    token: Option<Secret>,
+}
+
+/// An API token. Its `Debug` output hides it, so it cannot reach a log by accident.
+#[derive(Clone)]
+struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+impl std::fmt::Debug for QuorumClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuorumClient")
+            .field("config", &self.config)
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
 }
 
 impl QuorumClient {
@@ -289,6 +318,31 @@ impl QuorumClient {
             http,
             tracker: LeaderTracker::new(nodes),
             config,
+            token: None,
+        }
+    }
+
+    /// Sends `token` as `Authorization: Bearer <token>` with every request, for a cluster
+    /// whose nodes run with `QUORUM_TOKENS_FILE`. The role the token has in that file decides
+    /// what the client may do; a request it may not make fails with
+    /// [`ClientError::Rejected`] (401 or 403) and is not retried.
+    ///
+    /// A token is a password. Until the API speaks TLS it travels unencrypted, so use it only
+    /// on a network you trust.
+    pub fn with_token(mut self, token: impl Into<String>) -> Result<Self, ClientError> {
+        let token = token.into();
+        if token.is_empty() || !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            return Err(ClientError::InvalidToken);
+        }
+        self.token = Some(Secret(token));
+        Ok(self)
+    }
+
+    /// Adds the token, if there is one, marked sensitive so it stays out of debug output.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(Secret(token)) => request.bearer_auth(token),
+            None => request,
         }
     }
 
@@ -367,8 +421,7 @@ impl QuorumClient {
                 }
             };
             match self
-                .http
-                .get(url)
+                .authorize(self.http.get(url))
                 .timeout(self.config.request_timeout)
                 .send()
                 .await
@@ -500,7 +553,8 @@ impl QuorumClient {
             Op::RemoveMember(_) => self.http.delete(url),
         };
 
-        let response = request
+        let response = self
+            .authorize(request)
             .timeout(timeout)
             .send()
             .await
@@ -736,6 +790,45 @@ mod tests {
             max_backoff: Duration::from_millis(1000),
             ..ClientConfig::default()
         }
+    }
+
+    #[test]
+    fn a_missing_or_weak_token_is_rejected_for_good_and_never_retried() {
+        for status in [401, 403] {
+            let body = r#"{"error":"missing or invalid API token","outcome_unknown":false}"#;
+            for op in [get(), Op::Put("k".into(), vec![1]), Op::RemoveMember(2)] {
+                match classify(&op, &raw(status, body)) {
+                    Verdict::Fatal(ClientError::Rejected { status: s, message }) => {
+                        assert_eq!(s, status);
+                        assert_eq!(message, "missing or invalid API token");
+                    }
+                    other => panic!("{status} on {op:?} classified as {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_token_is_checked_before_it_is_stored_and_never_shown() {
+        let nodes: HashMap<NodeId, String> = HashMap::from([(1, "127.0.0.1:1".to_string())]);
+        for bad in [
+            "",
+            "has space",
+            "tab\there",
+            "caf\u{e9}-token-0123456789",
+            "new\nline",
+        ] {
+            let result = QuorumClient::new(nodes.clone()).with_token(bad);
+            assert!(
+                matches!(result, Err(ClientError::InvalidToken)),
+                "{bad:?} must be refused"
+            );
+        }
+        let secret = "s3cr3t-token-0123456789abcdef";
+        let client = QuorumClient::new(nodes).with_token(secret).unwrap();
+        let shown = format!("{client:?}");
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("Secret(..)"), "{shown}");
     }
 
     #[test]

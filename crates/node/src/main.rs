@@ -1,6 +1,6 @@
 use node::{
     cluster::{Cluster, PeerConnector},
-    config::{parse_max_value_bytes, request_timeout_from_env, NodeConfig},
+    config::{auth_from_env, parse_max_value_bytes, request_timeout_from_env, NodeConfig},
     metrics_api, network,
 };
 use std::collections::HashMap;
@@ -91,8 +91,26 @@ async fn main() -> anyhow::Result<()> {
     let max_value_bytes =
         parse_max_value_bytes(std::env::var("QUORUM_MAX_VALUE_BYTES").ok().as_deref())?;
     tracing::info!(max_value_bytes, "largest accepted value");
+    // Read before the node starts serving, so a mistake in the token settings stops it here.
+    let auth = auth_from_env()?;
+    if auth.enabled() {
+        let [read, write, admin] = auth.role_counts();
+        tracing::info!(
+            read_tokens = read,
+            write_tokens = write,
+            admin_tokens = admin,
+            protect_observability = auth.protects_observability(),
+            "API authentication is on"
+        );
+    } else {
+        tracing::warn!(
+            "API authentication is OFF: anyone who can reach this node's HTTP port can read, \
+             write and reconfigure it (set QUORUM_TOKENS_FILE to turn it on)"
+        );
+    }
     let app_state = metrics_api::AppState::from_handle(handle, request_timeout)
-        .with_max_value_bytes(max_value_bytes);
+        .with_max_value_bytes(max_value_bytes)
+        .with_auth(auth);
     let router = metrics_api::router(app_state);
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(&metrics_addr).await {

@@ -16,7 +16,7 @@ Repo: github.com/MuaazTasawar/quorum. Windows + PowerShell workflow. Rust worksp
 15 request lifecycle: 503/504 + outcome_unknown (ed57b76) | 16 pre-vote + check-quorum (2615889) + fix 5232505
 17 linearizable reads / ReadIndex (138eae5) | 18 backpressure + group commit + torn-WAL recovery (7a0af30)
 State at 7a0af30: 189 tests, 0 warnings (259 after Phase 19). HTTP: PUT/GET/DELETE /kv/{key}, GET /health, GET /ws.
-Settings: QUORUM_NODE_ID, LISTEN_ADDR, METRICS_ADDR, PEERS, STORAGE_DIR, REQUEST_TIMEOUT_MS, LOCAL_READS, CHANNEL_CAPACITY, MAX_BATCH, JOIN, CATCH_UP_TIMEOUT_MS, SNAPSHOT_THRESHOLD, SNAPSHOT_RETAIN, ELECTION_TIMEOUT_MS (default 1000; see Phase 24.1).
+Settings: QUORUM_NODE_ID, LISTEN_ADDR, METRICS_ADDR, PEERS, STORAGE_DIR, REQUEST_TIMEOUT_MS, LOCAL_READS, CHANNEL_CAPACITY, MAX_BATCH, JOIN, CATCH_UP_TIMEOUT_MS, SNAPSHOT_THRESHOLD, SNAPSHOT_RETAIN, ELECTION_TIMEOUT_MS (default 1000; see Phase 24.1), TOKENS_FILE, AUTH_PROTECT_OBSERVABILITY (Phase 25a).
 
 ## Phase 19 (done): membership changes
 Single-server changes through the log. Effective on APPEND, undone if truncated. One change in flight at a time. A new
@@ -162,8 +162,28 @@ Full catalog, scrape config, alert rules and dashboard notes: docs/observability
   config + cluster + raft-core unit tests; 10 mutation checks, all killed.
 - Not done: no jitter beyond the 1:2 spread, no separate heartbeat setting (always min/4), no election-timing gauge in /metrics.
 
+## Phase 25 (in progress): security, in four slices
+25a API token authentication - DONE. 25b TLS for the HTTP API | 25c mutual TLS on the peer port | 25d certgen (CA + node certs).
+Details, limits and token generation: docs/security.md.
+- node/src/auth.rs: roles read < write < admin; `Auth::check(route, method, token)` is pure and table-tested; tokens in a file
+  (`<role> <token>` lines, BOM and CRLF tolerated, 16..256 printable ASCII, unique); compared in constant time against every token;
+  routes: /kv GET=read, PUT/DELETE=write, /admin/*=admin, anything unclassified=admin (fail closed), /health /metrics /ws open unless
+  QUORUM_AUTH_PROTECT_OBSERVABILITY, /dashboard always open. Missing file / no tokens / bad token / empty variable / protection without
+  tokens all STOP the node (never silently off). Tokens never logged, never in Debug, never in an error message.
+- Middleware `authenticate` sits innermost in metrics_api::router (inside the metrics layer, so 401/403 are counted; before body
+  limits and handlers, so a refused request's body is never read). AppError::Unauthorized (401 + WWW-Authenticate) / Forbidden (403).
+- SDK: `QuorumClient::with_token(..)?` (token validated, redacted Debug), sent on every request incl. members(); 401/403 are Fatal
+  `Rejected`, never retried. ClientConfig is unchanged on purpose (struct literals in tests).
+- Tests (42 new; workspace total 525 = 483 + 42): 19 unit (auth.rs), 3 config, 2 errors, 2 SDK unit; node/tests/auth_test.rs (11 integration: open when off, 401 everywhere,
+  identical answers for missing/wrong tokens, role matrix, refused writes change nothing, refused before the body is read, protected
+  observability, refusals counted, SDK uses the token and never retries, SDK members() with protected /health); startup_config_test.rs
+  (+5: refuses bad token files, never logs tokens, the RUNNING node enforces its file). 26 mutation checks all killed by a real test
+  failure. Real 3-process run with curl: every status as designed, 0 tokens in logs or /metrics.
+- NOT done / known: tokens cross the network in clear until 25b; the peer port is unauthenticated until 25c; no rotation without a
+  rolling restart, no rate limit, no per-key ACL, no audit log. The dashboard cannot read a protected /health.
+
 ## Remaining plan
-25 security (TLS, auth, certgen) | 26 chaos CLI v2 + Docker volumes
+25b-25d (see above) | 26 chaos CLI v2 + Docker volumes
 27 deterministic simulation + linearizability checker | then regenerate the README.
 
 ## How we work
@@ -206,6 +226,13 @@ Full catalog, scrape config, alert rules and dashboard notes: docs/observability
   QUORUM_STORAGE_DIR under %TEMP%. Measure first: a 4 KB write+flush loop shows the disk in seconds (25 ms HDD vs 2 ms SSD here).
 - `sh` (dash) executes the commands it has already parsed BEFORE reporting a later syntax error: a failed multi-line script can have
   half-run (it applied a mutation once). Check the state after a syntax error; `time (...)` is not valid in dash.
+- Sandbox: test binaries linking reqwest need LD_LIBRARY_PATH=<conda env>/lib (exit status 127 = loader error, not a test failure).
+  Without it ~28 SDK-linked tests (client lib, sdk_test, behaviour_test) silently did not run in the sandbox: a binary that fails to
+  launch prints no `test result` line, so summing those lines still said "0 failed" (sandbox totals were 28 short of the user's Windows
+  total for phases 24-24.1: 455 vs 483, which I wrongly put down to Windows-only tests). Always also grep for "process didn't exit
+  successfully" and compare the total with the user's;
+  `create_file` refuses to overwrite the empty placeholder files (auth.rs, certgen/*): `rm` them first. A mutation harness must count a
+  kill only when a test actually FAILED (not any non-zero exit).
 - Process-local counters reset on restart; use rate()/increase(). Leader-only per-peer metrics move with leadership.
 
 ## Known limitations (roadmap)

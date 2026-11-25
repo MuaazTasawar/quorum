@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod base64;
 pub mod cluster;
 pub mod config;

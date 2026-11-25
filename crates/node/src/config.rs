@@ -1,3 +1,4 @@
+use crate::auth::Auth;
 use raft_core::{ElectionTimeoutConfig, Membership, NodeId};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -344,6 +345,62 @@ pub fn parse_catch_up_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
     Ok(Duration::from_millis(millis))
 }
 
+/// Builds the API's access rules from `QUORUM_TOKENS_FILE` and
+/// `QUORUM_AUTH_PROTECT_OBSERVABILITY`. Called once at startup; a mistake here stops the node,
+/// because the alternative to refusing is quietly running without the protection that was asked for.
+pub fn auth_from_env() -> anyhow::Result<Auth> {
+    parse_auth(
+        std::env::var("QUORUM_TOKENS_FILE").ok().as_deref(),
+        std::env::var("QUORUM_AUTH_PROTECT_OBSERVABILITY")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The rules behind [`auth_from_env`], on plain values.
+///
+/// * No file: authentication is off.
+/// * A file (it must exist, be readable and hold tokens): authentication is on.
+/// * A file named but empty (`QUORUM_TOKENS_FILE=`) is an error, not "off": whoever set it
+///   meant to turn authentication on.
+/// * Asking to protect the observability endpoints without any tokens is an error: it could
+///   only mean the tokens were forgotten.
+pub fn parse_auth(file: Option<&str>, protect_observability: Option<&str>) -> anyhow::Result<Auth> {
+    let protect = parse_flag("QUORUM_AUTH_PROTECT_OBSERVABILITY", protect_observability)?;
+    let Some(file) = file else {
+        if protect {
+            anyhow::bail!(
+                "QUORUM_AUTH_PROTECT_OBSERVABILITY is set but QUORUM_TOKENS_FILE is not: \
+                 there are no tokens to protect anything with"
+            );
+        }
+        return Ok(Auth::disabled());
+    };
+    if file.trim().is_empty() {
+        anyhow::bail!(
+            "QUORUM_TOKENS_FILE is set but empty; give it a path, or remove it to run \
+             without authentication"
+        );
+    }
+    Ok(Auth::load(std::path::Path::new(file.trim()))?.with_protected_observability(protect))
+}
+
+/// A true/false setting, false when unset. Anything else is an error: guessing wrong would
+/// quietly change what is protected.
+fn parse_flag(name: &str, raw: Option<&str>) -> anyhow::Result<bool> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        None => Ok(false),
+        Some(value) => match value.as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => anyhow::bail!(
+                "{name} must be true, false, 1 or 0, got {:?}",
+                raw.unwrap_or("")
+            ),
+        },
+    }
+}
+
 /// Parses `QUORUM_ELECTION_TIMEOUT_MS`, defaulting to [`DEFAULT_ELECTION_TIMEOUT`].
 ///
 /// Below 50 ms the heartbeat (a quarter of it) would be a few milliseconds, which no network or
@@ -387,6 +444,52 @@ pub fn parse_request_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token_file(tag: &str, text: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("quorum-cfg-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokens.txt");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn without_a_token_file_authentication_is_off() {
+        let auth = parse_auth(None, None).unwrap();
+        assert!(!auth.enabled());
+        assert!(!parse_auth(None, Some("false")).unwrap().enabled());
+    }
+
+    #[test]
+    fn a_token_file_turns_authentication_on_and_the_flag_protects_observability() {
+        let path = token_file("on", "admin admin-token-0123456789abcdef\n");
+        let path = path.to_str().unwrap();
+        let auth = parse_auth(Some(path), None).unwrap();
+        assert!(auth.enabled() && !auth.protects_observability());
+        let auth = parse_auth(Some(path), Some(" TRUE ")).unwrap();
+        assert!(auth.enabled() && auth.protects_observability());
+    }
+
+    #[test]
+    fn authentication_never_ends_up_off_by_accident() {
+        // Protection asked for, no tokens given.
+        assert!(parse_auth(None, Some("true")).is_err());
+        // The variable is set but empty.
+        for empty in ["", "   "] {
+            let error = parse_auth(Some(empty), None).unwrap_err().to_string();
+            assert!(error.contains("QUORUM_TOKENS_FILE"), "{error}");
+        }
+        // The file is missing, or holds no tokens.
+        assert!(parse_auth(Some("/no/such/tokens.txt"), None).is_err());
+        let empty = token_file("empty", "# nothing here\n");
+        assert!(parse_auth(Some(empty.to_str().unwrap()), None).is_err());
+        // The flag is not a guess.
+        let ok = token_file("flag", "read read-token-0123456789abcdef\n");
+        let ok = ok.to_str().unwrap();
+        for bad in ["", "yes", "maybe", "2"] {
+            assert!(parse_auth(Some(ok), Some(bad)).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn election_timeout_defaults_to_one_second_up_to_two() {

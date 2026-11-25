@@ -8,6 +8,9 @@ Every node serves three read-only things on its HTTP port (`QUORUM_METRICS_ADDR`
 | `GET /metrics` | The same state as Prometheus metrics, plus counters and latency histograms. | Prometheus text 0.0.4 |
 | `GET /dashboard` | A one-page live view of a whole cluster (see below). | HTML |
 
+With `QUORUM_AUTH_PROTECT_OBSERVABILITY=true` (see `docs/security.md`) `/health`, `/metrics` and `/ws` need a `read` token:
+give Prometheus one with `authorization: { type: Bearer, credentials_file: ... }`; the dashboard cannot read a protected `/health`.
+
 `/health` and `/metrics` send `Access-Control-Allow-Origin: *` so a dashboard served by one node can read
 the others. Nothing that reads or changes data (`/kv`, `/admin`, `/ws`) is ever opened up this way, and neither is
 `/dashboard` itself. There is no authentication yet (Phase 25): put the port behind your network boundary.

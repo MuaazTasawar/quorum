@@ -22,3 +22,8 @@ Thumbs.db
 
 /run-logs/
 *.err
+
+# Phase 25: API token files must never be committed
+tokens.txt
+*.tokens
+/secrets/
